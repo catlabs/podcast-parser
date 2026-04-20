@@ -20,7 +20,7 @@ Run directly to inspect the DB:
 import sqlite3
 from datetime import datetime, timezone
 
-from rag.config import DB_PATH
+from rag.config import DB_PATH, EMBED_REGISTRY
 
 
 def get_connection() -> sqlite3.Connection:
@@ -55,12 +55,34 @@ def init_db(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         pass
 
-    # Track which embedding model has indexed each episode.
-    # Enables multi-model ingestion and targeted backfill.
+    # Persistent registry of all known embedding models / vector collections.
+    # Config is the source of truth; this table is synced on every startup.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS index_collections (
+            key           TEXT PRIMARY KEY,
+            model_name    TEXT NOT NULL,
+            collection    TEXT NOT NULL,
+            label         TEXT NOT NULL,
+            registered_at TEXT NOT NULL
+        )
+    """)
+
+    now = datetime.now(timezone.utc).isoformat()
+    for key, cfg in EMBED_REGISTRY.items():
+        conn.execute("""
+            INSERT INTO index_collections (key, model_name, collection, label, registered_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                model_name = excluded.model_name,
+                collection = excluded.collection,
+                label      = excluded.label
+        """, (key, cfg.model_name, cfg.collection, cfg.label, now))
+
+    # Track which collection has indexed each episode.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS episode_models (
             episode_id  INTEGER NOT NULL REFERENCES episodes(id),
-            model_key   TEXT    NOT NULL,
+            model_key   TEXT    NOT NULL REFERENCES index_collections(key),
             indexed_at  TEXT    NOT NULL,
             PRIMARY KEY (episode_id, model_key)
         )
@@ -145,7 +167,7 @@ def upsert_episode(
     episodes indexed from local files.
     """
     indexed_at = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
+    conn.execute(
         """
         INSERT INTO episodes (podcast, title, date, file_path, chunk_count, indexed_at, audio_url)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -157,17 +179,33 @@ def upsert_episode(
         (podcast, title, date, file_path, chunk_count, indexed_at, audio_url),
     )
     conn.commit()
-    return cursor.lastrowid
+    row = conn.execute("SELECT id FROM episodes WHERE file_path = ?", (file_path,)).fetchone()
+    return row["id"]
 
 
 def list_episodes(conn: sqlite3.Connection) -> list[dict]:
-    """Return all episodes sorted by podcast name then date."""
+    """Return all episodes with their indexed collections, sorted by podcast then date."""
+    labels = {
+        row["key"]: row["label"]
+        for row in conn.execute("SELECT key, label FROM index_collections").fetchall()
+    }
+
     rows = conn.execute("""
-        SELECT id, podcast, title, date, chunk_count, indexed_at
-        FROM   episodes
-        ORDER  BY podcast, date
+        SELECT e.id, e.podcast, e.title, e.date, e.chunk_count, e.indexed_at,
+               GROUP_CONCAT(em.model_key, '|') AS indexed_keys
+        FROM   episodes e
+        LEFT JOIN episode_models em ON em.episode_id = e.id
+        GROUP  BY e.id
+        ORDER  BY e.podcast, e.date
     """).fetchall()
-    return [dict(row) for row in rows]
+
+    result = []
+    for row in rows:
+        d    = dict(row)
+        keys = [k for k in (d.pop("indexed_keys") or "").split("|") if k]
+        d["collections"] = [{"key": k, "label": labels.get(k, k)} for k in keys]
+        result.append(d)
+    return result
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
