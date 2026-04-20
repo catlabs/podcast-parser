@@ -18,7 +18,13 @@ Run:
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
+
+logging.basicConfig(
+    level  = logging.INFO,
+    format = "%(levelname)s  %(name)s  %(message)s",
+)
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -26,8 +32,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from rag.chat import ask, compare
-from rag.config import ANTHROPIC_API_KEY, DEFAULT_MODEL_KEY, TOP_K
+from rag.chat import ask, ask_stream, compare
+from rag.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, DEFAULT_MODEL_KEY, LLM_PROVIDER, OLLAMA_MODEL, TOP_K
 from rag.embed import MODEL_KEYS
 from rag.database import get_connection, init_db, list_episodes
 from rag.ingest import ingest_all
@@ -98,7 +104,24 @@ class UrlIngestRequest(BaseModel):
     whisper_model: str = "medium"
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _require_llm() -> None:
+    if LLM_PROVIDER == "anthropic" and not ANTHROPIC_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="ANTHROPIC_API_KEY is not configured. Add it to .env or set LLM_PROVIDER=ollama.",
+        )
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/config")
+async def config_endpoint():
+    """Return the active LLM provider and model name for the UI."""
+    model = ANTHROPIC_MODEL if LLM_PROVIDER == "anthropic" else OLLAMA_MODEL
+    return {"llm_provider": LLM_PROVIDER, "llm_model": model}
+
 
 @app.post("/ingest")
 async def ingest_endpoint(reindex: bool = False):
@@ -136,11 +159,7 @@ async def chat_endpoint(body: ChatRequest):
     ask() is I/O-bound (Anthropic API call) and uses the synchronous SDK,
     so we run it in a thread just like ingest.
     """
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured. Add it to your .env file.",
-        )
+    _require_llm()
     if body.model_key not in MODEL_KEYS:
         raise HTTPException(
             status_code=400,
@@ -149,6 +168,53 @@ async def chat_endpoint(body: ChatRequest):
 
     result = await asyncio.to_thread(ask, body.query, body.top_k, body.model_key)
     return result
+
+
+@app.post("/chat/stream")
+async def chat_stream_endpoint(body: ChatRequest):
+    """
+    Same as /chat but streams execution steps as SSE before the final result.
+
+    Events:
+      {"type": "step",   "step": str, "status": "running"|"done"|"error", "detail": str|None}
+      {"type": "result", "answer": str, "sources": [...], "chunks": [...], "model_key": str, "intent": str}
+      {"type": "error",  "detail": str}
+    """
+    _require_llm()
+    if body.model_key not in MODEL_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
+        )
+
+    loop  = asyncio.get_running_loop()
+    queue: asyncio.Queue[Optional[dict]] = asyncio.Queue()
+
+    def event_cb(event: dict) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def generate():
+        async def _run():
+            try:
+                ask_stream(body.query, body.top_k, body.model_key, event_cb)
+            except Exception as exc:
+                event_cb({"type": "error", "detail": str(exc)})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        asyncio.ensure_future(_run())
+
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/chat/compare")
@@ -163,11 +229,7 @@ async def compare_endpoint(body: CompareRequest):
 
     Returns {model_key: {answer, sources, chunks, model_key}} for each model.
     """
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured. Add it to your .env file.",
-        )
+    _require_llm()
 
     result = await asyncio.to_thread(compare, body.query, body.top_k)
     return result
