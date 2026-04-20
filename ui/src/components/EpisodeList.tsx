@@ -1,5 +1,18 @@
 import { useEffect, useState } from "react";
-import { getEpisodes, type Episode } from "../api";
+import { getEpisodes, type CollectionTag, type Episode } from "../api";
+
+function CollectionBadges({ collections }: { collections: CollectionTag[] | undefined }) {
+  if (!collections?.length) return <span className="muted">—</span>;
+  return (
+    <span className="collection-badges">
+      {collections.map(c => (
+        <span key={c.key} className="collection-badge" title={c.key}>
+          {c.label}
+        </span>
+      ))}
+    </span>
+  );
+}
 
 export default function EpisodeList() {
   const [episodes, setEpisodes] = useState<Episode[]>([]);
@@ -9,7 +22,7 @@ export default function EpisodeList() {
   useEffect(() => {
     getEpisodes()
       .then(setEpisodes)
-      .catch((e) => setError(e.message))
+      .catch((e: Error) => setError(e.message))
       .finally(() => setLoading(false));
   }, []);
 
@@ -20,28 +33,38 @@ export default function EpisodeList() {
   return (
     <div>
       <h2>Indexed episodes <span className="badge">{episodes.length}</span></h2>
-      <table>
-        <thead>
-          <tr>
-            <th>Date</th>
-            <th>Title</th>
-            <th>Chunks</th>
-            <th>Indexed at</th>
-          </tr>
-        </thead>
-        <tbody>
-          {episodes.map((ep) => (
-            <tr key={ep.id}>
-              <td className="muted nowrap">{ep.date ?? "—"}</td>
-              <td>{ep.title}</td>
-              <td className="center">
-                <span className="badge">{ep.chunk_count}</span>
-              </td>
-              <td className="muted nowrap">{ep.indexed_at.slice(0, 19).replace("T", " ")}</td>
+      <div className="table-scroll">
+        <table className="episodes-table">
+          <colgroup>
+            <col style={{ width: "100px" }} />
+            <col />
+            <col style={{ width: "80px" }} />
+            <col style={{ width: "220px" }} />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Title</th>
+              <th className="center">Chunks</th>
+              <th>Collections</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {episodes.map((ep) => (
+              <tr key={ep.id}>
+                <td className="muted nowrap">{ep.date ?? "—"}</td>
+                <td>{ep.title}</td>
+                <td className="center">
+                  <span className="badge">{ep.chunk_count}</span>
+                </td>
+                <td>
+                  <CollectionBadges collections={ep.collections} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

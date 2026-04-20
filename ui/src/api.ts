@@ -6,13 +6,19 @@ const BASE = "http://localhost:8000";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
+export interface CollectionTag {
+  key:   string;
+  label: string;
+}
+
 export interface Episode {
-  id: number;
-  podcast: string;
-  title: string;
-  date: string | null;
+  id:          number;
+  podcast:     string;
+  title:       string;
+  date:        string | null;
   chunk_count: number;
-  indexed_at: string;
+  indexed_at:  string;
+  collections: CollectionTag[];
 }
 
 // A single retrieved chunk — the raw output of semantic search.
@@ -34,11 +40,27 @@ export interface Source {
 }
 
 export interface ChatResponse {
-  answer: string;
-  sources: Source[];
-  chunks: Chunk[];   // raw retrieved chunks, ordered by distance
+  answer:    string;
+  sources:   Source[];
+  chunks:    Chunk[];
   model_key: string;
+  intent?:   string;
 }
+
+// ── Chat stream types ─────────────────────────────────────────────────────────
+
+export type StepStatus = "running" | "done" | "error";
+
+export interface ExecStep {
+  step:    string;
+  status:  StepStatus;
+  detail?: string;
+}
+
+export type ChatStreamEvent =
+  | { type: "step";   step: string; status: StepStatus; detail?: string }
+  | { type: "result"; answer: string; sources: Source[]; chunks: Chunk[]; model_key: string; intent: string }
+  | { type: "error";  detail: string };
 
 // ── Multi-model comparison types ──────────────────────────────────────────────
 
@@ -51,9 +73,22 @@ export interface ModelResult {
 
 export type CompareResponse = Record<string, ModelResult>;
 
+export type ModelLabels = Record<string, string>;
+
+// Resolved at runtime from /episodes collections — used by compare view.
+// Falls back to the key name if label is unavailable.
+export function buildModelLabels(episodes: Episode[]): ModelLabels {
+  const labels: ModelLabels = {};
+  for (const ep of episodes)
+    for (const c of ep.collections)
+      labels[c.key] = c.label;
+  return labels;
+}
+
+// Static fallback for places that can't wait for an episode fetch.
 export const MODEL_LABELS: Record<string, string> = {
-  minilm:       "MiniLM-L6 (English)",
-  multilingual: "MiniLM-L12 (Multilingual)",
+  minilm:       "MiniLM-L6 · EN",
+  multilingual: "MiniLM-L12 · ML",
 };
 
 export interface IngestResult {
@@ -119,12 +154,53 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface ServerConfig {
+  llm_provider: string;
+  llm_model:    string;
+}
+
+export function getConfig(): Promise<ServerConfig> {
+  return apiFetch<ServerConfig>("/config");
+}
+
 export function getEpisodes(): Promise<Episode[]> {
   return apiFetch<Episode[]>("/episodes");
 }
 
 export function runIngest(reindex = false): Promise<IngestResult> {
   return apiFetch<IngestResult>(`/ingest?reindex=${reindex}`, { method: "POST" });
+}
+
+export async function* chatStream(
+  query: string, top_k = 5, model_key = "minilm"
+): AsyncGenerator<ChatStreamEvent> {
+  const res = await fetch(`${BASE}/chat/stream`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ query, top_k, model_key }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  const reader  = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      const line = part.trim();
+      if (line.startsWith("data:")) {
+        try { yield JSON.parse(line.slice(5).trim()) as ChatStreamEvent; }
+        catch { /* skip malformed */ }
+      }
+    }
+  }
 }
 
 export function chat(query: string, top_k = 5, model_key = "minilm"): Promise<ChatResponse> {

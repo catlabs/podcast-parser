@@ -1,12 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  chat,
+  chatStream,
   compareModels,
+  getConfig,
   MODEL_LABELS,
   type ChatResponse,
   type Chunk,
   type CompareResponse,
+  type ExecStep,
   type ModelResult,
+  type ServerConfig,
 } from "../api";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -17,6 +20,7 @@ interface Turn {
   id:       number;
   mode:     Mode;
   query:    string;
+  steps:    ExecStep[];
   loading:  boolean;
   result?:  ChatResponse;
   compare?: CompareResponse;
@@ -105,18 +109,47 @@ function ResultPanel({ label, result }: { label?: string; result: ModelResult | 
   );
 }
 
+// ── Execution status panel ────────────────────────────────────────────────────
+
+const STEP_LABELS: Record<string, string> = {
+  classify: "classify query",
+  search:   "semantic search",
+  generate: "generate answer",
+};
+
+const STATUS_ICON: Record<string, string> = {
+  running: "·",
+  done:    "✓",
+  error:   "✗",
+};
+
+function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
+  if (steps.length === 0) return null;
+  return (
+    <div className="exec-panel">
+      {steps.map(s => (
+        <div key={s.step} className={`exec-step exec-step--${s.status}`}>
+          <span className="exec-step-icon">{STATUS_ICON[s.status]}</span>
+          <span className="exec-step-name">{STEP_LABELS[s.step] ?? s.step}</span>
+          {s.detail && <span className="exec-step-detail">{s.detail}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // ── Single conversation turn ──────────────────────────────────────────────────
 
 function ChatTurn({ turn }: { turn: Turn }) {
   return (
-    <div className="chat-turn">
+    <div className={`chat-turn${turn.mode === "compare" ? " chat-turn--compare" : ""}`}>
       <div className="turn-query-row">
         <div className="turn-query">{turn.query}</div>
       </div>
 
       <div className="turn-response">
-        {turn.loading && <p className="muted" style={{ fontSize: "0.88rem" }}>Searching…</p>}
-        {turn.error   && <p className="error">{turn.error}</p>}
+        <ExecutionPanel steps={turn.steps} />
+        {turn.error && <p className="error">{turn.error}</p>}
 
         {turn.result && <ResultPanel result={turn.result} />}
 
@@ -151,6 +184,9 @@ export default function ChatPanel() {
   const [mode,    setMode]    = useState<Mode>("single");
   const [query,   setQuery]   = useState("");
   const [loading, setLoading] = useState(false);
+  const [config,  setConfig]  = useState<ServerConfig | null>(null);
+
+  useEffect(() => { getConfig().then(setConfig).catch(() => {}); }, []);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef  = useRef<HTMLInputElement>(null);
@@ -166,7 +202,7 @@ export default function ChatPanel() {
     if (!q || loading) return;
 
     const id = nextId.current++;
-    const newTurn: Turn = { id, mode, query: q, loading: true };
+    const newTurn: Turn = { id, mode, query: q, steps: [], loading: true };
 
     setTurns(prev => [...prev, newTurn]);
     setQuery("");
@@ -175,10 +211,20 @@ export default function ChatPanel() {
     const patch = (update: Partial<Turn>) =>
       setTurns(prev => prev.map(t => t.id === id ? { ...t, ...update } : t));
 
+    const patchStep = (step: ExecStep) =>
+      setTurns(prev => prev.map(t => {
+        if (t.id !== id) return t;
+        const steps = t.steps.filter(s => s.step !== step.step);
+        return { ...t, steps: [...steps, step] };
+      }));
+
     try {
       if (mode === "single") {
-        const result = await chat(q);
-        patch({ loading: false, result });
+        for await (const event of chatStream(q)) {
+          if (event.type === "step")   patchStep({ step: event.step, status: event.status, detail: event.detail });
+          if (event.type === "result") patch({ loading: false, result: event });
+          if (event.type === "error")  patch({ loading: false, error: event.detail });
+        }
       } else {
         const compare = await compareModels(q);
         patch({ loading: false, compare });
@@ -202,8 +248,8 @@ export default function ChatPanel() {
       {/* Input area */}
       <div className="chat-input-area">
         <div className="chat-input-shell">
-          {/* Mode chips */}
-          <div className="mode-chips">
+          {/* Mode chips + provider label */}
+          <div className="mode-chips" style={{ justifyContent: "space-between" }}>
             <button
               type="button"
               className={`mode-chip${mode === "single" ? " mode-chip--active" : ""}`}
@@ -218,6 +264,11 @@ export default function ChatPanel() {
             >
               Compare models
             </button>
+            {config && (
+              <span className="llm-provider-label">
+                {config.llm_model}
+              </span>
+            )}
           </div>
 
           {/* Composer box */}
