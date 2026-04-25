@@ -19,9 +19,11 @@ Built as a learning and portfolio project in Python + React, focusing on clean, 
 
 5. **Multi-LLM** — switch between Claude (Sonnet / Haiku), GPT-4o (/ mini), and local Ollama from a toolbar dropdown. All providers share the same routing and streaming pipeline.
 
-6. **Compare mode** — run the same query through both embedding models simultaneously and see results side by side.
+6. **Research mode** — multi-step agentic analysis: decomposes complex questions into sub-queries, searches across multiple angles, analyzes each relevant episode, synthesizes a structured comparison, and verifies grounding against sources. Available in two implementations: custom orchestration and LangGraph.
 
-7. **Web UI** — React + TypeScript interface with a ChatGPT-style sidebar layout for browsing episodes, ingesting new sources, and chatting.
+7. **Compare mode** — run the same query through both embedding models simultaneously and see results side by side.
+
+8. **Web UI** — React + TypeScript interface with a ChatGPT-style sidebar layout for browsing episodes, ingesting new sources, and chatting.
 
 ---
 
@@ -35,6 +37,8 @@ rag/
   llm.py                 provider abstraction: Anthropic / OpenAI / Ollama
   router.py              intent classifier (podcast_rag / list_episodes / summarize_episode / app_meta)
   tools.py               tool implementations: list_episodes_text, summarize_episode
+  research.py            custom multi-step research orchestrator (plan → search → analyze → synthesize → ground)
+  research_graph.py      LangGraph-based research orchestrator (same pipeline as explicit StateGraph nodes)
   ingest.py              chunk + embed → ChromaDB (all models); upsert → SQLite
   database.py            SQLite: episodes + episode_models tables
   search.py              semantic_search(query, model_key) → nearest neighbours
@@ -66,6 +70,28 @@ ui/
 | `ollama` | Ollama (local) | configurable via `OLLAMA_MODEL` |
 
 The active LLM is selected per-query from the UI toolbar. Routing (intent classification) and answer generation both use the same selected model.
+
+### Research mode
+
+The toolbar exposes a **Mode** selector with three options:
+
+| Mode | Backend | Description |
+|------|---------|-------------|
+| **Chat** | `rag/chat.py` | Standard single-step RAG: classify → search → generate |
+| **Research** | `rag/research.py` | Custom multi-step orchestrator with `yield`-based streaming |
+| **LangGraph** | `rag/research_graph.py` | Same pipeline as a LangGraph `StateGraph` with typed state |
+
+Both research implementations follow the same 5-agent pipeline:
+
+1. **Query Planner** — decomposes the question into 2–5 sub-queries
+2. **Search Agent** — parallel `semantic_search()` per sub-query, dedup + rank
+3. **Episode Analyst** — per-episode LLM analysis notes
+4. **Synthesis Agent** — cross-episode structured answer (streamed token by token)
+5. **Grounding Critic** — verifies the synthesis is supported by source chunks
+
+The LangGraph version demonstrates graph-based agent orchestration with explicit nodes, typed `TypedDict` state passing, and an `operator.add` event reducer. It is designed for future extension with conditional edges (critic → re-search loop), `interrupt_before` for human-in-the-loop approval, and checkpointing for resumable workflows.
+
+The execution panel in the UI groups steps by agent with collapsible detail views, showing which tool was called at each step.
 
 ### Two embedding models
 
@@ -110,7 +136,8 @@ python3 -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install --upgrade pip
 pip install feedparser requests openai-whisper sentence-transformers \
-            chromadb fastapi uvicorn python-dotenv anthropic openai yt-dlp
+            chromadb fastapi uvicorn python-dotenv anthropic openai yt-dlp \
+            langgraph
 ```
 
 Copy the environment file and fill in the keys for the providers you want to use:
@@ -162,7 +189,7 @@ Open [http://localhost:5173](http://localhost:5173).
 
 | Section | What it does |
 |---------|-------------|
-| **Chat** | Ask a question; answers stream in real time. Use the **Embed** dropdown to pick the embedding model and the **LLM** dropdown to switch between Claude, GPT, or Ollama. Toggle **Compare both** to see both embedding models side by side. |
+| **Chat** | Ask a question; answers stream in real time. Use the **Mode** toggle to switch between Chat, Research, and LangGraph modes. Use the **Embed** dropdown to pick the embedding model and the **LLM** dropdown to switch between Claude, GPT, or Ollama. Toggle **Compare both** to see both embedding models side by side. |
 | **Episodes** | Browse all indexed episodes |
 | **Add episode** | Paste any RSS, YouTube, or audio URL — the app detects the type and guides you through ingestion with live progress |
 
@@ -170,10 +197,11 @@ Open [http://localhost:5173](http://localhost:5173).
 
 The input area exposes two selectors:
 
+- **Mode** — `Chat` (single-step RAG), `Research` (custom multi-step), or `LangGraph` (graph-based orchestration)
 - **Embed** — which sentence-transformer collection to search (`MiniLM-L6 · EN`, `MiniLM-L12 · ML`, or `Compare both`)
 - **LLM** — which model generates the answer (Claude Sonnet 4.5, Claude Haiku 4.5, GPT-4o, GPT-4o mini, or local Ollama)
 
-The execution panel below each answer shows which LLM was used next to the **generate answer** step, making it easy to compare outputs across sessions.
+The execution panel below each answer shows the pipeline trace. In Chat mode it shows flat steps; in Research/LangGraph mode it groups steps by agent with collapsible detail views.
 
 ### CLI — transcribe a feed
 
@@ -223,6 +251,8 @@ python -m rag.search "your question here"
 | `POST` | `/chat` | Semantic search + LLM answer |
 | `POST` | `/chat/stream` | Same as `/chat` but streams execution steps + tokens via SSE |
 | `POST` | `/chat/compare` | Same query through all embedding models in parallel |
+| `POST` | `/chat/research` | Multi-step research pipeline (custom orchestration, SSE) |
+| `POST` | `/chat/research-graph` | Multi-step research pipeline (LangGraph orchestration, SSE) |
 
 ---
 
