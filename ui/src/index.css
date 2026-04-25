@@ -737,3 +737,196 @@ textarea:focus {
   box-shadow: 0 0 0 3px rgba(0,0,0,0.06);
 }
 input::placeholder { color: var(--muted); }
+
+/* ── Mode toggle (Chat / Research) ──────────────────────────────────────── */
+
+.mode-toggle {
+  display: flex;
+  gap: 1px;
+  background: var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.mode-chip {
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-family: var(--font);
+  font-weight: 500;
+  padding: 0.2rem 0.65rem;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+  white-space: nowrap;
+}
+.mode-chip:hover:not(:disabled)   { color: var(--text); }
+.mode-chip--active                { background: var(--bg); color: var(--text); }
+.mode-chip:disabled               { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Research mode badge on user bubble ─────────────────────────────────── */
+
+.turn-mode-badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #fff;
+  background: var(--accent);
+  padding: 0.1em 0.45em;
+  border-radius: 4px;
+  margin-right: 0.5rem;
+  vertical-align: middle;
+}
+
+/* ── Agent-grouped execution panel ──────────────────────────────────────── */
+
+.exec-panel--research {
+  gap: 0.15rem;
+}
+
+.exec-agent-group {
+  animation: exec-step-in 0.2s ease-out both;
+}
+
+.exec-agent-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.25rem 0.15rem;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--text);
+  transition: background 0.1s;
+  border-radius: 4px;
+  text-align: left;
+}
+.exec-agent-header:hover { background: var(--surface); }
+
+.exec-agent-header--done { color: var(--muted); }
+
+.exec-agent-icon {
+  width: 1em;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.exec-agent-name {
+  font-weight: 600;
+}
+
+.exec-agent-summary {
+  color: var(--muted);
+  opacity: 0.7;
+  font-weight: 400;
+}
+.exec-agent-summary::before { content: "— "; }
+
+.exec-agent-chevron {
+  margin-left: auto;
+  color: var(--muted);
+  transition: transform 0.15s;
+  font-size: 0.7em;
+}
+.exec-agent-chevron--open {
+  transform: rotate(90deg);
+}
+
+.exec-agent-steps {
+  padding-left: 1.5rem;
+  margin: 0.1rem 0 0.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.exec-step-tool {
+  font-size: 0.7rem;
+  color: var(--muted);
+  opacity: 0.6;
+  background: var(--surface);
+  padding: 0.05em 0.4em;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+/* ── Research result details ────────────────────────────────────────────── */
+
+.research-details {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.research-detail-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.research-sub-queries {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding-left: 0.25rem;
+}
+.research-sub-queries li {
+  font-size: 0.82rem;
+  color: var(--muted);
+  padding: 0.15rem 0;
+}
+.research-sub-queries li::before {
+  content: "→ ";
+  color: var(--accent);
+}
+
+.research-analyses {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.research-analysis-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+}
+
+.research-analysis-title {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text);
+  margin-bottom: 0.35rem;
+}
+
+.research-analysis-notes {
+  font-size: 0.82rem;
+  color: var(--muted);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.research-grounding-flags {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+.research-grounding-flags li {
+  font-size: 0.82rem;
+  color: var(--yellow);
+  padding: 0.15rem 0;
+}
+.research-grounding-flags li::before {
+  content: "⚠ ";
+}

@@ -3,13 +3,18 @@ import {
   chatStream,
   compareModels,
   getConfig,
+  researchStream,
+  researchGraphStream,
   MODEL_LABELS,
   type ChatResponse,
   type Chunk,
   type CompareResponse,
+  type EpisodeAnalysis,
   type ExecStep,
+  type Grounding,
   type ModelResult,
   type LLMOption,
+  type ResearchResult,
 } from "../api";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -17,16 +22,36 @@ import {
 // "minilm" | "multilingual" → single model mode
 // "compare"                 → side-by-side mode
 type EmbedMode = "minilm" | "multilingual" | "compare";
+type ChatMode  = "chat" | "research" | "research-lg";
+
+interface AgentStep extends ExecStep {
+  agent?: string;
+  tool?:  string;
+}
+
+interface AgentLifecycle {
+  agent: string;
+  label: string;
+  done:  boolean;
+}
 
 interface Turn {
   id:               number;
   embedMode:        EmbedMode;
+  chatMode:         ChatMode;
   query:            string;
-  steps:            ExecStep[];
+  steps:            AgentStep[];
+  agents:           AgentLifecycle[];
   loading:          boolean;
   streamingAnswer?: string;
   result?:          ChatResponse;
   compare?:         CompareResponse;
+  research?:        ResearchResult;
+  researchData?: {
+    subQueries?:       string[];
+    episodeAnalyses?:  EpisodeAnalysis[];
+    grounding?:        Grounding;
+  };
   error?:           string;
 }
 
@@ -124,6 +149,19 @@ const STEP_LABELS: Record<string, string> = {
   generate:       "generate answer",
   fetch_episodes: "fetch episode list",
   fetch_chunks:   "load episode chunks",
+  plan:           "decompose query",
+  analyze:        "analyze episodes",
+  synthesize:     "synthesize findings",
+  ground:         "verify grounding",
+};
+
+const AGENT_LABELS: Record<string, string> = {
+  orchestrator: "Research Orchestrator",
+  planner:      "Query Planner",
+  search:       "Search Agent",
+  analyst:      "Episode Analyst",
+  synthesizer:  "Synthesis Agent",
+  critic:       "Grounding Critic",
 };
 
 function StepIcon({ status }: { status: string }) {
@@ -132,7 +170,13 @@ function StepIcon({ status }: { status: string }) {
   return <span>✗</span>;
 }
 
-function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
+function AgentIcon({ done }: { done: boolean }) {
+  if (done) return <span style={{ color: "var(--green)" }}>✓</span>;
+  return <span className="exec-step-spinner" />;
+}
+
+/** Classic flat execution panel for normal chat mode */
+function ExecutionPanel({ steps }: { steps: AgentStep[] }) {
   if (steps.length === 0) return null;
   return (
     <div className="exec-panel">
@@ -143,6 +187,135 @@ function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
           {s.detail && <span className="exec-step-detail">{s.detail}</span>}
         </div>
       ))}
+    </div>
+  );
+}
+
+/** Agent-grouped execution panel for research mode */
+function ResearchExecutionPanel({ agents, steps }: { agents: AgentLifecycle[]; steps: AgentStep[] }) {
+  const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
+
+  if (agents.length === 0) return null;
+
+  // Skip the orchestrator wrapper in the display — it just groups everything
+  const displayAgents = agents.filter(a => a.agent !== "orchestrator");
+
+  const toggleAgent = (agent: string) =>
+    setExpandedAgents(prev => {
+      const next = new Set(prev);
+      if (next.has(agent)) next.delete(agent); else next.add(agent);
+      return next;
+    });
+
+  return (
+    <div className="exec-panel exec-panel--research">
+      {displayAgents.map(a => {
+        const agentSteps = steps.filter(s => s.agent === a.agent);
+        const latestStep = agentSteps[agentSteps.length - 1];
+        const isExpanded = expandedAgents.has(a.agent);
+
+        return (
+          <div key={a.agent} className="exec-agent-group">
+            <button
+              className={`exec-agent-header exec-agent-header--${a.done ? "done" : "running"}`}
+              onClick={() => toggleAgent(a.agent)}
+            >
+              <span className="exec-agent-icon"><AgentIcon done={a.done} /></span>
+              <span className="exec-agent-name">{AGENT_LABELS[a.agent] ?? a.label}</span>
+              {latestStep && !isExpanded && (
+                <span className="exec-agent-summary">{latestStep.detail || STEP_LABELS[latestStep.step] || latestStep.step}</span>
+              )}
+              <span className={`exec-agent-chevron${isExpanded ? " exec-agent-chevron--open" : ""}`}>▸</span>
+            </button>
+
+            {isExpanded && agentSteps.length > 0 && (
+              <div className="exec-agent-steps">
+                {agentSteps.map(s => (
+                  <div key={`${s.step}-${s.status}`} className={`exec-step exec-step--${s.status}`}>
+                    <span className="exec-step-icon"><StepIcon status={s.status} /></span>
+                    <span className="exec-step-name">{STEP_LABELS[s.step] ?? s.step}</span>
+                    {s.tool && <span className="exec-step-tool">{s.tool}</span>}
+                    {s.detail && <span className="exec-step-detail">{s.detail}</span>}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Research result details ──────────────────────────────────────────────────
+
+function VerdictBadge({ verdict }: { verdict: string }) {
+  const colors: Record<string, string> = {
+    supported:   "var(--green)",
+    partial:     "var(--yellow)",
+    unsupported: "var(--red)",
+    unknown:     "var(--muted)",
+  };
+  return (
+    <span className="badge" style={{ background: colors[verdict] ?? "var(--muted)", color: "#fff", border: "none" }}>
+      {verdict}
+    </span>
+  );
+}
+
+function ResearchDetails({ data }: { data: Turn["researchData"] }) {
+  const [subQueriesOpen,  setSubQueriesOpen]  = useState(false);
+  const [analysesOpen,    setAnalysesOpen]    = useState(false);
+  const [groundingOpen,   setGroundingOpen]   = useState(false);
+
+  if (!data) return null;
+
+  return (
+    <div className="research-details">
+      {data.subQueries && data.subQueries.length > 0 && (
+        <div className="research-detail-section">
+          <button className="link-btn" onClick={() => setSubQueriesOpen(o => !o)}>
+            {subQueriesOpen ? "Hide" : "Show"} {data.subQueries.length} sub-queries
+          </button>
+          {subQueriesOpen && (
+            <ul className="research-sub-queries">
+              {data.subQueries.map((sq, i) => <li key={i}>{sq}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {data.episodeAnalyses && data.episodeAnalyses.length > 0 && (
+        <div className="research-detail-section">
+          <button className="link-btn" onClick={() => setAnalysesOpen(o => !o)}>
+            {analysesOpen ? "Hide" : "Show"} {data.episodeAnalyses.length} episode analyses
+          </button>
+          {analysesOpen && (
+            <div className="research-analyses">
+              {data.episodeAnalyses.map((a, i) => (
+                <div key={i} className="research-analysis-card">
+                  <div className="research-analysis-title">{a.episode}</div>
+                  <div className="research-analysis-notes">{a.notes}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {data.grounding && (
+        <div className="research-detail-section">
+          <button className="link-btn" onClick={() => setGroundingOpen(o => !o)}>
+            Grounding: <VerdictBadge verdict={data.grounding.verdict} />
+            {data.grounding.flags.length > 0 && ` (${data.grounding.flags.length} flags)`}
+          </button>
+          {groundingOpen && data.grounding.flags.length > 0 && (
+            <ul className="research-grounding-flags">
+              {data.grounding.flags.map((f, i) => <li key={i}>{f}</li>)}
+            </ul>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -162,16 +335,25 @@ function TypingIndicator() {
 // ── Single conversation turn ──────────────────────────────────────────────────
 
 function ChatTurn({ turn }: { turn: Turn }) {
-  const hasResponse = !!(turn.result || turn.compare || turn.error);
-  const isStreaming  = turn.loading && !!turn.streamingAnswer && !turn.result;
+  const hasResponse = !!(turn.result || turn.compare || turn.research || turn.error);
+  const isStreaming  = turn.loading && !!turn.streamingAnswer && !turn.result && !turn.research;
+  const isResearch   = turn.chatMode === "research" || turn.chatMode === "research-lg";
+
   return (
-    <div className={`chat-turn${turn.embedMode === "compare" ? " chat-turn--compare" : ""}`}>
+    <div className={`chat-turn${turn.embedMode === "compare" ? " chat-turn--compare" : ""}${isResearch ? " chat-turn--research" : ""}`}>
       <div className="turn-query-row">
-        <div className="turn-query">{turn.query}</div>
+        <div className="turn-query">
+          {turn.chatMode === "research" && <span className="turn-mode-badge">Research</span>}
+          {turn.chatMode === "research-lg" && <span className="turn-mode-badge">LangGraph</span>}
+          {turn.query}
+        </div>
       </div>
 
       <div className="turn-response">
-        <ExecutionPanel steps={turn.steps} />
+        {isResearch
+          ? <ResearchExecutionPanel agents={turn.agents} steps={turn.steps} />
+          : <ExecutionPanel steps={turn.steps} />
+        }
         {turn.loading && !hasResponse && !turn.streamingAnswer && <TypingIndicator />}
         {turn.error && <p className="error">{turn.error}</p>}
 
@@ -181,7 +363,14 @@ function ChatTurn({ turn }: { turn: Turn }) {
           </div>
         )}
 
-        {turn.result && <ResultPanel result={turn.result} />}
+        {turn.result && !isResearch && <ResultPanel result={turn.result} />}
+
+        {turn.research && (
+          <>
+            <ResultPanel result={turn.research} />
+            <ResearchDetails data={turn.researchData} />
+          </>
+        )}
 
         {turn.compare && (
           <div className="compare-grid">
@@ -220,6 +409,7 @@ const EMBED_OPTIONS: { value: EmbedMode; label: string }[] = [
 export default function ChatPanel() {
   const [turns,      setTurns]      = useState<Turn[]>([]);
   const [embedMode,  setEmbedMode]  = useState<EmbedMode>("minilm");
+  const [chatMode,   setChatMode]   = useState<ChatMode>("chat");
   const [llmKey,     setLlmKey]     = useState("claude-sonnet-4-5");
   const [llmOptions, setLlmOptions] = useState<LLMOption[]>([]);
   const [query,      setQuery]      = useState("");
@@ -246,7 +436,7 @@ export default function ChatPanel() {
     if (!q || loading) return;
 
     const id = nextId.current++;
-    const newTurn: Turn = { id, embedMode, query: q, steps: [], loading: true };
+    const newTurn: Turn = { id, embedMode, chatMode, query: q, steps: [], agents: [], loading: true };
 
     setTurns(prev => [...prev, newTurn]);
     setQuery("");
@@ -255,21 +445,82 @@ export default function ChatPanel() {
     const patch = (update: Partial<Turn>) =>
       setTurns(prev => prev.map(t => t.id === id ? { ...t, ...update } : t));
 
-    const patchStep = (step: ExecStep) =>
+    const patchStep = (step: AgentStep) =>
       setTurns(prev => prev.map(t => {
         if (t.id !== id) return t;
         const steps = t.steps.filter(s => s.step !== step.step);
         return { ...t, steps: [...steps, step] };
       }));
 
+    const patchAgent = (agent: string, label: string, done: boolean) =>
+      setTurns(prev => prev.map(t => {
+        if (t.id !== id) return t;
+        const existing = t.agents.filter(a => a.agent !== agent);
+        return { ...t, agents: [...existing, { agent, label, done }] };
+      }));
+
     // Accumulate tokens in a ref to avoid O(n²) string concat in each setState.
     let tokenBuf = "";
 
     try {
-      if (embedMode === "compare") {
+      if (chatMode === "research" || chatMode === "research-lg") {
+        // ── Research mode (custom or LangGraph) ────────────────────────
+        const embedKey = embedMode === "compare" ? "minilm" : embedMode;
+        const stream = chatMode === "research-lg"
+          ? researchGraphStream(q, 8, embedKey, llmKey)
+          : researchStream(q, 8, embedKey, llmKey);
+
+        const researchMeta: Turn["researchData"] = {};
+
+        for await (const event of stream) {
+          if (event.type === "agent_start") {
+            patchAgent(event.agent, event.label, false);
+          }
+          if (event.type === "agent_end") {
+            patchAgent(event.agent, AGENT_LABELS[event.agent] ?? event.agent, true);
+          }
+          if (event.type === "step") {
+            patchStep({ step: event.step, status: event.status, detail: event.detail, agent: event.agent, tool: event.tool });
+          }
+          if (event.type === "token") {
+            tokenBuf += event.text;
+            patch({ streamingAnswer: tokenBuf });
+          }
+          if (event.type === "plan") {
+            researchMeta.subQueries = event.sub_queries;
+            patch({ researchData: { ...researchMeta } });
+          }
+          if (event.type === "episode_analysis") {
+            if (!researchMeta.episodeAnalyses) researchMeta.episodeAnalyses = [];
+            researchMeta.episodeAnalyses.push({ episode: event.episode, notes: event.notes });
+            patch({ researchData: { ...researchMeta } });
+          }
+          if (event.type === "grounding") {
+            researchMeta.grounding = { verdict: event.verdict as Grounding["verdict"], flags: event.flags };
+            patch({ researchData: { ...researchMeta } });
+          }
+          if (event.type === "result") {
+            patch({
+              loading: false,
+              streamingAnswer: undefined,
+              research: event as unknown as ResearchResult,
+              researchData: {
+                subQueries:      event.research.sub_queries,
+                episodeAnalyses: event.research.episode_analyses,
+                grounding:       event.research.grounding ?? undefined,
+              },
+            });
+          }
+          if (event.type === "error") {
+            patch({ loading: false, error: event.detail });
+          }
+        }
+
+      } else if (embedMode === "compare") {
         const compare = await compareModels(q, 5, llmKey);
         patch({ loading: false, compare });
       } else {
+        // ── Normal chat mode ───────────────────────────────────────────
         for await (const event of chatStream(q, 5, embedMode, llmKey)) {
           if (event.type === "step")   patchStep({ step: event.step, status: event.status, detail: event.detail });
           if (event.type === "token")  { tokenBuf += event.text; patch({ streamingAnswer: tokenBuf }); }
@@ -306,7 +557,7 @@ export default function ChatPanel() {
                 type="text"
                 value={query}
                 onChange={e => setQuery(e.target.value)}
-                placeholder="Ask about your podcasts…"
+                placeholder={chatMode !== "chat" ? "Research across your podcasts…" : "Ask about your podcasts…"}
                 disabled={loading}
                 autoFocus
               />
@@ -323,8 +574,36 @@ export default function ChatPanel() {
             </div>
           </form>
 
-          {/* Toolbar: embed selector + LLM chip */}
+          {/* Toolbar: mode + embed selector + LLM chip */}
           <div className="chat-toolbar">
+            <div className="toolbar-control">
+              <span className="toolbar-control-label">Mode</span>
+              <div className="mode-toggle">
+                <button
+                  className={`mode-chip${chatMode === "chat" ? " mode-chip--active" : ""}`}
+                  onClick={() => setChatMode("chat")}
+                  disabled={loading}
+                >
+                  Chat
+                </button>
+                <button
+                  className={`mode-chip${chatMode === "research" ? " mode-chip--active" : ""}`}
+                  onClick={() => setChatMode("research")}
+                  disabled={loading}
+                >
+                  Research
+                </button>
+                <button
+                  className={`mode-chip${chatMode === "research-lg" ? " mode-chip--active" : ""}`}
+                  onClick={() => setChatMode("research-lg")}
+                  disabled={loading}
+                  title="LangGraph-based research orchestration"
+                >
+                  LangGraph
+                </button>
+              </div>
+            </div>
+
             <div className="toolbar-control">
               <span className="toolbar-control-label">Embed</span>
               <select
@@ -357,7 +636,12 @@ export default function ChatPanel() {
           </div>
 
           <p className="chat-input-disclaimer">
-            Answers are grounded in indexed podcast content only.
+            {chatMode === "research"
+              ? "Research mode: multi-step analysis across episodes. Takes longer, goes deeper."
+              : chatMode === "research-lg"
+              ? "LangGraph mode: graph-based agent orchestration with typed state passing."
+              : "Answers are grounded in indexed podcast content only."
+            }
           </p>
         </div>
       </div>

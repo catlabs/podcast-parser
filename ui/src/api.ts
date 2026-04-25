@@ -63,6 +63,45 @@ export type ChatStreamEvent =
   | { type: "result"; answer: string; sources: Source[]; chunks: Chunk[]; model_key: string; intent: string }
   | { type: "error";  detail: string };
 
+// ── Research mode types ──────────────────────────────────────────────────────
+
+export interface EpisodeAnalysis {
+  episode: string;
+  notes:   string;
+}
+
+export interface Grounding {
+  verdict: "supported" | "partial" | "unsupported" | "unknown";
+  flags:   string[];
+}
+
+export interface ResearchData {
+  sub_queries:       string[];
+  episode_analyses:  EpisodeAnalysis[];
+  grounding:         Grounding | null;
+}
+
+export interface ResearchResult {
+  answer:    string;
+  sources:   Source[];
+  chunks:    Chunk[];
+  model_key: string;
+  intent:    string;
+  research:  ResearchData;
+}
+
+export type ResearchStreamEvent =
+  | { type: "agent_start"; agent: string; label: string }
+  | { type: "agent_end";   agent: string }
+  | { type: "step";   step: string; status: StepStatus; detail?: string; agent?: string; tool?: string }
+  | { type: "token";  text: string }
+  | { type: "plan";   sub_queries: string[] }
+  | { type: "search_results"; episodes_found: number; total_chunks: number }
+  | { type: "episode_analysis"; episode: string; notes: string }
+  | { type: "grounding"; verdict: string; flags: string[] }
+  | { type: "result"; answer: string; sources: Source[]; chunks: Chunk[]; model_key: string; intent: string; research: ResearchData }
+  | { type: "error";  detail: string };
+
 // ── Multi-model comparison types ──────────────────────────────────────────────
 
 export interface ModelResult {
@@ -223,6 +262,70 @@ export function compareModels(query: string, top_k = 5, llm_key = "claude-sonnet
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ query, top_k, llm_key }),
   });
+}
+
+export async function* researchStream(
+  query: string, top_k = 8, model_key = "minilm", llm_key = "claude-sonnet-4-5"
+): AsyncGenerator<ResearchStreamEvent> {
+  const res = await fetch(`${BASE}/chat/research`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  const reader  = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      const line = part.trim();
+      if (line.startsWith("data:")) {
+        try { yield JSON.parse(line.slice(5).trim()) as ResearchStreamEvent; }
+        catch { /* skip malformed */ }
+      }
+    }
+  }
+}
+
+export async function* researchGraphStream(
+  query: string, top_k = 8, model_key = "minilm", llm_key = "claude-sonnet-4-5"
+): AsyncGenerator<ResearchStreamEvent> {
+  const res = await fetch(`${BASE}/chat/research-graph`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  const reader  = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let   buffer  = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parts = buffer.split("\n\n");
+    buffer = parts.pop() ?? "";
+    for (const part of parts) {
+      const line = part.trim();
+      if (line.startsWith("data:")) {
+        try { yield JSON.parse(line.slice(5).trim()) as ResearchStreamEvent; }
+        catch { /* skip malformed */ }
+      }
+    }
+  }
 }
 
 export function detectSource(url: string): Promise<DetectedSource> {
