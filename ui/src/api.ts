@@ -59,6 +59,7 @@ export interface ExecStep {
 
 export type ChatStreamEvent =
   | { type: "step";   step: string; status: StepStatus; detail?: string }
+  | { type: "token";  text: string }
   | { type: "result"; answer: string; sources: Source[]; chunks: Chunk[]; model_key: string; intent: string }
   | { type: "error";  detail: string };
 
@@ -154,9 +155,14 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface LLMOption {
+  key:   string;
+  label: string;
+}
+
 export interface ServerConfig {
-  llm_provider: string;
-  llm_model:    string;
+  llm_options:    LLMOption[];
+  default_llm_key: string;
 }
 
 export function getConfig(): Promise<ServerConfig> {
@@ -172,12 +178,12 @@ export function runIngest(reindex = false): Promise<IngestResult> {
 }
 
 export async function* chatStream(
-  query: string, top_k = 5, model_key = "minilm"
+  query: string, top_k = 5, model_key = "minilm", llm_key = "claude-sonnet-4-5"
 ): AsyncGenerator<ChatStreamEvent> {
   const res = await fetch(`${BASE}/chat/stream`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ query, top_k, model_key }),
+    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -203,19 +209,19 @@ export async function* chatStream(
   }
 }
 
-export function chat(query: string, top_k = 5, model_key = "minilm"): Promise<ChatResponse> {
+export function chat(query: string, top_k = 5, model_key = "minilm", llm_key = "claude-sonnet-4-5"): Promise<ChatResponse> {
   return apiFetch<ChatResponse>("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k, model_key }),
+    body: JSON.stringify({ query, top_k, model_key, llm_key }),
   });
 }
 
-export function compareModels(query: string, top_k = 5): Promise<CompareResponse> {
+export function compareModels(query: string, top_k = 5, llm_key = "claude-sonnet-4-5"): Promise<CompareResponse> {
   return apiFetch<CompareResponse>("/chat/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k }),
+    body: JSON.stringify({ query, top_k, llm_key }),
   });
 }
 

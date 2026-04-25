@@ -314,34 +314,54 @@ body {
   gap: 0.5rem;
 }
 
-.mode-chips {
-  display: flex;
-  gap: 0.4rem;
-  padding: 0 0.25rem;
-}
+/* ── Chat toolbar (embed + LLM controls) ─────────────────────────────────── */
 
-.mode-chip {
-  padding: 0.25rem 0.75rem;
-  border-radius: 999px;
-  border: 1px solid var(--border);
-  background: none;
-  color: var(--muted);
-  font-size: 0.8rem;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s;
+.chat-toolbar {
   display: flex;
   align-items: center;
-  gap: 0.3rem;
+  gap: 0.75rem;
+  padding: 0.35rem 0.25rem 0;
 }
-.mode-chip:hover   { background: var(--surface); color: var(--text); }
-.mode-chip--active { background: var(--surface); border-color: var(--border); color: var(--text); font-weight: 500; }
 
-.llm-provider-label {
-  font-size: 0.72rem;
+.toolbar-control {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.toolbar-control-label {
+  font-size: 0.7rem;
+  font-weight: 600;
   color: var(--muted);
-  padding: 0.2rem 0.5rem;
-  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  user-select: none;
+}
+
+.toolbar-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238e8ea0'/%3E%3C/svg%3E") no-repeat right 0.5rem center;
   border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.78rem;
+  font-family: var(--font);
+  padding: 0.2rem 1.6rem 0.2rem 0.55rem;
+  cursor: pointer;
+  transition: border-color 0.12s;
+  outline: none;
+}
+.toolbar-select:hover:not(:disabled)  { border-color: #aaa; }
+.toolbar-select:disabled              { opacity: 0.5; cursor: not-allowed; }
+
+.toolbar-chip {
+  font-size: 0.78rem;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.2rem 0.55rem;
   white-space: nowrap;
   user-select: none;
 }
@@ -438,18 +458,41 @@ body {
   align-items: center;
   gap: 0.5rem;
   color: var(--muted);
+  animation: exec-step-in 0.2s ease-out both;
+}
+
+@keyframes exec-step-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 
 .exec-step-icon {
   width: 1em;
   text-align: center;
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
-.exec-step--running .exec-step-icon { color: var(--muted); }
-.exec-step--done    .exec-step-icon { color: var(--green); }
-.exec-step--error   .exec-step-icon { color: var(--red);   }
-.exec-step--error                   { color: var(--red);   }
+.exec-step-spinner {
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: exec-spin 0.6s linear infinite;
+}
+
+@keyframes exec-spin {
+  to { transform: rotate(360deg); }
+}
+
+.exec-step--running             { color: var(--text); }
+.exec-step--done .exec-step-icon { color: var(--green); }
+.exec-step--done                 { color: var(--muted); }
+.exec-step--error .exec-step-icon { color: var(--red);   }
+.exec-step--error                 { color: var(--red);   }
 
 .exec-step-name   { color: inherit; }
 .exec-step-detail {
@@ -457,6 +500,30 @@ body {
   opacity: 0.7;
 }
 .exec-step-detail::before { content: "→ "; }
+
+/* ── Typing indicator ────────────────────────────────────────────────────── */
+
+.typing-indicator {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0.4rem 0.25rem;
+}
+
+.typing-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  animation: typing-bounce 1.2s infinite ease-in-out;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.2s; }
+.typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes typing-bounce {
+  0%, 60%, 100% { transform: translateY(0);   opacity: 0.35; }
+  30%            { transform: translateY(-6px); opacity: 1;    }
+}
 
 /* ── Result panel ────────────────────────────────────────────────────────── */
 
@@ -589,6 +656,21 @@ button:not(.nav-item):not(.mode-chip):not(.link-btn):not(.send-btn):not(.new-cha
   line-height: 1.8;
   font-size: 0.9rem;
   color: var(--text);
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--accent);
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  animation: cursor-blink 0.6s steps(2) infinite;
+}
+
+@keyframes cursor-blink {
+  0%   { opacity: 1; }
+  100% { opacity: 0; }
 }
 
 /* ── Sources / chunks ────────────────────────────────────────────────────── */

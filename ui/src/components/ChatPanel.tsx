@@ -9,22 +9,25 @@ import {
   type CompareResponse,
   type ExecStep,
   type ModelResult,
-  type ServerConfig,
+  type LLMOption,
 } from "../api";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type Mode = "single" | "compare";
+// "minilm" | "multilingual" → single model mode
+// "compare"                 → side-by-side mode
+type EmbedMode = "minilm" | "multilingual" | "compare";
 
 interface Turn {
-  id:       number;
-  mode:     Mode;
-  query:    string;
-  steps:    ExecStep[];
-  loading:  boolean;
-  result?:  ChatResponse;
-  compare?: CompareResponse;
-  error?:   string;
+  id:               number;
+  embedMode:        EmbedMode;
+  query:            string;
+  steps:            ExecStep[];
+  loading:          boolean;
+  streamingAnswer?: string;
+  result?:          ChatResponse;
+  compare?:         CompareResponse;
+  error?:           string;
 }
 
 // ── Primitive display components ──────────────────────────────────────────────
@@ -90,20 +93,24 @@ function ResultPanel({ label, result }: { label?: string; result: ModelResult | 
         </div>
       )}
 
-      <button
-        className="link-btn"
-        style={{ marginTop: "0.25rem" }}
-        onClick={() => setChunksOpen(o => !o)}
-      >
-        {chunksOpen ? "Hide" : "Show"} {result.chunks.length} retrieved chunks
-      </button>
+      {result.chunks.length > 0 && (
+        <>
+          <button
+            className="link-btn"
+            style={{ marginTop: "0.25rem" }}
+            onClick={() => setChunksOpen(o => !o)}
+          >
+            {chunksOpen ? "Hide" : "Show"} {result.chunks.length} retrieved chunks
+          </button>
 
-      {chunksOpen && (
-        <div className="chunk-list" style={{ marginTop: "0.5rem" }}>
-          {result.chunks.map((chunk, i) => (
-            <ChunkCard key={i} chunk={chunk} index={i} />
-          ))}
-        </div>
+          {chunksOpen && (
+            <div className="chunk-list" style={{ marginTop: "0.5rem" }}>
+              {result.chunks.map((chunk, i) => (
+                <ChunkCard key={i} chunk={chunk} index={i} />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -112,16 +119,18 @@ function ResultPanel({ label, result }: { label?: string; result: ModelResult | 
 // ── Execution status panel ────────────────────────────────────────────────────
 
 const STEP_LABELS: Record<string, string> = {
-  classify: "classify query",
-  search:   "semantic search",
-  generate: "generate answer",
+  classify:       "classify query",
+  search:         "semantic search",
+  generate:       "generate answer",
+  fetch_episodes: "fetch episode list",
+  fetch_chunks:   "load episode chunks",
 };
 
-const STATUS_ICON: Record<string, string> = {
-  running: "·",
-  done:    "✓",
-  error:   "✗",
-};
+function StepIcon({ status }: { status: string }) {
+  if (status === "running") return <span className="exec-step-spinner" />;
+  if (status === "done")    return <span>✓</span>;
+  return <span>✗</span>;
+}
 
 function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
   if (steps.length === 0) return null;
@@ -129,7 +138,7 @@ function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
     <div className="exec-panel">
       {steps.map(s => (
         <div key={s.step} className={`exec-step exec-step--${s.status}`}>
-          <span className="exec-step-icon">{STATUS_ICON[s.status]}</span>
+          <span className="exec-step-icon"><StepIcon status={s.status} /></span>
           <span className="exec-step-name">{STEP_LABELS[s.step] ?? s.step}</span>
           {s.detail && <span className="exec-step-detail">{s.detail}</span>}
         </div>
@@ -138,18 +147,39 @@ function ExecutionPanel({ steps }: { steps: ExecStep[] }) {
   );
 }
 
+// ── Typing indicator ─────────────────────────────────────────────────────────
+
+function TypingIndicator() {
+  return (
+    <div className="typing-indicator">
+      <span className="typing-dot" />
+      <span className="typing-dot" />
+      <span className="typing-dot" />
+    </div>
+  );
+}
+
 // ── Single conversation turn ──────────────────────────────────────────────────
 
 function ChatTurn({ turn }: { turn: Turn }) {
+  const hasResponse = !!(turn.result || turn.compare || turn.error);
+  const isStreaming  = turn.loading && !!turn.streamingAnswer && !turn.result;
   return (
-    <div className={`chat-turn${turn.mode === "compare" ? " chat-turn--compare" : ""}`}>
+    <div className={`chat-turn${turn.embedMode === "compare" ? " chat-turn--compare" : ""}`}>
       <div className="turn-query-row">
         <div className="turn-query">{turn.query}</div>
       </div>
 
       <div className="turn-response">
         <ExecutionPanel steps={turn.steps} />
+        {turn.loading && !hasResponse && !turn.streamingAnswer && <TypingIndicator />}
         {turn.error && <p className="error">{turn.error}</p>}
+
+        {isStreaming && (
+          <div className="answer-block">
+            {turn.streamingAnswer}<span className="streaming-cursor" />
+          </div>
+        )}
 
         {turn.result && <ResultPanel result={turn.result} />}
 
@@ -171,22 +201,36 @@ function EmptyState() {
   return (
     <div className="chat-empty">
       <div className="chat-empty-icon">🎙</div>
-      <h2>What can I help with?</h2>
-      <p>Ask a question about your indexed podcasts, or switch to <strong>Compare</strong> mode to see two embedding models side by side.</p>
+      <h2>Ask about your podcasts</h2>
+      <p>Search episode content, list indexed episodes, or ask for a summary of a specific episode.</p>
     </div>
   );
 }
 
+// ── Embed mode options ────────────────────────────────────────────────────────
+
+const EMBED_OPTIONS: { value: EmbedMode; label: string }[] = [
+  { value: "minilm",        label: "MiniLM-L6 · EN" },
+  { value: "multilingual",  label: "MiniLM-L12 · ML" },
+  { value: "compare",       label: "Compare both" },
+];
+
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ChatPanel() {
-  const [turns,   setTurns]   = useState<Turn[]>([]);
-  const [mode,    setMode]    = useState<Mode>("single");
-  const [query,   setQuery]   = useState("");
-  const [loading, setLoading] = useState(false);
-  const [config,  setConfig]  = useState<ServerConfig | null>(null);
+  const [turns,      setTurns]      = useState<Turn[]>([]);
+  const [embedMode,  setEmbedMode]  = useState<EmbedMode>("minilm");
+  const [llmKey,     setLlmKey]     = useState("claude-sonnet-4-5");
+  const [llmOptions, setLlmOptions] = useState<LLMOption[]>([]);
+  const [query,      setQuery]      = useState("");
+  const [loading,    setLoading]    = useState(false);
 
-  useEffect(() => { getConfig().then(setConfig).catch(() => {}); }, []);
+  useEffect(() => {
+    getConfig().then(cfg => {
+      setLlmOptions(cfg.llm_options);
+      setLlmKey(cfg.default_llm_key);
+    }).catch(() => {});
+  }, []);
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef  = useRef<HTMLInputElement>(null);
@@ -202,7 +246,7 @@ export default function ChatPanel() {
     if (!q || loading) return;
 
     const id = nextId.current++;
-    const newTurn: Turn = { id, mode, query: q, steps: [], loading: true };
+    const newTurn: Turn = { id, embedMode, query: q, steps: [], loading: true };
 
     setTurns(prev => [...prev, newTurn]);
     setQuery("");
@@ -218,16 +262,20 @@ export default function ChatPanel() {
         return { ...t, steps: [...steps, step] };
       }));
 
+    // Accumulate tokens in a ref to avoid O(n²) string concat in each setState.
+    let tokenBuf = "";
+
     try {
-      if (mode === "single") {
-        for await (const event of chatStream(q)) {
+      if (embedMode === "compare") {
+        const compare = await compareModels(q, 5, llmKey);
+        patch({ loading: false, compare });
+      } else {
+        for await (const event of chatStream(q, 5, embedMode, llmKey)) {
           if (event.type === "step")   patchStep({ step: event.step, status: event.status, detail: event.detail });
-          if (event.type === "result") patch({ loading: false, result: event });
+          if (event.type === "token")  { tokenBuf += event.text; patch({ streamingAnswer: tokenBuf }); }
+          if (event.type === "result") patch({ loading: false, streamingAnswer: undefined, result: event });
           if (event.type === "error")  patch({ loading: false, error: event.detail });
         }
-      } else {
-        const compare = await compareModels(q);
-        patch({ loading: false, compare });
       }
     } catch (err) {
       patch({ loading: false, error: (err as Error).message });
@@ -248,28 +296,6 @@ export default function ChatPanel() {
       {/* Input area */}
       <div className="chat-input-area">
         <div className="chat-input-shell">
-          {/* Mode chips + provider label */}
-          <div className="mode-chips" style={{ justifyContent: "space-between" }}>
-            <button
-              type="button"
-              className={`mode-chip${mode === "single" ? " mode-chip--active" : ""}`}
-              onClick={() => setMode("single")}
-            >
-              Single model
-            </button>
-            <button
-              type="button"
-              className={`mode-chip${mode === "compare" ? " mode-chip--active" : ""}`}
-              onClick={() => setMode("compare")}
-            >
-              Compare models
-            </button>
-            {config && (
-              <span className="llm-provider-label">
-                {config.llm_model}
-              </span>
-            )}
-          </div>
 
           {/* Composer box */}
           <form onSubmit={handleSubmit}>
@@ -280,7 +306,7 @@ export default function ChatPanel() {
                 type="text"
                 value={query}
                 onChange={e => setQuery(e.target.value)}
-                placeholder="Ask a question…"
+                placeholder="Ask about your podcasts…"
                 disabled={loading}
                 autoFocus
               />
@@ -297,8 +323,41 @@ export default function ChatPanel() {
             </div>
           </form>
 
+          {/* Toolbar: embed selector + LLM chip */}
+          <div className="chat-toolbar">
+            <div className="toolbar-control">
+              <span className="toolbar-control-label">Embed</span>
+              <select
+                className="toolbar-select"
+                value={embedMode}
+                onChange={e => setEmbedMode(e.target.value as EmbedMode)}
+                disabled={loading}
+              >
+                {EMBED_OPTIONS.map(o => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {llmOptions.length > 0 && (
+              <div className="toolbar-control">
+                <span className="toolbar-control-label">LLM</span>
+                <select
+                  className="toolbar-select"
+                  value={llmKey}
+                  onChange={e => setLlmKey(e.target.value)}
+                  disabled={loading}
+                >
+                  {llmOptions.map(o => (
+                    <option key={o.key} value={o.key}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
+
           <p className="chat-input-disclaimer">
-            Podcast RAG can make mistakes. Verify important information.
+            Answers are grounded in indexed podcast content only.
           </p>
         </div>
       </div>
