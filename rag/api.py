@@ -33,6 +33,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from rag.chat import ask, ask_stream, compare
+from rag.research import research_stream
+from rag.research_graph import research_graph_stream
 from rag.config import ANTHROPIC_API_KEY, DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, OPENAI_API_KEY, TOP_K
 from rag.embed import MODEL_KEYS
 from rag.database import get_connection, init_db, list_episodes
@@ -93,6 +95,13 @@ class RssIngestRequest(BaseModel):
     feed_title: str
     whisper_model: str = "medium"
     episodes: list[RssEpisodeIn]
+
+
+class ResearchRequest(BaseModel):
+    query:     str
+    top_k:     int = 8
+    model_key: str = DEFAULT_MODEL_KEY
+    llm_key:   str = DEFAULT_LLM_KEY
 
 
 class DetectRequest(BaseModel):
@@ -239,6 +248,117 @@ async def compare_endpoint(body: CompareRequest):
 
     result = await asyncio.to_thread(compare, body.query, body.top_k, body.llm_key)
     return result
+
+
+@app.post("/chat/research")
+async def research_endpoint(body: ResearchRequest):
+    """
+    Multi-step research pipeline streamed via SSE.
+
+    Decomposes the query, searches multiple angles, analyzes episodes,
+    synthesizes a structured answer, and verifies grounding.
+
+    Uses the same SSE pattern as /chat/stream — events are yielded one at a
+    time via to_thread(next, gen).
+    """
+    _require_llm(body.llm_key)
+    if body.model_key not in MODEL_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
+        )
+
+    async def generate():
+        gen = research_stream(body.query, body.top_k, body.model_key, body.llm_key)
+        try:
+            while True:
+                event = await asyncio.to_thread(next, gen, _SENTINEL)
+                if event is _SENTINEL:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/chat/research-graph")
+async def research_graph_endpoint(body: ResearchRequest):
+    """
+    LangGraph-based research pipeline streamed via SSE.
+
+    Same research workflow as /chat/research but orchestrated by LangGraph
+    with explicit graph nodes and typed state passing.
+
+    Token streaming: the synthesizer node pushes tokens to a queue.Queue.
+    A background thread runs the graph and feeds all events (step events
+    from the graph + token events from the queue) into a single
+    asyncio.Queue that the SSE generator reads from.
+    """
+    _require_llm(body.llm_key)
+    if body.model_key not in MODEL_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
+        )
+
+    import queue as stdlib_queue
+
+    loop = asyncio.get_running_loop()
+    async_q: asyncio.Queue[Optional[dict]] = asyncio.Queue()
+    token_q: stdlib_queue.Queue = stdlib_queue.Queue()
+
+    def _run_graph():
+        """Run in a thread: iterate the graph stream and drain the token queue."""
+        import threading
+
+        # Token drain thread: reads from the sync token_q and pushes to async_q
+        def _drain_tokens():
+            while True:
+                tok = token_q.get()
+                if tok is None:
+                    break
+                loop.call_soon_threadsafe(async_q.put_nowait, tok)
+
+        drain = threading.Thread(target=_drain_tokens, daemon=True)
+        drain.start()
+
+        try:
+            for event in research_graph_stream(
+                body.query, body.top_k, body.model_key, body.llm_key, token_q,
+            ):
+                # Don't duplicate token events (they come via the drain thread)
+                if event.get("type") != "token":
+                    loop.call_soon_threadsafe(async_q.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                async_q.put_nowait,
+                {"type": "error", "detail": str(exc)},
+            )
+        finally:
+            # Ensure drain thread exits
+            token_q.put(None)
+            drain.join(timeout=5)
+            loop.call_soon_threadsafe(async_q.put_nowait, None)
+
+    async def generate():
+        asyncio.get_running_loop().run_in_executor(None, _run_graph)
+
+        while True:
+            event = await async_q.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/detect")
