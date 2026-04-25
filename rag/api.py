@@ -33,7 +33,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from rag.chat import ask, ask_stream, compare
-from rag.config import ANTHROPIC_API_KEY, ANTHROPIC_MODEL, DEFAULT_MODEL_KEY, LLM_PROVIDER, OLLAMA_MODEL, TOP_K
+from rag.config import ANTHROPIC_API_KEY, DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, OPENAI_API_KEY, TOP_K
 from rag.embed import MODEL_KEYS
 from rag.database import get_connection, init_db, list_episodes
 from rag.ingest import ingest_all
@@ -69,14 +69,16 @@ app.add_middleware(
 # ── Request / Response models ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    query: str
-    top_k: int = TOP_K
+    query:     str
+    top_k:     int = TOP_K
     model_key: str = DEFAULT_MODEL_KEY
+    llm_key:   str = DEFAULT_LLM_KEY
 
 
 class CompareRequest(BaseModel):
-    query: str
-    top_k: int = TOP_K
+    query:   str
+    top_k:   int = TOP_K
+    llm_key: str = DEFAULT_LLM_KEY
 
 
 class RssEpisodeIn(BaseModel):
@@ -106,11 +108,17 @@ class UrlIngestRequest(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _require_llm() -> None:
-    if LLM_PROVIDER == "anthropic" and not ANTHROPIC_API_KEY:
+def _require_llm(llm_key: str = DEFAULT_LLM_KEY) -> None:
+    cfg = LLM_REGISTRY.get(llm_key, LLM_REGISTRY[DEFAULT_LLM_KEY])
+    if cfg.provider == "anthropic" and not ANTHROPIC_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="ANTHROPIC_API_KEY is not configured. Add it to .env or set LLM_PROVIDER=ollama.",
+            detail="ANTHROPIC_API_KEY is not configured. Add it to .env.",
+        )
+    if cfg.provider == "openai" and not OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_API_KEY is not configured. Add it to .env.",
         )
 
 
@@ -118,9 +126,11 @@ def _require_llm() -> None:
 
 @app.get("/config")
 async def config_endpoint():
-    """Return the active LLM provider and model name for the UI."""
-    model = ANTHROPIC_MODEL if LLM_PROVIDER == "anthropic" else OLLAMA_MODEL
-    return {"llm_provider": LLM_PROVIDER, "llm_model": model}
+    """Return available LLM options and the default key for the UI."""
+    return {
+        "llm_options":    [{"key": k, "label": v.label} for k, v in LLM_REGISTRY.items()],
+        "default_llm_key": DEFAULT_LLM_KEY,
+    }
 
 
 @app.post("/ingest")
@@ -159,15 +169,18 @@ async def chat_endpoint(body: ChatRequest):
     ask() is I/O-bound (Anthropic API call) and uses the synchronous SDK,
     so we run it in a thread just like ingest.
     """
-    _require_llm()
+    _require_llm(body.llm_key)
     if body.model_key not in MODEL_KEYS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
         )
 
-    result = await asyncio.to_thread(ask, body.query, body.top_k, body.model_key)
+    result = await asyncio.to_thread(ask, body.query, body.top_k, body.model_key, body.llm_key)
     return result
+
+
+_SENTINEL = object()
 
 
 @app.post("/chat/stream")
@@ -175,40 +188,33 @@ async def chat_stream_endpoint(body: ChatRequest):
     """
     Same as /chat but streams execution steps as SSE before the final result.
 
+    The pipeline (ask_stream) is a sync generator that yields events between
+    blocking steps.  We advance it one yield at a time via to_thread(next, gen)
+    so each event is flushed to the SSE stream immediately — the event loop is
+    never blocked.
+
     Events:
       {"type": "step",   "step": str, "status": "running"|"done"|"error", "detail": str|None}
       {"type": "result", "answer": str, "sources": [...], "chunks": [...], "model_key": str, "intent": str}
       {"type": "error",  "detail": str}
     """
-    _require_llm()
+    _require_llm(body.llm_key)
     if body.model_key not in MODEL_KEYS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
         )
 
-    loop  = asyncio.get_running_loop()
-    queue: asyncio.Queue[Optional[dict]] = asyncio.Queue()
-
-    def event_cb(event: dict) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, event)
-
     async def generate():
-        async def _run():
-            try:
-                ask_stream(body.query, body.top_k, body.model_key, event_cb)
-            except Exception as exc:
-                event_cb({"type": "error", "detail": str(exc)})
-            finally:
-                loop.call_soon_threadsafe(queue.put_nowait, None)
-
-        asyncio.ensure_future(_run())
-
-        while True:
-            event = await queue.get()
-            if event is None:
-                break
-            yield f"data: {json.dumps(event)}\n\n"
+        gen = ask_stream(body.query, body.top_k, body.model_key, body.llm_key)
+        try:
+            while True:
+                event = await asyncio.to_thread(next, gen, _SENTINEL)
+                if event is _SENTINEL:
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -229,9 +235,9 @@ async def compare_endpoint(body: CompareRequest):
 
     Returns {model_key: {answer, sources, chunks, model_key}} for each model.
     """
-    _require_llm()
+    _require_llm(body.llm_key)
 
-    result = await asyncio.to_thread(compare, body.query, body.top_k)
+    result = await asyncio.to_thread(compare, body.query, body.top_k, body.llm_key)
     return result
 
 
