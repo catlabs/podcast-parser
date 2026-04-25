@@ -64,11 +64,49 @@ TOP_K = 5   # default number of results to retrieve
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
-# Provider: "anthropic" (default) or "ollama"
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "anthropic")
-
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL   = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "llama3")
+OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str   # "anthropic" | "openai" | "ollama"
+    model:    str   # model identifier
+    label:    str   # human-readable label shown in the UI
+
+
+# Add or remove entries here to control what appears in the LLM dropdown.
+# "Ollama · <model>" always points to the local Ollama instance (OLLAMA_BASE_URL).
+LLM_REGISTRY: dict[str, LLMConfig] = {
+    "claude-sonnet-4-5": LLMConfig(
+        provider = "anthropic",
+        model    = "claude-sonnet-4-5",
+        label    = "Claude Sonnet 4.5",
+    ),
+    "claude-haiku-4-5": LLMConfig(
+        provider = "anthropic",
+        model    = "claude-haiku-4-5-20251001",
+        label    = "Claude Haiku 4.5",
+    ),
+    "gpt-4o": LLMConfig(
+        provider = "openai",
+        model    = "gpt-4o",
+        label    = "GPT-4o",
+    ),
+    "gpt-4o-mini": LLMConfig(
+        provider = "openai",
+        model    = "gpt-4o-mini",
+        label    = "GPT-4o mini",
+    ),
+    "ollama": LLMConfig(
+        provider = "ollama",
+        model    = OLLAMA_MODEL,
+        label    = f"Ollama · {OLLAMA_MODEL}",
+    ),
+}
+
+DEFAULT_LLM_KEY = "claude-sonnet-4-5"

@@ -1,15 +1,15 @@
 """
 rag/llm.py
 ==========
-Thin provider abstraction for LLM answer generation.
+Provider abstraction for LLM answer generation.
 
-Supported providers (selected via LLM_PROVIDER env var):
-  "anthropic"  — Claude via the Anthropic SDK  (default)
+Supported providers (selected via LLM_REGISTRY / llm_key):
+  "anthropic"  — Claude via the Anthropic SDK
   "ollama"     — any local model via Ollama /api/generate
 
 Public API:
-  generate(system, user) -> str
-  ollama_call(system, user, *, format=None) -> str   (always Ollama, used by router)
+  generate(system, user, llm_key=None) -> str
+  generate_stream(system, user, llm_key=None) -> Generator[str]
 """
 
 import json
@@ -17,34 +17,52 @@ import urllib.error
 import urllib.request
 
 import anthropic
+import openai as _openai_sdk
 
 from rag.config import (
     ANTHROPIC_API_KEY,
-    ANTHROPIC_MODEL,
-    LLM_PROVIDER,
+    DEFAULT_LLM_KEY,
+    LLM_REGISTRY,
+    LLMConfig,
     OLLAMA_BASE_URL,
-    OLLAMA_MODEL,
+    OPENAI_API_KEY,
 )
 
 
-def generate(system: str, user: str) -> str:
-    """Call the configured LLM provider and return the answer text."""
-    if LLM_PROVIDER == "ollama":
-        return ollama_call(system, user)
-    return _anthropic(system, user)
+def _resolve(llm_key: str | None) -> LLMConfig:
+    key = llm_key or DEFAULT_LLM_KEY
+    return LLM_REGISTRY.get(key, LLM_REGISTRY[DEFAULT_LLM_KEY])
+
+
+def generate(system: str, user: str, llm_key: str | None = None) -> str:
+    """Call the selected LLM and return the answer text."""
+    cfg = _resolve(llm_key)
+    if cfg.provider == "ollama":
+        return _ollama(system, user, cfg.model)
+    if cfg.provider == "openai":
+        return _openai(system, user, cfg.model)
+    return _anthropic(system, user, cfg.model)
+
+
+def generate_stream(system: str, user: str, llm_key: str | None = None):
+    """Yield text chunks from the selected LLM."""
+    cfg = _resolve(llm_key)
+    if cfg.provider == "ollama":
+        yield from _ollama_stream(system, user, cfg.model)
+    elif cfg.provider == "openai":
+        yield from _openai_stream(system, user, cfg.model)
+    else:
+        yield from _anthropic_stream(system, user, cfg.model)
 
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
-def _anthropic(system: str, user: str) -> str:
+def _anthropic(system: str, user: str, model: str) -> str:
     if not ANTHROPIC_API_KEY:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. "
-            "Add it to .env or set LLM_PROVIDER=ollama to use a local model."
-        )
+        raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
     client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     response = client.messages.create(
-        model      = ANTHROPIC_MODEL,
+        model      = model,
         max_tokens = 1024,
         system     = system,
         messages   = [{"role": "user", "content": user}],
@@ -52,18 +70,62 @@ def _anthropic(system: str, user: str) -> str:
     return response.content[0].text
 
 
-# ── Ollama ────────────────────────────────────────────────────────────────────
+def _anthropic_stream(system: str, user: str, model: str):
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    with client.messages.stream(
+        model      = model,
+        max_tokens = 1024,
+        system     = system,
+        messages   = [{"role": "user", "content": user}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
 
-def ollama_call(system: str, user: str, *, fmt: str | None = None) -> str:
-    """
-    POST to Ollama /api/generate with stream=false.
 
-    fmt="json" activates Ollama's constrained JSON output mode — the model
-    is forced to emit valid JSON regardless of what the prompt says.
-    Uses only stdlib; no extra dependency required.
-    """
+# ── OpenAI ───────────────────────────────────────────────────────────────────
+
+def _openai(system: str, user: str, model: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env.")
+    client   = _openai_sdk.OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model    = model,
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        max_tokens = 1024,
+    )
+    return response.choices[0].message.content or ""
+
+
+def _openai_stream(system: str, user: str, model: str):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set. Add it to .env.")
+    client = _openai_sdk.OpenAI(api_key=OPENAI_API_KEY)
+    stream = client.chat.completions.create(
+        model    = model,
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ],
+        max_tokens = 1024,
+        stream     = True,
+    )
+    for chunk in stream:
+        text = chunk.choices[0].delta.content
+        if text:
+            yield text
+
+
+# ── Ollama (local) ────────────────────────────────────────────────────────────
+
+def _ollama(system: str, user: str, model: str, *, fmt: str | None = None) -> str:
+    """POST to local Ollama /api/generate with stream=false."""
     payload: dict = {
-        "model":  OLLAMA_MODEL,
+        "model":  model,
         "system": system,
         "prompt": user,
         "stream": False,
@@ -84,7 +146,7 @@ def ollama_call(system: str, user: str, *, fmt: str | None = None) -> str:
         detail = exc.read().decode(errors="replace")
         raise RuntimeError(
             f"Ollama error {exc.code}: {detail}\n"
-            f"Hint: run `ollama pull {OLLAMA_MODEL}` if the model is not installed."
+            f"Hint: run `ollama pull {model}` if the model is not installed."
         ) from exc
     except OSError as exc:
         raise RuntimeError(
@@ -92,3 +154,36 @@ def ollama_call(system: str, user: str, *, fmt: str | None = None) -> str:
         ) from exc
 
     return body["response"]
+
+
+def _ollama_stream(system: str, user: str, model: str):
+    """POST to local Ollama /api/generate with stream=true, yield text chunks."""
+    payload: dict = {
+        "model":  model,
+        "system": system,
+        "prompt": user,
+        "stream": True,
+    }
+    req = urllib.request.Request(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        data    = json.dumps(payload).encode(),
+        headers = {"Content-Type": "application/json"},
+        method  = "POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            for line in resp:
+                data  = json.loads(line)
+                token = data.get("response", "")
+                if token:
+                    yield token
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise RuntimeError(
+            f"Ollama error {exc.code}: {detail}\n"
+            f"Hint: run `ollama pull {model}` if the model is not installed."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot reach Ollama at {OLLAMA_BASE_URL} — is it running?\n{exc}"
+        ) from exc
