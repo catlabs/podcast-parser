@@ -14,12 +14,20 @@ from dotenv import load_dotenv
 load_dotenv()   # reads .env if present; no-op if not
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
+# Defaults match the original layout. Each path can be overridden by an env
+# variable so the same code runs unchanged in containers, mounted volumes, or
+# (later) Azure-backed storage layouts.
 
-BASE_DIR   = Path(__file__).parent.parent   # podcast-parser/
-OUTPUT_DIR = BASE_DIR / "output"            # where transcripts live
-DATA_DIR   = BASE_DIR / "rag" / "data"      # created at runtime; gitignored
-CHROMA_DIR = DATA_DIR / "chroma"            # ChromaDB persistence
-DB_PATH    = DATA_DIR / "metadata.db"       # SQLite episode metadata
+BASE_DIR = Path(__file__).parent.parent   # podcast-parser/
+
+def _path_from_env(var: str, default: Path) -> Path:
+    raw = os.environ.get(var)
+    return Path(raw).expanduser() if raw else default
+
+OUTPUT_DIR = _path_from_env("OUTPUT_DIR", BASE_DIR / "output")
+DATA_DIR   = _path_from_env("DATA_DIR",   BASE_DIR / "rag" / "data")
+CHROMA_DIR = _path_from_env("CHROMA_DIR", DATA_DIR / "chroma")
+DB_PATH    = _path_from_env("DB_PATH",    DATA_DIR / "metadata.db")
 
 # ── Embedding registry ────────────────────────────────────────────────────────
 

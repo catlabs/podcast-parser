@@ -19,6 +19,7 @@ Run:
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
 
 logging.basicConfig(
@@ -60,9 +61,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Podcast RAG", lifespan=lifespan)
 
+# CORS origins are configurable via the CORS_ALLOW_ORIGINS env var
+# (comma-separated). Default preserves the original local-dev origin.
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=_cors_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )

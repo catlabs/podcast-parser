@@ -1,0 +1,25 @@
+# Backend runtime dependencies.
+# Versions are intentionally loose — pin in CI once an Azure target is chosen.
+
+# ── Web layer ────────────────────────────────────────────────────────────────
+fastapi
+uvicorn
+pydantic
+python-dotenv
+
+# ── Ingestion ────────────────────────────────────────────────────────────────
+feedparser
+requests
+openai-whisper
+yt-dlp
+
+# ── Indexing / retrieval ─────────────────────────────────────────────────────
+sentence-transformers
+chromadb
+
+# ── LLM providers ────────────────────────────────────────────────────────────
+anthropic
+openai
+
+# ── Research orchestration ───────────────────────────────────────────────────
+langgraph

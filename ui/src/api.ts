@@ -2,7 +2,9 @@
 // All fetch calls and TypeScript types live here.
 // Components import from this file; they never call fetch directly.
 
-const BASE = "http://localhost:8000";
+// API base URL: override via VITE_API_BASE_URL at build time
+// (see ui/.env.example). Default preserves the original local-dev value.
+const BASE = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000") as string;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
