@@ -377,6 +377,28 @@ def transcribe_audio(
     return text, model
 
 
+# ── SpeechTranscriber adapter ─────────────────────────────────────────────────
+
+class LocalSpeechTranscriber:
+    """Implements SpeechTranscriber using local Whisper.
+
+    Stateful: the model is lazily loaded on the first .transcribe() call and
+    reused for subsequent calls — mirrors the existing pattern where rss.py
+    and yt.py thread `loaded_model` through transcribe_audio() to avoid
+    reloading weights between episodes.
+    """
+
+    def __init__(self, model_name: str = "medium"):
+        self.model_name    = model_name
+        self._loaded_model: object | None = None
+
+    def transcribe(self, audio_path: Path) -> str:
+        text, self._loaded_model = transcribe_audio(
+            audio_path, self.model_name, self._loaded_model,
+        )
+        return text
+
+
 def main() -> None:
     args = parse_args()
     if args.limit < 1:

@@ -187,3 +187,24 @@ def _ollama_stream(system: str, user: str, model: str):
         raise RuntimeError(
             f"Cannot reach Ollama at {OLLAMA_BASE_URL} — is it running?\n{exc}"
         ) from exc
+
+
+# ── ChatProvider adapter ──────────────────────────────────────────────────────
+
+class LocalChatProvider:
+    """Adapter exposing this module's provider dispatch as a ChatProvider.
+
+    Holds the llm_key as state so consumers can pass a configured instance
+    around without re-resolving it on every call. Implementation simply
+    delegates to the module-level generate / generate_stream functions —
+    no new branching logic.
+    """
+
+    def __init__(self, llm_key: str | None = None):
+        self.llm_key = llm_key
+
+    def generate(self, system: str, user: str) -> str:
+        return generate(system, user, self.llm_key)
+
+    def generate_stream(self, system: str, user: str):
+        return generate_stream(system, user, self.llm_key)

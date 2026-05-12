@@ -63,3 +63,67 @@ def get_collection(model_key: str = DEFAULT_MODEL_KEY) -> chromadb.Collection:
         col_name = COLLECTIONS[model_key]
         _collections[model_key] = _get_client().get_or_create_collection(col_name)
     return _collections[model_key]
+
+
+# ── EmbeddingProvider / VectorStore adapters ─────────────────────────────────
+# Wrap the cached SentenceTransformer and Chroma collection above as instances
+# of the rag.interfaces protocols. The caches are unchanged — these classes
+# are thin objects that route through get_model / get_collection, so behavior
+# and memory footprint stay identical to the existing function-based API.
+
+class LocalEmbeddingProvider:
+    """Implements EmbeddingProvider using sentence-transformers."""
+
+    def __init__(self, model_key: str = DEFAULT_MODEL_KEY):
+        if model_key not in EMBED_MODELS:
+            raise ValueError(f"Unknown model_key {model_key!r}. Valid keys: {MODEL_KEYS}")
+        self.model_key = model_key
+        self.name      = EMBED_MODELS[model_key]
+
+    def encode(self, texts):
+        return (
+            get_model(self.model_key)
+            .encode(list(texts), show_progress_bar=False)
+            .tolist()
+        )
+
+
+class LocalVectorStore:
+    """Implements VectorStore against a ChromaDB collection.
+
+    `query()` reshapes Chroma's batched response into the protocol's flat
+    list-of-dicts form (text/metadata/distance). Distance is left unrounded
+    here; callers that need the legacy 4-decimal rounding (rag.search) keep
+    doing it themselves until they migrate to this adapter.
+    """
+
+    def __init__(self, model_key: str = DEFAULT_MODEL_KEY):
+        if model_key not in COLLECTIONS:
+            raise ValueError(f"Unknown model_key {model_key!r}. Valid keys: {MODEL_KEYS}")
+        self.model_key       = model_key
+        self.collection_name = COLLECTIONS[model_key]
+
+    def _coll(self) -> chromadb.Collection:
+        return get_collection(self.model_key)
+
+    def upsert(self, ids, documents, embeddings, metadatas):
+        self._coll().upsert(
+            ids        = list(ids),
+            documents  = list(documents),
+            embeddings = [list(e) for e in embeddings],
+            metadatas  = list(metadatas),
+        )
+
+    def query(self, embedding, top_k: int):
+        raw = self._coll().query(
+            query_embeddings = [list(embedding)],
+            n_results        = top_k,
+        )
+        return [
+            {"text": doc, "metadata": meta, "distance": dist}
+            for doc, meta, dist in zip(
+                raw["documents"][0],
+                raw["metadatas"][0],
+                raw["distances"][0],
+            )
+        ]
