@@ -21,7 +21,8 @@ import sys
 
 from rag.config import DEFAULT_MODEL_KEY
 from rag.database import get_connection, init_db, record_model_indexing
-from rag.embed import get_collection, get_model
+from rag.embed import get_collection
+from rag.providers import get_embedding_provider
 
 TARGET_KEY = "multilingual"
 
@@ -78,14 +79,14 @@ def backfill_episode(
     documents = batch["documents"]
     metadatas = batch["metadatas"]
 
-    target_model = get_model(TARGET_KEY)
-    target_col   = get_collection(TARGET_KEY)
+    target_provider = get_embedding_provider(TARGET_KEY)
+    target_col      = get_collection(TARGET_KEY)
 
-    embeddings = target_model.encode(documents, show_progress_bar=False)
+    embeddings = target_provider.encode(documents)
     target_col.upsert(
         ids        = ids,
         documents  = documents,
-        embeddings = embeddings.tolist(),
+        embeddings = embeddings,
         metadatas  = metadatas,
     )
 

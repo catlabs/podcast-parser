@@ -37,7 +37,8 @@ from rag.database import (
     record_model_indexing,
     upsert_episode,
 )
-from rag.embed import get_collection, get_model
+from rag.embed import get_collection
+from rag.providers import get_embedding_provider
 
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
@@ -141,13 +142,13 @@ def ingest_file(
     ]
 
     for key in model_keys:
-        model      = get_model(key)
-        collection = get_collection(key)
-        embeddings = model.encode(chunks, show_progress_bar=False)
+        embedding_provider = get_embedding_provider(key)
+        collection         = get_collection(key)
+        embeddings         = embedding_provider.encode(chunks)
         collection.upsert(
             ids        = ids,
             documents  = chunks,
-            embeddings = embeddings.tolist(),
+            embeddings = embeddings,
             metadatas  = metadatas,
         )
 

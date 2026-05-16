@@ -13,7 +13,8 @@ Run directly to try a query:
 """
 
 from rag.config import DEFAULT_MODEL_KEY, TOP_K
-from rag.embed import get_collection, get_model
+from rag.embed import get_collection
+from rag.providers import get_embedding_provider
 
 
 # ── Search ────────────────────────────────────────────────────────────────────
@@ -40,9 +41,9 @@ def semantic_search(
         "model_key":   str,    # which model produced this result
       }
     """
-    query_vec  = get_model(model_key).encode([query])
-    raw        = get_collection(model_key).query(
-        query_embeddings=query_vec.tolist(),
+    query_vec = get_embedding_provider(model_key).encode([query])
+    raw       = get_collection(model_key).query(
+        query_embeddings=query_vec,
         n_results=top_k,
     )
 
