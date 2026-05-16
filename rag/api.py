@@ -36,7 +36,17 @@ from pydantic import BaseModel
 from rag.chat import ask, ask_stream, compare
 from rag.research import research_stream
 from rag.research_graph import research_graph_stream
-from rag.config import ANTHROPIC_API_KEY, DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, OPENAI_API_KEY, TOP_K
+from rag.config import (
+    ANTHROPIC_API_KEY,
+    AZURE_OPENAI_API_KEY,
+    AZURE_OPENAI_DEPLOYMENT,
+    AZURE_OPENAI_ENDPOINT,
+    DEFAULT_LLM_KEY,
+    DEFAULT_MODEL_KEY,
+    LLM_REGISTRY,
+    OPENAI_API_KEY,
+    TOP_K,
+)
 from rag.embed import MODEL_KEYS
 from rag.database import get_connection, init_db, list_episodes
 from rag.ingest import ingest_all
@@ -138,6 +148,19 @@ def _require_llm(llm_key: str = DEFAULT_LLM_KEY) -> None:
             status_code=503,
             detail="OPENAI_API_KEY is not configured. Add it to .env.",
         )
+    if cfg.provider == "azure_openai":
+        missing = [
+            name for name, value in (
+                ("AZURE_OPENAI_ENDPOINT",   AZURE_OPENAI_ENDPOINT),
+                ("AZURE_OPENAI_API_KEY",    AZURE_OPENAI_API_KEY),
+                ("AZURE_OPENAI_DEPLOYMENT", AZURE_OPENAI_DEPLOYMENT),
+            ) if not value
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Azure OpenAI is not fully configured. Missing: {', '.join(missing)}. Add to .env.",
+            )
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────

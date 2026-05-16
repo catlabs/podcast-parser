@@ -16,7 +16,7 @@ matching get_* is called.
 
 from __future__ import annotations
 
-from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY
+from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY
 from rag.interfaces import (
     ChatProvider,
     EmbeddingProvider,
@@ -27,9 +27,19 @@ from rag.interfaces import (
 
 
 def get_chat_provider(llm_key: str | None = None) -> ChatProvider:
-    """Return a ChatProvider for the given LLM key. Defaults to the system default."""
+    """Return a ChatProvider for the given LLM key.
+
+    Dispatch is driven by LLM_REGISTRY[<key>].provider. Local (Anthropic /
+    OpenAI / Ollama) is the default; "azure_openai" routes to the Azure
+    variant. Unknown keys fall back to the system default.
+    """
+    key = llm_key or DEFAULT_LLM_KEY
+    cfg = LLM_REGISTRY.get(key, LLM_REGISTRY[DEFAULT_LLM_KEY])
+    if cfg.provider == "azure_openai":
+        from rag.azure_openai import AzureOpenAIChatProvider
+        return AzureOpenAIChatProvider()
     from rag.llm import LocalChatProvider
-    return LocalChatProvider(llm_key or DEFAULT_LLM_KEY)
+    return LocalChatProvider(key)
 
 
 def get_embedding_provider(model_key: str = DEFAULT_MODEL_KEY) -> EmbeddingProvider:

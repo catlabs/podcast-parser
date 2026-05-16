@@ -79,11 +79,19 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 
+# Azure OpenAI — optional, opt-in. The azure-openai LLM entry is added to the
+# registry only when AZURE_OPENAI_ENDPOINT is set, so users who never deploy
+# Azure don't see a non-functional option in the UI dropdown.
+AZURE_OPENAI_ENDPOINT    = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+AZURE_OPENAI_API_KEY     = os.environ.get("AZURE_OPENAI_API_KEY", "")
+AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+
 
 @dataclass(frozen=True)
 class LLMConfig:
-    provider: str   # "anthropic" | "openai" | "ollama"
-    model:    str   # model identifier
+    provider: str   # "anthropic" | "openai" | "ollama" | "azure_openai"
+    model:    str   # model identifier (or Azure deployment name)
     label:    str   # human-readable label shown in the UI
 
 
@@ -116,5 +124,19 @@ LLM_REGISTRY: dict[str, LLMConfig] = {
         label    = f"Ollama · {OLLAMA_MODEL}",
     ),
 }
+
+# Conditionally register Azure OpenAI. Only appears when an endpoint is set;
+# the deployment-specific label is used when AZURE_OPENAI_DEPLOYMENT is also
+# set. Missing api_key / deployment at request time is reported as 503 by
+# rag/api.py:_require_llm.
+if AZURE_OPENAI_ENDPOINT:
+    LLM_REGISTRY["azure-openai"] = LLMConfig(
+        provider = "azure_openai",
+        model    = AZURE_OPENAI_DEPLOYMENT,
+        label    = (
+            f"Azure · {AZURE_OPENAI_DEPLOYMENT}"
+            if AZURE_OPENAI_DEPLOYMENT else "Azure OpenAI"
+        ),
+    )
 
 DEFAULT_LLM_KEY = "claude-sonnet-4-5"
