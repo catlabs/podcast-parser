@@ -143,6 +143,84 @@ call site, not a refactor.
 
 ---
 
+---
+
+## Step 4 — consumer rewire (ChatProvider only)
+
+All LLM call sites now go through the factory:
+
+- `rag/router.py`, `rag/chat.py`, `rag/research.py`, `rag/research_graph.py`
+  build a provider with `get_chat_provider(llm_key)` and call
+  `chat.generate(...)` / `chat.generate_stream(...)`.
+- `rag/llm.py` still exports `generate` / `generate_stream` for internal use
+  by `LocalChatProvider` — no consumer calls them directly anymore.
+
+The contract from Step 3 is now load-bearing: an alternate `ChatProvider`
+swap is a single factory dispatch, not a multi-file refactor. Validated by
+the next step.
+
+---
+
+## Step 5 — Azure OpenAI chat provider
+
+First real Azure variant slots in behind the existing factory. Local
+providers stay default; consumers don't change at all.
+
+### What ships
+
+- **`rag/azure_openai.py` (new)** — `AzureOpenAIChatProvider`. Implements
+  `ChatProvider` against the `openai` SDK's `AzureOpenAI` client. Lazy-
+  constructs the client on the first call so the `openai` package never
+  sees empty config and so importing the module stays cheap.
+- **`rag/config.py`** — reads four env vars (`AZURE_OPENAI_ENDPOINT`,
+  `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`, `AZURE_OPENAI_API_VERSION`).
+  Adds an `azure-openai` entry to `LLM_REGISTRY` **only when**
+  `AZURE_OPENAI_ENDPOINT` is set — keeps the UI dropdown clean for users
+  who never deploy Azure.
+- **`rag/providers.py`** — `get_chat_provider` now inspects
+  `LLMConfig.provider` and returns `AzureOpenAIChatProvider` when it's
+  `"azure_openai"`; everything else still returns `LocalChatProvider`.
+- **`rag/api.py`** — `_require_llm` returns 503 if any of the three
+  required Azure vars is missing when an Azure key is selected.
+- **`.env.example`** — `AZURE_OPENAI_*` block moved from "NOT USED YET" to
+  an active "Azure OpenAI — optional, opt-in" section.
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `AZURE_OPENAI_ENDPOINT` | — | e.g. `https://<resource>.openai.azure.com`. Presence enables the dropdown entry. |
+| `AZURE_OPENAI_API_KEY` | — | Primary or secondary key from the Azure portal. |
+| `AZURE_OPENAI_DEPLOYMENT` | — | Deployment name (NOT the model name). |
+| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Optional override. |
+
+### Activating Azure in a session
+
+```bash
+# in .env
+AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_DEPLOYMENT=gpt-4o-prod
+# AZURE_OPENAI_API_VERSION=...  (optional)
+```
+
+After restart, `GET /config` returns a new `{key: "azure-openai", label: "Azure · gpt-4o-prod"}` entry. Selecting it in the UI dropdown routes that
+request through `AzureOpenAIChatProvider`. All other keys (Claude, GPT-4o,
+Ollama) still work as before.
+
+### What did NOT change in Step 5
+
+- Embeddings (`rag/embed.py`, `LocalEmbeddingProvider`).
+- Vector search (`rag/search.py`, `LocalVectorStore`, ChromaDB).
+- Ingestion (`rag/ingest.py`, `rag/rss.py`, `rag/yt.py`).
+- Speech / Whisper (`transcribe.py`, `LocalSpeechTranscriber`).
+- Local object store (`rag/storage.py`).
+- Frontend.
+- Default LLM (`DEFAULT_LLM_KEY` still `claude-sonnet-4-5`).
+- `rag/llm.py` (no edits — local providers untouched).
+
+---
+
 ## Out of scope (later steps)
 
-Azure Blob, Azure OpenAI, Azure Speech, Azure AI Search — none introduced here.
+Azure Blob, Azure Speech, Azure AI Search — none introduced here.
