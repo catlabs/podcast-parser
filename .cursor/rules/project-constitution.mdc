@@ -1,0 +1,29 @@
+---
+description: Project constitution — goal, migration strategy, and implementation rules for the podcast RAG → Azure migration
+alwaysApply: true
+---
+
+# Podcast RAG — project constitution
+
+Full rules live in `CLAUDE.md`. Key points:
+
+## Goal
+Incrementally migrate a local-first podcast RAG app to Azure without ever breaking the local runtime.
+
+## Strategy
+- One architectural layer per session (chat → embeddings → storage → search → speech).
+- Local providers always stay wired and working.
+- Azure variants are opt-in via env vars — never the default.
+- Use provider abstractions: `rag/interfaces.py` (contracts) + `rag/providers.py` (factory).
+
+## Migration state
+Steps 1–5 done (baseline → config → interfaces → consumer rewire → Azure OpenAI Chat).
+**Next**: Step 6 — Azure OpenAI Embeddings.
+
+## Hard rules
+- Explain files that will change before editing.
+- Do not introduce Azure services unless explicitly asked.
+- Do not remove or break local providers.
+- Never commit automatically — wait for an explicit instruction.
+- Always provide a smoke-test command: `curl http://localhost:8000/config`.
+- Use `.venv/bin/python` / `.venv/bin/pip` — never `source .venv/bin/activate`.
