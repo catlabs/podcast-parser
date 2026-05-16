@@ -15,7 +15,7 @@ back to {"intent": "podcast_rag", "query": None} on any error.
 
 import json
 
-from rag.llm import generate
+from rag.providers import get_chat_provider
 
 # ── Types & constants ─────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ def classify(query: str, llm_key: str | None = None) -> ClassifyResult:
     Always returns a valid ClassifyResult; falls back to FALLBACK on any error.
     """
     try:
-        raw = generate(ROUTER_SYSTEM, query, llm_key)
+        raw = get_chat_provider(llm_key).generate(ROUTER_SYSTEM, query)
         return _parse(raw)
     except Exception:
         return FALLBACK

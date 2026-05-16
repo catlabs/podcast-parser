@@ -32,7 +32,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
-from rag.llm import generate, generate_stream
+from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text
 
@@ -223,7 +223,7 @@ def planner_node(state: ResearchState) -> dict:
 
     episode_list = list_episodes_text()
     prompt = PLAN_SYSTEM.format(episode_list=episode_list)
-    raw = generate(prompt, state["query"], state["llm_key"])
+    raw = get_chat_provider(state["llm_key"]).generate(prompt, state["query"])
     plan = _parse_json(raw)
     sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [state["query"]]
 
@@ -281,14 +281,14 @@ def analyst_node(state: ResearchState) -> dict:
     n       = len(episodes_by_title)
     events  = [_agent_start("analyst"), _ev("analyst", "analyze", "running", f"0/{n} episodes", tool="generate")]
 
+    chat = get_chat_provider(llm_key)
     analyses: list[dict] = []
     for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
         events.append(_ev("analyst", "analyze", "running", f"{i + 1}/{n} episodes", tool="generate"))
         context = format_context(ep_chunks)
-        notes = generate(
+        notes = chat.generate(
             ANALYZE_SYSTEM,
             f'Question de recherche : {query}\n\nÉpisode : "{title}"\n\nExtraits :\n{context}',
-            llm_key,
         )
         analyses.append({"episode": title, "notes": notes})
         events.append({"type": "episode_analysis", "episode": title, "notes": notes})
@@ -316,7 +316,7 @@ def synthesizer_node(state: ResearchState) -> dict:
 
     token_q: queue.Queue | None = state.get("_token_queue")
     tokens: list[str] = []
-    for tok in generate_stream(SYNTHESIZE_SYSTEM, user_msg, llm_key):
+    for tok in get_chat_provider(llm_key).generate_stream(SYNTHESIZE_SYSTEM, user_msg):
         tokens.append(tok)
         if token_q is not None:
             token_q.put({"type": "token", "text": tok})
@@ -339,7 +339,7 @@ def critic_node(state: ResearchState) -> dict:
     )
 
     try:
-        raw = generate(GROUND_SYSTEM, user_msg, state["llm_key"])
+        raw = get_chat_provider(state["llm_key"]).generate(GROUND_SYSTEM, user_msg)
         grounding = _parse_json(raw)
     except Exception as exc:
         log.warning("grounding check failed: %s", exc)

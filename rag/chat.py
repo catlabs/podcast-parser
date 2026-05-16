@@ -18,7 +18,7 @@ import logging
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, EMBED_MODELS, LLM_REGISTRY, TOP_K
 
 log = logging.getLogger(__name__)
-from rag.llm import generate, generate_stream
+from rag.providers import get_chat_provider
 from rag.router import classify
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text, summarize_episode as summarize_episode_tool
@@ -94,13 +94,14 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
     result    = classify(query, llm_key)
     intent    = result["intent"]
     sub_query = result.get("query") or query
+    chat      = get_chat_provider(llm_key)
 
     log.info("route=%s  sub_query=%r", intent, sub_query)
 
     # ── tool: list episodes ───────────────────────────────────────────────────
     if intent == "list_episodes":
         episode_list = list_episodes_text()
-        answer = generate(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}", llm_key)
+        answer = chat.generate(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}")
         return {
             "answer":    answer,
             "sources":   [],
@@ -112,7 +113,7 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
     # ── tool: summarize episode ───────────────────────────────────────────────
     if intent == "summarize_episode":
         ep_title, context = summarize_episode_tool(sub_query, model_key)
-        answer = generate(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}', llm_key)
+        answer = chat.generate(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}')
         return {
             "answer":    answer,
             "sources":   [{"title": ep_title, "podcast": "", "date": None}],
@@ -128,7 +129,7 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
     log.info("prompt=%s  retrieval=%s", system.splitlines()[0][:60], use_rag)
 
     if not use_rag:
-        answer = generate(system, query, llm_key)
+        answer = chat.generate(system, query)
         return {
             "answer":    answer,
             "sources":   [],
@@ -140,7 +141,7 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
     results      = semantic_search(query, top_k=top_k, model_key=model_key)
     context      = format_context(results)
     user_message = build_prompt(query, context)
-    answer       = generate(system, user_message, llm_key)
+    answer       = chat.generate(system, user_message)
 
     return {
         "answer":    answer,
@@ -171,6 +172,7 @@ def ask_stream(
         return {"type": "step", "step": name, "status": status, "detail": detail}
 
     llm_label = LLM_REGISTRY.get(llm_key or DEFAULT_LLM_KEY, LLM_REGISTRY[DEFAULT_LLM_KEY]).label
+    chat      = get_chat_provider(llm_key)
 
     # ── classify ──────────────────────────────────────────────────────────────
     yield step("classify", "running")
@@ -200,7 +202,7 @@ def ask_stream(
         yield step("generate", "running", llm_label)
         chunks_text: list[str] = []
         try:
-            for token in generate_stream(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}", llm_key):
+            for token in chat.generate_stream(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}"):
                 chunks_text.append(token)
                 yield {"type": "token", "text": token}
         except Exception as exc:
@@ -228,7 +230,7 @@ def ask_stream(
         yield step("generate", "running", llm_label)
         chunks_text: list[str] = []
         try:
-            for token in generate_stream(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}', llm_key):
+            for token in chat.generate_stream(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}'):
                 chunks_text.append(token)
                 yield {"type": "token", "text": token}
         except Exception as exc:
@@ -269,7 +271,7 @@ def ask_stream(
     yield step("generate", "running", llm_label)
     chunks_text: list[str] = []
     try:
-        for token in generate_stream(system, user_message, llm_key):
+        for token in chat.generate_stream(system, user_message):
             chunks_text.append(token)
             yield {"type": "token", "text": token}
     except Exception as exc:

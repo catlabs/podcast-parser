@@ -24,7 +24,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
-from rag.llm import generate, generate_stream
+from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text
 
@@ -208,6 +208,7 @@ def research_stream(
     llm_label = LLM_REGISTRY.get(
         llm_key or DEFAULT_LLM_KEY, LLM_REGISTRY[DEFAULT_LLM_KEY]
     ).label
+    chat = get_chat_provider(llm_key)
 
     yield _agent_start("orchestrator")
 
@@ -217,7 +218,7 @@ def research_stream(
     try:
         episode_list = list_episodes_text()
         plan_prompt = PLAN_SYSTEM.format(episode_list=episode_list)
-        raw_plan = generate(plan_prompt, query, llm_key)
+        raw_plan = chat.generate(plan_prompt, query)
         plan = _parse_json(raw_plan)
         sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES]
         if not sub_queries:
@@ -300,7 +301,7 @@ def research_stream(
                 f'Épisode : "{title}"\n\n'
                 f'Extraits :\n{context}'
             )
-            notes = generate(ANALYZE_SYSTEM, analysis_input, llm_key)
+            notes = chat.generate(ANALYZE_SYSTEM, analysis_input)
             episode_analyses.append({"episode": title, "notes": notes})
             yield {"type": "episode_analysis", "episode": title, "notes": notes}
 
@@ -330,7 +331,7 @@ def research_stream(
 
     tokens: list[str] = []
     try:
-        for token in generate_stream(SYNTHESIZE_SYSTEM, synthesis_input, llm_key):
+        for token in chat.generate_stream(SYNTHESIZE_SYSTEM, synthesis_input):
             tokens.append(token)
             yield {"type": "token", "text": token}
     except Exception as exc:
@@ -358,7 +359,7 @@ def research_stream(
 
     grounding: dict | None = None
     try:
-        raw_ground = generate(GROUND_SYSTEM, ground_input, llm_key)
+        raw_ground = chat.generate(GROUND_SYSTEM, ground_input)
         grounding = _parse_json(raw_ground)
     except Exception as exc:
         log.warning("grounding check failed: %s", exc)
