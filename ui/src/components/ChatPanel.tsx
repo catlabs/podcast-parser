@@ -9,6 +9,7 @@ import {
   type ChatResponse,
   type Chunk,
   type CompareResponse,
+  type EmbedOption,
   type EpisodeAnalysis,
   type ExecStep,
   type Grounding,
@@ -19,9 +20,10 @@ import {
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-// "minilm" | "multilingual" → single model mode
-// "compare"                 → side-by-side mode
-type EmbedMode = "minilm" | "multilingual" | "compare";
+// Single-model keys come from /config (minilm / multilingual / azure-openai / …);
+// "compare" is a UI-only mode that fans out to /chat/compare across all
+// configured embedding models.
+type EmbedMode = string;
 type ChatMode  = "chat" | "research" | "research-lg";
 
 interface AgentStep extends ExecStep {
@@ -398,27 +400,34 @@ function EmptyState() {
 
 // ── Embed mode options ────────────────────────────────────────────────────────
 
-const EMBED_OPTIONS: { value: EmbedMode; label: string }[] = [
-  { value: "minilm",        label: "MiniLM-L6 · EN" },
-  { value: "multilingual",  label: "MiniLM-L12 · ML" },
-  { value: "compare",       label: "Compare both" },
+// Static fallback used until /config resolves; the live list comes from the
+// backend so newly configured embedding keys (e.g. "azure-openai") show up
+// automatically without a UI release.
+const FALLBACK_EMBED_OPTIONS: EmbedOption[] = [
+  { key: "minilm",       label: "MiniLM-L6 · EN" },
+  { key: "multilingual", label: "MiniLM-L12 · ML" },
 ];
 
 // ── Main component ────────────────────────────────────────────────────────────
 
 export default function ChatPanel() {
-  const [turns,      setTurns]      = useState<Turn[]>([]);
-  const [embedMode,  setEmbedMode]  = useState<EmbedMode>("minilm");
-  const [chatMode,   setChatMode]   = useState<ChatMode>("chat");
-  const [llmKey,     setLlmKey]     = useState("claude-sonnet-4-5");
-  const [llmOptions, setLlmOptions] = useState<LLMOption[]>([]);
-  const [query,      setQuery]      = useState("");
-  const [loading,    setLoading]    = useState(false);
+  const [turns,        setTurns]        = useState<Turn[]>([]);
+  const [embedMode,    setEmbedMode]    = useState<EmbedMode>("minilm");
+  const [chatMode,     setChatMode]     = useState<ChatMode>("chat");
+  const [llmKey,       setLlmKey]       = useState("claude-sonnet-4-5");
+  const [llmOptions,   setLlmOptions]   = useState<LLMOption[]>([]);
+  const [embedOptions, setEmbedOptions] = useState<EmbedOption[]>(FALLBACK_EMBED_OPTIONS);
+  const [query,        setQuery]        = useState("");
+  const [loading,      setLoading]      = useState(false);
 
   useEffect(() => {
     getConfig().then(cfg => {
       setLlmOptions(cfg.llm_options);
       setLlmKey(cfg.default_llm_key);
+      if (cfg.embed_options && cfg.embed_options.length > 0) {
+        setEmbedOptions(cfg.embed_options);
+        setEmbedMode(cfg.default_embed_key);
+      }
     }).catch(() => {});
   }, []);
 
@@ -609,12 +618,15 @@ export default function ChatPanel() {
               <select
                 className="toolbar-select"
                 value={embedMode}
-                onChange={e => setEmbedMode(e.target.value as EmbedMode)}
+                onChange={e => setEmbedMode(e.target.value)}
                 disabled={loading}
               >
-                {EMBED_OPTIONS.map(o => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
+                {embedOptions.map(o => (
+                  <option key={o.key} value={o.key}>{o.label}</option>
                 ))}
+                {embedOptions.length > 1 && (
+                  <option value="compare">Compare all</option>
+                )}
               </select>
             </div>
 

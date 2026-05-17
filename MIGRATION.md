@@ -221,6 +221,212 @@ Ollama) still work as before.
 
 ---
 
+## Step 6a — embeddings consumer rewire
+
+Mirrors Step 4 (chat) for the embeddings layer. Every code path that
+embeds text now consumes the factory:
+
+- `rag/search.py` — `get_embedding_provider(model_key).encode([query])`.
+- `rag/ingest.py` — `get_embedding_provider(key).encode(chunks)` per model.
+- `rag/backfill.py` — `target_provider.encode(documents)`.
+
+`get_model(...)` has a single remaining caller — `LocalEmbeddingProvider`
+inside `rag/embed.py`. Vectors are byte-identical to the pre-rewire path,
+so `python -m rag.eval --top 5` produces the same numbers.
+
+Untouched: Chroma collections, chunking, SQLite, chat, transcribe, UI.
+
+---
+
+## Step 6b — Azure OpenAI embeddings (opt-in)
+
+A new embedding key `azure-openai` slots in behind the existing
+factory, populating its own Chroma collection. Local keys stay default;
+no Azure AI Search yet — Chroma still hosts every vector.
+
+### What ships
+
+- **`rag/azure_openai.py`** — `AzureOpenAIEmbeddingProvider`. Implements
+  `EmbeddingProvider` against the `openai` SDK's `AzureOpenAI` client.
+  Lazy client construction, batches 16 inputs per request (well under
+  documented per-request limits), defensive sort-by-index on the response.
+  A small shared `_azure_client()` helper handles endpoint/key validation;
+  `AzureOpenAIChatProvider` is **not** modified.
+- **`rag/config.py`** — `EmbedConfig` gains a `provider: str = "local"`
+  field (default keeps the two existing entries unchanged). Two new env
+  vars: `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_EMBEDDING_COLLECTION`
+  (default `"podcasts_azure"`). The `"azure-openai"` entry is added to
+  `EMBED_REGISTRY` only when both `AZURE_OPENAI_ENDPOINT` and
+  `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` are set.
+- **`rag/providers.py`** — `get_embedding_provider` dispatches on
+  `EmbedConfig.provider`: `azure_openai` → `AzureOpenAIEmbeddingProvider`,
+  else `LocalEmbeddingProvider`. The vector store dispatch is unchanged —
+  Chroma hosts the Azure collection too.
+- **`rag/embed.py`** — `LocalEmbeddingProvider` now refuses non-local keys
+  with a clear error pointing to the factory. Belt-and-braces — consumers
+  should already go through the factory.
+- **`rag/backfill.py`** — adds `--target <key>` (default `multilingual`),
+  so the same script can backfill any non-baseline collection. Refuses to
+  target the baseline collection. Unused `file_path` parameter removed.
+- **`.env.example`** — documents the embedding-specific Azure vars.
+
+### Env vars
+
+| Var | Default | Required when |
+|---|---|---|
+| `AZURE_OPENAI_ENDPOINT` | — | Any Azure feature (chat or embeddings) |
+| `AZURE_OPENAI_API_KEY` | — | Any Azure feature |
+| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Optional override |
+| `AZURE_OPENAI_DEPLOYMENT` | — | Chat (Step 5) |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | Embeddings (this step). Presence enables the `azure-openai` embed key. |
+| `AZURE_OPENAI_EMBEDDING_COLLECTION` | `podcasts_azure` | Optional override. **Use a unique name per deployment** if you ever switch embedding models — different deployments produce different vector dimensions and Chroma will reject mixed inserts. |
+
+### Activating Azure embeddings
+
+```bash
+# in .env
+AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=text-embedding-3-small
+# AZURE_OPENAI_EMBEDDING_COLLECTION=podcasts_azure       # default
+```
+
+After restart, the new key is visible programmatically:
+
+```python
+from rag.config import EMBED_REGISTRY
+print(EMBED_REGISTRY["azure-openai"])
+# EmbedConfig(model_name='text-embedding-3-small',
+#             collection='podcasts_azure',
+#             label='Azure · text-embedding-3-small',
+#             provider='azure_openai')
+```
+
+### Populating the Azure collection
+
+Two paths, depending on whether you want to re-transcribe or just
+re-embed existing transcripts:
+
+**(A) Backfill from the baseline collection** *(recommended — no
+re-transcription, no re-chunking, no new audio downloads)*:
+
+```bash
+.venv/bin/python -m rag.backfill --target azure-openai --dry-run
+.venv/bin/python -m rag.backfill --target azure-openai
+```
+
+The backfill script pulls each episode's chunks from the baseline
+(`minilm`) Chroma collection, re-embeds them via the Azure deployment,
+and upserts into the Azure collection. SQLite's `episode_models` table
+records the new coverage so the UI / `/episodes` reflects it.
+
+**(B) Re-ingest from local transcripts** *(re-embeds with **all**
+configured models, including local ones, since `ingest_all` doesn't
+selectively skip per-model — wasteful if local indexes already exist)*:
+
+```bash
+.venv/bin/python -m rag.ingest                  # only missing models per file
+.venv/bin/python -m rag.ingest --reindex        # force everything
+```
+
+### Retrieval eval — local vs Azure
+
+The retrieval eval supports any embedding key; once the Azure collection
+is populated, compare side by side:
+
+```bash
+# Baseline (local only)
+.venv/bin/python -m rag.eval --top 5
+#   minilm        Hit@5=1.00  Rec@5=0.96  MRR=0.781
+#   multilingual  Hit@5=0.67  Rec@5=0.67  MRR=0.537
+
+# Single model
+.venv/bin/python -m rag.eval --top 5 --model azure-openai
+
+# All models including Azure (after backfill)
+.venv/bin/python -m rag.eval --top 5
+#   minilm        ...
+#   multilingual  ...
+#   azure-openai  ...  ← new line
+```
+
+### What did NOT change in Step 6b
+
+- Chat providers (`rag/llm.py`, `AzureOpenAIChatProvider`).
+- Local embedding providers (`LocalEmbeddingProvider`, `LocalVectorStore`).
+- Chroma collections for local models (`podcasts`, `podcasts_multilingual`).
+- Chunking parameters.
+- `rag/search.py`, `rag/ingest.py` — they already consume the factory
+  after Step 6a; the Azure adapter slots in without consumer changes.
+- Transcribe, SQLite schema, frontend.
+- `DEFAULT_MODEL_KEY` still `"minilm"`.
+
+### Notes / gotchas
+
+- **No Azure AI Search yet.** Azure vectors are stored in Chroma
+  alongside local vectors. The Azure AI Search swap is a separate
+  later step.
+- **Switching embedding deployments**: a deployment change usually means
+  a dimension change. Use a unique `AZURE_OPENAI_EMBEDDING_COLLECTION`
+  per deployment if you switch — otherwise delete and re-backfill the
+  collection.
+- **UI surfacing**: the UI's embedding dropdown is populated from
+  `/episodes` per-episode `collections` arrays. The Azure key only
+  appears in the UI after at least one episode has been ingested or
+  backfilled into the Azure collection.
+- **Rate limits**: Azure deployments have per-minute token/request
+  limits. Backfilling many episodes may need pacing or quota tuning.
+
+---
+
+## Step 6c — UI surfacing of Azure embeddings
+
+End-to-end usability: when Azure is configured, both the embed selector and
+the LLM selector show Azure entries without a code release.
+
+### What ships
+
+- **`rag/api.py` — `/config`** now also returns:
+  ```json
+  {
+    "embed_options":      [{"key": "minilm", "label": "MiniLM-L6 · EN"}, ...],
+    "default_embed_key":  "minilm"
+  }
+  ```
+  Built from `EMBED_REGISTRY` at startup, so the `azure-openai` entry only
+  appears when both `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`
+  are set (same gate as Step 6b).
+- **`ui/src/api.ts`** — `ServerConfig` gains `embed_options` and
+  `default_embed_key`; new `EmbedOption` type. `MODEL_LABELS` static fallback
+  is preserved for callers that can't await a fetch.
+- **`ui/src/components/ChatPanel.tsx`** — `EMBED_OPTIONS` is no longer
+  hardcoded. The embed `<select>` is populated from `/config.embed_options`;
+  the "Compare all" virtual option appears whenever two or more embedding
+  models are configured. The dropdown defaults to `default_embed_key`.
+
+### What did NOT change in Step 6c
+
+- Backend behavior — `/chat`, `/chat/stream`, `/chat/compare`, `/chat/research*`
+  unchanged. The compare endpoint already iterated over every entry in
+  `EMBED_MODELS`, so Azure embeddings join the comparison automatically
+  once registered.
+- Chunking, Chroma persistence, SQLite schema, Whisper, RSS ingestion.
+- Azure chat behavior (`AzureOpenAIChatProvider` not touched).
+- Local-only behavior: without Azure env vars, the UI shows exactly the
+  same two embed options as before.
+
+### Notes
+
+- The compare result tile labels Azure with its raw key (`azure-openai`)
+  because `MODEL_LABELS` is a static fallback. Once at least one episode
+  has been ingested/backfilled into the Azure collection, the dynamic
+  labels from `/episodes.collections` (resolved via `buildModelLabels`)
+  carry the friendly label everywhere it's looked up that way.
+- Compare hits all configured embeddings, including Azure. Expect a paid
+  Azure call on every compare query when Azure is enabled.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.

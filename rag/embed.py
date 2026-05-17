@@ -18,7 +18,7 @@ from __future__ import annotations
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from rag.config import CHROMA_DIR, COLLECTIONS, DEFAULT_MODEL_KEY, EMBED_MODELS
+from rag.config import CHROMA_DIR, COLLECTIONS, DEFAULT_MODEL_KEY, EMBED_MODELS, EMBED_REGISTRY
 
 # ── Internal caches ───────────────────────────────────────────────────────────
 
@@ -77,6 +77,13 @@ class LocalEmbeddingProvider:
     def __init__(self, model_key: str = DEFAULT_MODEL_KEY):
         if model_key not in EMBED_MODELS:
             raise ValueError(f"Unknown model_key {model_key!r}. Valid keys: {MODEL_KEYS}")
+        cfg = EMBED_REGISTRY[model_key]
+        if cfg.provider != "local":
+            raise ValueError(
+                f"Model key {model_key!r} is provider={cfg.provider!r}. "
+                f"Use rag.providers.get_embedding_provider({model_key!r}) instead — "
+                f"the factory routes non-local providers to the right adapter."
+            )
         self.model_key = model_key
         self.name      = EMBED_MODELS[model_key]
 

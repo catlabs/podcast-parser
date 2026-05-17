@@ -33,9 +33,10 @@ DB_PATH    = _path_from_env("DB_PATH",    DATA_DIR / "metadata.db")
 
 @dataclass(frozen=True)
 class EmbedConfig:
-    model_name: str   # HuggingFace model ID
+    model_name: str   # HuggingFace ID (local) or deployment name (azure)
     collection: str   # ChromaDB collection name
     label:      str   # human-readable label shown in the UI
+    provider:   str = "local"   # "local" | "azure_openai"
 
 # Add new embedding models here — everything else (DB, UI, ingest) picks them
 # up automatically on next startup.
@@ -86,6 +87,13 @@ AZURE_OPENAI_ENDPOINT    = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
 AZURE_OPENAI_API_KEY     = os.environ.get("AZURE_OPENAI_API_KEY", "")
 AZURE_OPENAI_DEPLOYMENT  = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "")
 AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+
+# Azure OpenAI embeddings — opt-in. Shares endpoint / api_key / api_version
+# with the chat deployment above; the embedding-specific vars are the
+# deployment name and the Chroma collection to write into (kept separate
+# from local collections so dimensions / quality can be compared).
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "")
+AZURE_OPENAI_EMBEDDING_COLLECTION = os.environ.get("AZURE_OPENAI_EMBEDDING_COLLECTION", "podcasts_azure")
 
 
 @dataclass(frozen=True)
@@ -140,3 +148,20 @@ if AZURE_OPENAI_ENDPOINT:
     )
 
 DEFAULT_LLM_KEY = "claude-sonnet-4-5"
+
+# Conditionally register Azure OpenAI embeddings. Opt-in: only appears when
+# both AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_EMBEDDING_DEPLOYMENT are set.
+# Stored in a separate Chroma collection so Azure vectors don't mix with
+# local ones (different dim / different model quality — keep them
+# independently queryable for side-by-side evaluation).
+if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_EMBEDDING_DEPLOYMENT:
+    EMBED_REGISTRY["azure-openai"] = EmbedConfig(
+        provider   = "azure_openai",
+        model_name = AZURE_OPENAI_EMBEDDING_DEPLOYMENT,
+        collection = AZURE_OPENAI_EMBEDDING_COLLECTION,
+        label      = f"Azure · {AZURE_OPENAI_EMBEDDING_DEPLOYMENT}",
+    )
+
+# Keep backward-compat aliases in sync after any post-registration additions.
+EMBED_MODELS = {k: v.model_name for k, v in EMBED_REGISTRY.items()}
+COLLECTIONS  = {k: v.collection for k, v in EMBED_REGISTRY.items()}

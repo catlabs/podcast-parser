@@ -16,7 +16,7 @@ matching get_* is called.
 
 from __future__ import annotations
 
-from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY
+from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, EMBED_REGISTRY, LLM_REGISTRY
 from rag.interfaces import (
     ChatProvider,
     EmbeddingProvider,
@@ -43,7 +43,15 @@ def get_chat_provider(llm_key: str | None = None) -> ChatProvider:
 
 
 def get_embedding_provider(model_key: str = DEFAULT_MODEL_KEY) -> EmbeddingProvider:
-    """Return an EmbeddingProvider for the given embedding model key."""
+    """Return an EmbeddingProvider for the given embedding model key.
+
+    Dispatch is driven by EMBED_REGISTRY[<key>].provider. Local is the
+    default; "azure_openai" routes to the Azure embeddings adapter.
+    """
+    cfg = EMBED_REGISTRY.get(model_key)
+    if cfg is not None and cfg.provider == "azure_openai":
+        from rag.azure_openai import AzureOpenAIEmbeddingProvider
+        return AzureOpenAIEmbeddingProvider(deployment=cfg.model_name)
     from rag.embed import LocalEmbeddingProvider
     return LocalEmbeddingProvider(model_key)
 

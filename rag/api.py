@@ -43,6 +43,7 @@ from rag.config import (
     AZURE_OPENAI_ENDPOINT,
     DEFAULT_LLM_KEY,
     DEFAULT_MODEL_KEY,
+    EMBED_REGISTRY,
     LLM_REGISTRY,
     OPENAI_API_KEY,
     TOP_K,
@@ -167,10 +168,17 @@ def _require_llm(llm_key: str = DEFAULT_LLM_KEY) -> None:
 
 @app.get("/config")
 async def config_endpoint():
-    """Return available LLM options and the default key for the UI."""
+    """Return LLM + embedding options and defaults for the UI.
+
+    `embed_options` mirrors EMBED_REGISTRY at startup. The Azure embedding key
+    only appears here when AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_EMBEDDING_DEPLOYMENT
+    are set, so the UI dropdown stays clean for local-only setups.
+    """
     return {
-        "llm_options":    [{"key": k, "label": v.label} for k, v in LLM_REGISTRY.items()],
-        "default_llm_key": DEFAULT_LLM_KEY,
+        "llm_options":      [{"key": k, "label": v.label} for k, v in LLM_REGISTRY.items()],
+        "default_llm_key":  DEFAULT_LLM_KEY,
+        "embed_options":    [{"key": k, "label": v.label} for k, v in EMBED_REGISTRY.items()],
+        "default_embed_key": DEFAULT_MODEL_KEY,
     }
 
 

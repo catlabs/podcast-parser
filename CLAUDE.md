@@ -48,8 +48,10 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 3 | done | provider interfaces (`interfaces.py`, `providers.py`, `storage.py`) |
 | 4 | done | consumer rewire — ChatProvider only |
 | 5 | done | Azure OpenAI Chat (`azure_openai.py`, opt-in via `AZURE_OPENAI_ENDPOINT`) |
-| 6 | next | Azure OpenAI Embeddings |
-| 7 | — | Azure Blob Storage |
+| 6a | done | consumer rewire — EmbeddingProvider (search / ingest / backfill) |
+| 6b | done | Azure OpenAI Embeddings (opt-in via `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`) |
+| 6c | done | UI surfacing — `/config.embed_options` drives the embed dropdown |
+| 7 | next | Azure Blob Storage |
 | 8 | — | Azure AI Search |
 | 9 | — | Azure Speech |
 | 10 | — | async ingestion jobs |
@@ -62,7 +64,7 @@ cd ui && npm run dev                                  # http://localhost:5173
 | `rag/interfaces.py` | Five `Protocol` contracts (Chat, Embedding, VectorStore, Speech, ObjectStore) |
 | `rag/providers.py` | Factory — returns local or Azure impl based on env vars |
 | `rag/config.py` | All env-var reading and `LLM_REGISTRY` |
-| `rag/azure_openai.py` | `AzureOpenAIChatProvider` (Step 5) |
+| `rag/azure_openai.py` | `AzureOpenAIChatProvider` (Step 5) + `AzureOpenAIEmbeddingProvider` (Step 6b) |
 | `rag/storage.py` | `LocalObjectStore` |
 | `rag/llm.py` | `LocalChatProvider` + raw `generate`/`generate_stream` |
 | `rag/embed.py` | `LocalEmbeddingProvider` + `LocalVectorStore` |
@@ -71,7 +73,7 @@ cd ui && npm run dev                                  # http://localhost:5173
 
 ## Environment variables
 
-Active (Steps 1–5):
+Active (Steps 1–6):
 
 | Var | Default | Purpose |
 |-----|---------|---------|
@@ -84,9 +86,11 @@ Active (Steps 1–5):
 | `CHROMA_DIR` | `<DATA_DIR>/chroma` | ChromaDB persistence |
 | `DB_PATH` | `<DATA_DIR>/metadata.db` | SQLite path |
 | `CORS_ALLOW_ORIGINS` | `http://localhost:5173` | FastAPI CORS |
-| `AZURE_OPENAI_ENDPOINT` | — | Opt-in: enables Azure dropdown |
-| `AZURE_OPENAI_API_KEY` | — | Azure portal key |
-| `AZURE_OPENAI_DEPLOYMENT` | — | Deployment name (not model name) |
-| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Optional override |
+| `AZURE_OPENAI_ENDPOINT` | — | Shared (chat + embeddings); presence enables the Azure chat dropdown entry |
+| `AZURE_OPENAI_API_KEY` | — | Shared — Azure portal key |
+| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Shared — optional override |
+| `AZURE_OPENAI_DEPLOYMENT` | — | Chat-only — chat deployment name (NOT model name) |
+| `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | Embeddings-only — presence enables the `azure-openai` embed key |
+| `AZURE_OPENAI_EMBEDDING_COLLECTION` | `podcasts_azure` | Embeddings-only — Chroma collection (use a unique name per deployment if vector dim changes) |
 
 Reserved (not active yet): `AZURE_STORAGE_*`, `AZURE_SEARCH_*`, `AZURE_SPEECH_*`.

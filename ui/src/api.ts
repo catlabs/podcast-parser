@@ -201,9 +201,16 @@ export interface LLMOption {
   label: string;
 }
 
+export interface EmbedOption {
+  key:   string;
+  label: string;
+}
+
 export interface ServerConfig {
-  llm_options:    LLMOption[];
-  default_llm_key: string;
+  llm_options:       LLMOption[];
+  default_llm_key:   string;
+  embed_options:     EmbedOption[];
+  default_embed_key: string;
 }
 
 export function getConfig(): Promise<ServerConfig> {
