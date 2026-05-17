@@ -17,11 +17,11 @@ Built as a learning and portfolio project in Python + React, focusing on clean, 
 
 4. **Chat** — feed the retrieved excerpts to the selected LLM as context; get a grounded answer that cites specific episodes.
 
-5. **Multi-LLM** — switch between Claude (Sonnet / Haiku), GPT-4o (/ mini), and local Ollama from a toolbar dropdown. All providers share the same routing and streaming pipeline.
+5. **Multi-LLM** — switch between Claude (Sonnet / Haiku), GPT-4o (/ mini), local Ollama, and (optionally) Azure OpenAI from a toolbar dropdown. All providers share the same routing and streaming pipeline.
 
 6. **Research mode** — multi-step agentic analysis: decomposes complex questions into sub-queries, searches across multiple angles, analyzes each relevant episode, synthesizes a structured comparison, and verifies grounding against sources. Available in two implementations: custom orchestration and LangGraph.
 
-7. **Compare mode** — run the same query through both embedding models simultaneously and see results side by side.
+7. **Compare mode** — run the same query through every configured embedding model in parallel and see results side by side.
 
 8. **Web UI** — React + TypeScript interface with a ChatGPT-style sidebar layout for browsing episodes, ingesting new sources, and chatting.
 
@@ -32,9 +32,13 @@ Built as a learning and portfolio project in Python + React, focusing on clean, 
 ```
 transcribe.py            RSS → audio download → Whisper → .txt files
 rag/
-  config.py              paths, embed registry, LLM registry (all providers)
+  config.py              paths, embed registry, LLM registry (local + opt-in Azure)
+  interfaces.py          Protocol contracts: Chat / Embedding / VectorStore / Speech / ObjectStore
+  providers.py           factory: returns local or Azure impl based on env vars
+  azure_openai.py        AzureOpenAIChatProvider + AzureOpenAIEmbeddingProvider (opt-in)
+  storage.py             LocalObjectStore (filesystem-backed ObjectStore)
   embed.py               embedding model/collection registry (lazy-loaded, shared ChromaDB client)
-  llm.py                 provider abstraction: Anthropic / OpenAI / Ollama
+  llm.py                 LocalChatProvider + Anthropic / OpenAI / Ollama dispatch
   router.py              intent classifier (podcast_rag / list_episodes / summarize_episode / app_meta)
   tools.py               tool implementations: list_episodes_text, summarize_episode
   research.py            custom multi-step research orchestrator (plan → search → analyze → synthesize → ground)
@@ -46,7 +50,8 @@ rag/
   rss.py                 RSS feed parsing + per-episode ingestion pipeline
   source.py              URL type detection (rss / youtube / audio / webpage)
   yt.py                  YouTube download via yt-dlp + ingest pipeline
-  backfill.py            backfill existing episodes into the multilingual collection
+  backfill.py            re-embed existing chunks into any non-baseline collection (--target)
+  eval.py                minimal retrieval eval over a fixed query set (no LLM calls)
   api.py                 FastAPI: all HTTP endpoints + SSE streaming
 ui/
   src/
@@ -68,8 +73,9 @@ ui/
 | `gpt-4o` | OpenAI | gpt-4o |
 | `gpt-4o-mini` | OpenAI | gpt-4o-mini |
 | `ollama` | Ollama (local) | configurable via `OLLAMA_MODEL` |
+| `azure-openai` | Azure OpenAI (opt-in) | configurable via `AZURE_OPENAI_DEPLOYMENT` — only listed when `AZURE_OPENAI_ENDPOINT` is set |
 
-The active LLM is selected per-query from the UI toolbar. Routing (intent classification) and answer generation both use the same selected model.
+The active LLM is selected per-query from the UI toolbar. Routing (intent classification) and answer generation both use the same selected model. All providers go through the same `ChatProvider` protocol via `rag/providers.py`, so swapping backends is a one-line factory dispatch — not a consumer refactor.
 
 ### Research mode
 
@@ -93,14 +99,17 @@ The LangGraph version demonstrates graph-based agent orchestration with explicit
 
 The execution panel in the UI groups steps by agent with collapsible detail views, showing which tool was called at each step.
 
-### Two embedding models
+### Embedding models
 
-| Key | Model | Collection |
-|-----|-------|------------|
-| `minilm` | `all-MiniLM-L6-v2` | `podcasts` |
-| `multilingual` | `paraphrase-multilingual-MiniLM-L12-v2` | `podcasts_multilingual` |
+| Key | Model | Collection | Provider |
+|-----|-------|------------|----------|
+| `minilm` | `all-MiniLM-L6-v2` | `podcasts` | local (sentence-transformers) |
+| `multilingual` | `paraphrase-multilingual-MiniLM-L12-v2` | `podcasts_multilingual` | local (sentence-transformers) |
+| `azure-openai` | configurable via `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | `podcasts_azure` (override with `AZURE_OPENAI_EMBEDDING_COLLECTION`) | Azure OpenAI (opt-in) |
 
-Both are 384-dim and run on CPU. New ingestion indexes into both collections automatically. Existing episodes can be backfilled into the multilingual collection with `python -m rag.backfill`.
+Local models are 384-dim and run on CPU. The Azure entry is registered only when both `AZURE_OPENAI_ENDPOINT` and `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` are set; vectors land in a **separate Chroma collection** so dimensions never mix with the local ones.
+
+New ingestion indexes into every registered collection. To populate one collection from existing chunks without re-transcribing, run `python -m rag.backfill --target <key>`.
 
 ### Two stores, complementary roles
 
@@ -160,6 +169,43 @@ OLLAMA_MODEL=qwen2.5:7b
 
 You only need to set the keys for providers you actually use.
 
+#### Azure OpenAI (optional, opt-in)
+
+Setting any of these is **additive** — local providers stay default. The Azure dropdown entries only appear when their gating vars are set.
+
+```env
+# Shared (chat + embeddings)
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_API_VERSION=2024-10-21        # default if unset
+
+# Chat — enables the "Azure · <deployment>" entry in the LLM dropdown
+AZURE_OPENAI_DEPLOYMENT=<chat-deployment>   # NOT the model name
+
+# Embeddings — enables the "azure-openai" entry in the Embed dropdown.
+# Use a unique collection name per deployment when vector dimensions differ.
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT=<embed-deployment>
+AZURE_OPENAI_EMBEDDING_COLLECTION=podcasts_azure   # default if unset
+```
+
+After ingesting at least one transcript, populate the Azure embedding collection from existing chunks:
+
+```bash
+python -m rag.backfill --target azure-openai --dry-run
+python -m rag.backfill --target azure-openai
+```
+
+GPT-5 / o-series chat deployments (e.g. `gpt-5.2-chat`) require API version `2024-12-01-preview` or newer. The chat provider sends `max_completion_tokens` (the parameter that current Azure models accept).
+
+#### UI defaults (optional)
+
+Pin which entries the toolbar selectors are pre-selected to. Unknown keys silently fall back to `minilm` / `claude-sonnet-4-5`. These only affect the `/config` payload — they do not change the baseline backfill source or the LLM-registry fallback.
+
+```env
+UI_DEFAULT_EMBED_KEY=multilingual
+UI_DEFAULT_LLM_KEY=azure-openai
+```
+
 ### Frontend
 
 ```bash
@@ -189,7 +235,7 @@ Open [http://localhost:5173](http://localhost:5173).
 
 | Section | What it does |
 |---------|-------------|
-| **Chat** | Ask a question; answers stream in real time. Use the **Mode** toggle to switch between Chat, Research, and LangGraph modes. Use the **Embed** dropdown to pick the embedding model and the **LLM** dropdown to switch between Claude, GPT, or Ollama. Toggle **Compare both** to see both embedding models side by side. |
+| **Chat** | Ask a question; answers stream in real time. Use the **Mode** toggle to switch between Chat, Research, and LangGraph modes. Use the **Embed** dropdown to pick the embedding model and the **LLM** dropdown to switch between Claude, GPT, Ollama, or Azure OpenAI. Pick **Compare all** to see every configured embedding model side by side. |
 | **Episodes** | Browse all indexed episodes |
 | **Add episode** | Paste any RSS, YouTube, or audio URL — the app detects the type and guides you through ingestion with live progress |
 
@@ -198,8 +244,8 @@ Open [http://localhost:5173](http://localhost:5173).
 The input area exposes two selectors:
 
 - **Mode** — `Chat` (single-step RAG), `Research` (custom multi-step), or `LangGraph` (graph-based orchestration)
-- **Embed** — which sentence-transformer collection to search (`MiniLM-L6 · EN`, `MiniLM-L12 · ML`, or `Compare both`)
-- **LLM** — which model generates the answer (Claude Sonnet 4.5, Claude Haiku 4.5, GPT-4o, GPT-4o mini, or local Ollama)
+- **Embed** — which embedding collection to search. List is populated from `/config.embed_options` so newly-configured backends (e.g. `azure-openai`) appear without a UI release. `Compare all` is available when ≥2 embeddings are configured.
+- **LLM** — which model generates the answer. List comes from `/config.llm_options`; the Azure entry only appears when `AZURE_OPENAI_ENDPOINT` is set.
 
 The execution panel below each answer shows the pipeline trace. In Chat mode it shows flat steps; in Research/LangGraph mode it groups steps by agent with collapsible detail views.
 
@@ -220,19 +266,30 @@ python -m rag.ingest              # index new files in output/
 python -m rag.ingest --reindex    # re-embed everything
 ```
 
-### CLI — backfill multilingual collection
+### CLI — backfill a non-baseline collection
 
-Run this once after adding the multilingual model to index existing episodes without re-transcribing:
+Re-embed already-ingested chunks into any non-baseline embedding collection without re-transcribing. Defaults to `multilingual`; pass `--target azure-openai` (or any registered non-baseline key) to populate that collection instead.
 
 ```bash
-python -m rag.backfill --dry-run   # preview what would be processed
-python -m rag.backfill             # execute
+python -m rag.backfill --dry-run                  # preview, defaults to --target multilingual
+python -m rag.backfill                            # execute, multilingual
+python -m rag.backfill --target azure-openai      # populate the Azure collection
 ```
 
 ### CLI — search without the UI
 
 ```bash
 python -m rag.search "your question here"
+python -m rag.search "your question here" --model azure-openai
+```
+
+### CLI — retrieval eval
+
+A small fixed-query eval (no LLM calls). Compare embedding backends side by side:
+
+```bash
+python -m rag.eval --top 5                          # all configured models
+python -m rag.eval --top 5 --model azure-openai     # single model
 ```
 
 ---
@@ -241,7 +298,7 @@ python -m rag.search "your question here"
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/config` | LLM options list + default key |
+| `GET` | `/config` | LLM + embedding option lists and default keys for the UI |
 | `GET` | `/episodes` | List all indexed episodes |
 | `POST` | `/ingest` | Index local transcripts from `output/` |
 | `POST` | `/detect` | Detect URL type (rss / youtube / audio / webpage) |
@@ -275,6 +332,7 @@ rag/data/
 - **No audio URL found** — some RSS entries have no enclosure link; nothing to download.
 - **Whisper errors** — confirm `ffmpeg` is installed and in `PATH`; try `--model tiny` for speed.
 - **Slow first run** — Whisper and both embedding models download on first use (~700 MB total for `medium`).
-- **API key not set** — `/chat` returns 503 if the key for the selected LLM provider is missing from `.env`.
+- **API key not set** — `/chat` returns 503 if the key for the selected LLM provider is missing from `.env`. For the Azure path, the error message lists exactly which `AZURE_OPENAI_*` var is missing.
+- **Azure 400 Bad Request** — usually a model/parameter mismatch (e.g. GPT-5 deployments reject `max_tokens` and require `max_completion_tokens`, or the deployment name doesn't match the endpoint segment). The full Azure error body is logged at `ERROR` level under `rag.azure_openai` — check the uvicorn console.
 - **Ollama not reachable** — ensure `ollama serve` is running and `OLLAMA_BASE_URL` points to it; run `ollama pull <model>` if the model isn't installed.
 - **SQLite threading errors** — always create connections inside the thread that uses them; never pass a connection across threads.
