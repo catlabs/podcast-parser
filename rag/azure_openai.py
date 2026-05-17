@@ -23,6 +23,7 @@ the missing-config case earlier and returns 503.
 
 from __future__ import annotations
 
+import logging
 from typing import Iterator, Sequence
 
 from rag.config import (
@@ -31,6 +32,45 @@ from rag.config import (
     AZURE_OPENAI_DEPLOYMENT,
     AZURE_OPENAI_ENDPOINT,
 )
+
+log = logging.getLogger(__name__)
+
+
+def _log_azure_bad_request(exc, *, messages, **params) -> None:
+    """Emit the full Azure error payload for debugging a 400.
+
+    Logs HTTP status, Azure's error message + raw body, and the request
+    parameters that were sent (with `messages` reduced to a role/length
+    summary so transcripts don't flood the log). NEVER logs the API key
+    or endpoint — those live in module state, not in `params`.
+    """
+    status      = getattr(exc, "status_code", None)
+    raw_body    = None
+    error_msg   = str(exc)
+    response    = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            raw_body = response.json()
+        except Exception:
+            raw_body = getattr(response, "text", None)
+
+    msg_summary = [
+        {"role": m.get("role"), "chars": len(m.get("content", "") or "")}
+        for m in messages
+    ]
+    log.error(
+        "Azure OpenAI 400 BadRequest\n"
+        "  status      : %s\n"
+        "  error       : %s\n"
+        "  raw_body    : %s\n"
+        "  deployment  : %s\n"
+        "  api_version : %s\n"
+        "  params      : %s\n"
+        "  messages    : %s",
+        status, error_msg, raw_body,
+        AZURE_OPENAI_DEPLOYMENT, AZURE_OPENAI_API_VERSION,
+        params, msg_summary,
+    )
 
 
 def _azure_client():
@@ -89,28 +129,40 @@ class AzureOpenAIChatProvider:
         return self._client
 
     def generate(self, system: str, user: str) -> str:
-        client = self._ensure_client()
-        response = client.chat.completions.create(
-            model    = AZURE_OPENAI_DEPLOYMENT,
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            max_tokens = 1024,
-        )
+        from openai import BadRequestError
+        client   = self._ensure_client()
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ]
+        try:
+            response = client.chat.completions.create(
+                model                 = AZURE_OPENAI_DEPLOYMENT,
+                messages              = messages,
+                max_completion_tokens = 1024,
+            )
+        except BadRequestError as exc:
+            _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024)
+            raise
         return response.choices[0].message.content or ""
 
     def generate_stream(self, system: str, user: str) -> Iterator[str]:
-        client = self._ensure_client()
-        stream = client.chat.completions.create(
-            model    = AZURE_OPENAI_DEPLOYMENT,
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
-            max_tokens = 1024,
-            stream     = True,
-        )
+        from openai import BadRequestError
+        client   = self._ensure_client()
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user",   "content": user},
+        ]
+        try:
+            stream = client.chat.completions.create(
+                model                 = AZURE_OPENAI_DEPLOYMENT,
+                messages              = messages,
+                max_completion_tokens = 1024,
+                stream                = True,
+            )
+        except BadRequestError as exc:
+            _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024, stream=True)
+            raise
         for chunk in stream:
             if not chunk.choices:
                 continue
