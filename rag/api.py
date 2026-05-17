@@ -47,6 +47,8 @@ from rag.config import (
     LLM_REGISTRY,
     OPENAI_API_KEY,
     TOP_K,
+    UI_DEFAULT_EMBED_KEY,
+    UI_DEFAULT_LLM_KEY,
 )
 from rag.embed import MODEL_KEYS
 from rag.database import get_connection, init_db, list_episodes
@@ -176,9 +178,9 @@ async def config_endpoint():
     """
     return {
         "llm_options":      [{"key": k, "label": v.label} for k, v in LLM_REGISTRY.items()],
-        "default_llm_key":  DEFAULT_LLM_KEY,
+        "default_llm_key":  UI_DEFAULT_LLM_KEY,
         "embed_options":    [{"key": k, "label": v.label} for k, v in EMBED_REGISTRY.items()],
-        "default_embed_key": DEFAULT_MODEL_KEY,
+        "default_embed_key": UI_DEFAULT_EMBED_KEY,
     }
 
 

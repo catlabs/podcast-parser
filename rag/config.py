@@ -165,3 +165,18 @@ if AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_EMBEDDING_DEPLOYMENT:
 # Keep backward-compat aliases in sync after any post-registration additions.
 EMBED_MODELS = {k: v.model_name for k, v in EMBED_REGISTRY.items()}
 COLLECTIONS  = {k: v.collection for k, v in EMBED_REGISTRY.items()}
+
+# ── UI defaults (overrideable via .env) ───────────────────────────────────────
+# DEFAULT_MODEL_KEY / DEFAULT_LLM_KEY above are *system* defaults:
+#   - DEFAULT_MODEL_KEY is the baseline collection backfill reads from and
+#     refuses to write to (see rag/backfill.py).
+#   - DEFAULT_LLM_KEY is the guaranteed-present LLM fallback used by
+#     LLM_REGISTRY.get(key, LLM_REGISTRY[DEFAULT_LLM_KEY]).
+# The two constants below are what /config returns to the UI, so users can
+# prefer a different model in the dropdown via .env without changing
+# baseline semantics. Invalid keys silently fall back to the system default.
+_ui_embed = os.environ.get("UI_DEFAULT_EMBED_KEY", "").strip()
+UI_DEFAULT_EMBED_KEY = _ui_embed if _ui_embed in EMBED_REGISTRY else DEFAULT_MODEL_KEY
+
+_ui_llm = os.environ.get("UI_DEFAULT_LLM_KEY", "").strip()
+UI_DEFAULT_LLM_KEY = _ui_llm if _ui_llm in LLM_REGISTRY else DEFAULT_LLM_KEY
