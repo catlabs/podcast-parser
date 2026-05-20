@@ -268,13 +268,17 @@ python -m rag.ingest --reindex    # re-embed everything
 
 ### CLI — backfill a non-baseline collection
 
-Re-embed already-ingested chunks into any non-baseline embedding collection without re-transcribing. Defaults to `multilingual`; pass `--target azure-openai` (or any registered non-baseline key) to populate that collection instead.
+Re-embed already-ingested chunks into any non-baseline embedding collection without re-transcribing. Defaults to `multilingual`; pass `--target <key>` to populate another collection.
 
 ```bash
-python -m rag.backfill --dry-run                  # preview, defaults to --target multilingual
-python -m rag.backfill                            # execute, multilingual
-python -m rag.backfill --target azure-openai      # populate the Azure collection
+python -m rag.backfill --dry-run                              # preview multilingual, no writes
+python -m rag.backfill                                        # execute multilingual
+python -m rag.backfill --target azure-openai --dry-run        # preview Azure, no API calls
+python -m rag.backfill --target azure-openai --limit 1 --yes  # smoke-test the paid path
+python -m rag.backfill --target azure-openai --yes            # full paid backfill
 ```
+
+The dry-run is always free — chunk counts are read from the local baseline collection. Any target whose provider is not `local` (e.g. `azure-openai`) requires `--yes` to acknowledge that paid API calls will be made; without it, the script prints the scope and exits. On a paid target, a first-episode failure aborts the run so a misconfiguration (wrong deployment, expired key) doesn't burn one failed request per episode.
 
 ### CLI — search without the UI
 

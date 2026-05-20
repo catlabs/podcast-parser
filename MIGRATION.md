@@ -311,9 +311,29 @@ re-embed existing transcripts:
 re-transcription, no re-chunking, no new audio downloads)*:
 
 ```bash
+# 1. Always start with a free dry-run — chunk counts come from the
+#    LOCAL baseline collection; no API calls are made.
 .venv/bin/python -m rag.backfill --target azure-openai --dry-run
-.venv/bin/python -m rag.backfill --target azure-openai
+
+# 2. Smoke-test against the first 1-2 episodes before committing to the
+#    full set. --limit slices both the episode list and the chunk total
+#    shown in the banner. Paid providers still require --yes.
+.venv/bin/python -m rag.backfill --target azure-openai --limit 1 --yes
+
+# 3. Run the full backfill.
+.venv/bin/python -m rag.backfill --target azure-openai --yes
 ```
+
+Safety rails built into the script:
+
+- A paid target (any `EmbedConfig.provider != "local"`) requires `--yes`.
+  Without it, the script prints scope and exits `2` — no API calls made.
+- A first-episode failure on a paid target aborts the run rather than
+  paying for repeated identical failures (typically wrong deployment,
+  expired key, or bad endpoint).
+- The up-front banner reports the active provider, collection, episode
+  count, and chunk count so the magnitude of the run is visible before
+  any tokens leave the machine.
 
 The backfill script pulls each episode's chunks from the baseline
 (`minilm`) Chroma collection, re-embeds them via the Azure deployment,
