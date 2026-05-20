@@ -54,8 +54,9 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 6c | done | UI surfacing — `/config.embed_options` drives the embed dropdown |
 | 6d | done | Backfill safety rails (`--dry-run`, `--limit`, `--yes`, fail-fast) |
 | 7 (step 1) | done | Langfuse observability — chat path + Azure embeddings; opt-in |
-| 7 (step 2) | next | Langfuse — research-mode span hierarchy |
-| 7 (step 3) | — | Langfuse — context tags (session_id, user_id, feature) |
+| 7 (step 2) | done | Langfuse — retrieval spans around `semantic_search()` |
+| 7 (step 3) | next | Langfuse — research-mode span hierarchy |
+| 7 (step 4) | — | Langfuse — context tags (session_id, user_id, feature) |
 | 8 | — | Azure Blob Storage |
 | 9 | — | Azure AI Search |
 | 10 | — | Azure Speech |

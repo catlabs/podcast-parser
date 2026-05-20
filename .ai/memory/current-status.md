@@ -80,3 +80,10 @@ OpenAI/AzureOpenAI drop-in covers GPT/Azure chat + Azure embeddings, Anthropic
 chat instrumented manually (sync + stream). Local-only mode unchanged when
 keys are unset. Ollama, sentence-transformers, and research-mode span tree
 deliberately deferred to step 2.
+
+2026-05-20 — Langfuse step 2 wired: retrieval span around `semantic_search()`.
+Captures query, top_k, model_key, provider, collection, per-chunk metadata
+(title/podcast/date/chunk_index/distance) and Langfuse-native span duration.
+Chunk `text` deliberately excluded — re-enable behind a `mask=` callback later.
+Azure embedding calls nest as a child generation under the retrieval span via
+the Step 1 drop-in. Research-mode parent trace and context tags still deferred.

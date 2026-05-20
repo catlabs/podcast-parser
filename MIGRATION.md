@@ -547,6 +547,120 @@ LANGFUSE_PUBLIC_KEY=pk-lf-x LANGFUSE_SECRET_KEY=sk-lf-y \
 
 ---
 
+## Step 7 — Langfuse observability (step 2: retrieval spans)
+
+Wraps every `semantic_search()` call in a Langfuse span so we can compare
+retrieval behaviour before swapping Chroma for Azure AI Search later.
+Pure observability change — retrieval results, prompts, and chunking
+are untouched.
+
+### What ships
+
+- **`rag/search.py`** — `semantic_search()` body extracted to a private
+  `_do_search()` helper so the public function can wrap the work in
+  `lf.start_as_current_observation(as_type="span", name="retrieval")`
+  when Langfuse is configured. When disabled, the call goes straight to
+  `_do_search()` — no measurable overhead.
+- **`_retrieval_output()`** — compact summary emitted on the span. Keeps
+  the per-chunk metadata (title, podcast, date, chunk_index, distance)
+  but drops the chunk `text` field, matching the "do not log full
+  transcript / chunk content" constraint.
+
+No other files touched. Behaviour with Langfuse disabled is byte-identical.
+
+### What gets traced per retrieval call
+
+| Field | Source | Why |
+|---|---|---|
+| `input.query` | user query string | the input that produced this retrieval |
+| `input.top_k` | request param | for grouping runs by request size |
+| `input.model_key` | request param | the registry key (`minilm` / `multilingual` / `azure-openai` / …) |
+| `metadata.embedding_provider` | `EmbedConfig.provider` | `local` vs `azure_openai`; one-click filter in Langfuse |
+| `metadata.collection` | `EmbedConfig.collection` | Chroma collection name (`podcasts` / `podcasts_multilingual` / `podcasts_azure`) |
+| `output.count` | results length | sanity check vs `top_k` |
+| `output.results[i]` | per-chunk metadata | `title`, `podcast`, `date`, `chunk_index`, `distance` — no `text` |
+| span duration | Langfuse automatic | total retrieval wall time (query embed + Chroma query) |
+
+When `model_key="azure-openai"`, the embedding call inside `_do_search()`
+goes through the langfuse.openai drop-in patched `AzureOpenAI` client
+from Step 1, so a child `generation` observation appears nested under
+the retrieval span automatically. For local sentence-transformer
+embeddings the embedding step is uninstrumented (no upstream API; free).
+
+### What is intentionally NOT traced
+
+- **Chunk text bodies** — could contain transcribed personal/customer
+  content. Dropped from the summary. (Re-enable later via a configured
+  `mask=` callback once a redaction strategy is decided.)
+- **Local sentence-transformer embedding** — CPU-only, no upstream
+  call, no marginal value in observing.
+- **Research-mode parent trace** — each sub-query retrieval is its
+  own root span today. Nesting all of them under a single
+  `chat-research` parent is Step 3.
+- **Prompts / formatted context** — `format_context()` is unchanged
+  and unobserved here; instrumenting it would duplicate what the
+  chat-span input already records.
+
+### Activating
+
+Nothing to do beyond Step 1 — the spans appear automatically the next
+time Langfuse env vars are set:
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+### Smoke test
+
+```bash
+# 1. Local-only path (no Langfuse keys) — return shape unchanged
+.venv/bin/python -c "
+from rag.search import semantic_search
+r = semantic_search('Nanocorp', top_k=3, model_key='minilm')
+print(len(r), sorted(r[0].keys()))
+"
+# expect: 3 ['chunk_index', 'date', 'distance', 'model_key', 'podcast', 'text', 'title']
+
+# 2. Langfuse-enabled path — confirm the traced summary excludes 'text'
+.venv/bin/python -c "
+from rag.search import semantic_search, _retrieval_output
+r = semantic_search('Nanocorp', top_k=3, model_key='minilm')
+print('text in trace:', 'text' in _retrieval_output(r)['results'][0])
+"
+# expect: text in trace: False
+```
+
+After running a few /chat queries in the UI, open the Langfuse Traces
+view: each chat will now contain a `retrieval` span with the metadata
+above, and Azure-embedding chats will show the nested embedding
+generation underneath.
+
+### Limitations when comparing similarity scores
+
+Two pitfalls before drawing conclusions from `distance`:
+
+1. **Across vector stores** — Chroma returns cosine distance (lower is
+   better, range ~0–2). Azure AI Search, once it lands, returns a
+   `@search.score` whose scale depends on configuration (BM25,
+   semantic ranker, vector profile). Distances and scores are not
+   directly comparable; the only safe comparison is *relative rank
+   within a single store* until we have both stores online and can
+   calibrate.
+2. **Across embedding models** — even staying inside Chroma, the
+   distance distribution depends on the embedding model. `minilm`
+   and `multilingual` cluster differently; absolute distance values
+   shouldn't be compared between them. Useful comparisons are
+   *rank-based*: did the same gold chunk show up in the top-5 for
+   both models? That's exactly what `rag.eval` already measures
+   (Hit@K, Recall@K, MRR).
+
+The retrieval spans are designed for behavioural comparison (which
+chunks were returned, in what order) rather than score-magnitude
+comparison.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.
