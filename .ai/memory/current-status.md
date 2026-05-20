@@ -87,3 +87,13 @@ Captures query, top_k, model_key, provider, collection, per-chunk metadata
 Chunk `text` deliberately excluded — re-enable behind a `mask=` callback later.
 Azure embedding calls nest as a child generation under the retrieval span via
 the Step 1 drop-in. Research-mode parent trace and context tags still deferred.
+
+2026-05-20 — Langfuse step 3 wired: app-level RAG spans. `ask()` / `ask_stream()`
+in chat.py now open a root `chat-request` span; `classify()` is wrapped in
+`router-classify`; each of the four LLM call sites (list_episodes,
+summarize_episode, app_meta, podcast_rag — sync + stream) is wrapped in
+`final-generation`. Auto OpenAI SDK observations are kept and appear as
+children under each custom span (raw payloads + token usage). New
+LANGFUSE_LOG_FULL_PROMPTS=false default keeps prompts out of custom-span
+inputs; auto SDK obs still carries the raw message array. Research-mode
+parent trace and context tags still deferred.

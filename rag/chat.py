@@ -18,10 +18,27 @@ import logging
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, EMBED_MODELS, LLM_REGISTRY, TOP_K
 
 log = logging.getLogger(__name__)
+from rag.observability import should_log_full_prompts, span
 from rag.providers import get_chat_provider
 from rag.router import classify
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text, summarize_episode as summarize_episode_tool
+
+
+def _gen_input(intent: str, *, extra: dict | None = None, prompt: str | None = None) -> dict:
+    """Build the final-generation span input.
+
+    Keeps the trace summary short (intent + numeric stats) and omits the
+    full prompt unless LANGFUSE_LOG_FULL_PROMPTS=true. The auto SDK span
+    under this one captures the full message array regardless, so the
+    raw payload is always reachable by clicking one level deeper.
+    """
+    out = {"intent": intent}
+    if extra:
+        out.update(extra)
+    if prompt is not None and should_log_full_prompts():
+        out["prompt"] = prompt
+    return out
 
 # ── Prompt ────────────────────────────────────────────────────────────────────
 
@@ -91,65 +108,120 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
         "intent":    str,          # router classification
       }
     """
-    result    = classify(query, llm_key)
-    intent    = result["intent"]
-    sub_query = result.get("query") or query
-    chat      = get_chat_provider(llm_key)
+    with span(
+        "chat-request",
+        input    = {"query": query, "top_k": top_k},
+        metadata = {"model_key": model_key, "llm_key": llm_key or DEFAULT_LLM_KEY},
+    ) as req:
+        result    = classify(query, llm_key)
+        intent    = result["intent"]
+        sub_query = result.get("query") or query
+        chat      = get_chat_provider(llm_key)
 
-    log.info("route=%s  sub_query=%r", intent, sub_query)
+        log.info("route=%s  sub_query=%r", intent, sub_query)
 
-    # ── tool: list episodes ───────────────────────────────────────────────────
-    if intent == "list_episodes":
-        episode_list = list_episodes_text()
-        answer = chat.generate(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}")
+        # ── tool: list episodes ───────────────────────────────────────────────
+        if intent == "list_episodes":
+            episode_list = list_episodes_text()
+            with span(
+                "final-generation",
+                input    = _gen_input(intent),
+                metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                            "prompt":  "LIST_EPISODES_PROMPT"},
+            ) as gen:
+                answer = chat.generate(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}")
+                gen.update(output={"answer_length": len(answer)})
+            req.update(output={"intent": intent, "n_chunks": 0, "answer_length": len(answer)})
+            return {
+                "answer":    answer,
+                "sources":   [],
+                "chunks":    [],
+                "model_key": model_key,
+                "intent":    intent,
+            }
+
+        # ── tool: summarize episode ───────────────────────────────────────────
+        if intent == "summarize_episode":
+            ep_title, context = summarize_episode_tool(sub_query, model_key)
+            user_message      = f'Épisode : "{ep_title}"\n\n{context}'
+            with span(
+                "final-generation",
+                input    = _gen_input(
+                    intent,
+                    extra  = {"episode_title": ep_title, "context_chars": len(context)},
+                    prompt = user_message,
+                ),
+                metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                            "prompt":  "SUMMARIZE_PROMPT"},
+            ) as gen:
+                answer = chat.generate(SUMMARIZE_PROMPT, user_message)
+                gen.update(output={"answer_length": len(answer)})
+            req.update(output={"intent": intent, "n_chunks": 0, "answer_length": len(answer)})
+            return {
+                "answer":    answer,
+                "sources":   [{"title": ep_title, "podcast": "", "date": None}],
+                "chunks":    [],
+                "model_key": model_key,
+                "intent":    intent,
+            }
+
+        # ── existing intents ──────────────────────────────────────────────────
+        system  = _PROMPT_FOR_INTENT.get(intent, PODCAST_RAG_PROMPT)
+        use_rag = intent == "podcast_rag"
+
+        log.info("prompt=%s  retrieval=%s", system.splitlines()[0][:60], use_rag)
+
+        if not use_rag:
+            with span(
+                "final-generation",
+                input    = _gen_input(intent, prompt=query),
+                metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                            "prompt":  "APP_META_PROMPT"},
+            ) as gen:
+                answer = chat.generate(system, query)
+                gen.update(output={"answer_length": len(answer)})
+            req.update(output={"intent": intent, "n_chunks": 0, "answer_length": len(answer)})
+            return {
+                "answer":    answer,
+                "sources":   [],
+                "chunks":    [],
+                "model_key": model_key,
+                "intent":    intent,
+            }
+
+        results      = semantic_search(query, top_k=top_k, model_key=model_key)
+        context      = format_context(results)
+        user_message = build_prompt(query, context)
+
+        with span(
+            "final-generation",
+            input    = _gen_input(
+                intent,
+                extra  = {
+                    "n_chunks":      len(results),
+                    "context_chars": len(context),
+                    "top_titles":    [r["title"] for r in results[:3]],
+                },
+                prompt = user_message,
+            ),
+            metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                        "prompt":  "PODCAST_RAG_PROMPT"},
+        ) as gen:
+            answer = chat.generate(system, user_message)
+            gen.update(output={"answer_length": len(answer)})
+
+        req.update(output={
+            "intent":        intent,
+            "n_chunks":      len(results),
+            "answer_length": len(answer),
+        })
         return {
             "answer":    answer,
-            "sources":   [],
-            "chunks":    [],
+            "sources":   _unique_sources(results),
+            "chunks":    results,
             "model_key": model_key,
             "intent":    intent,
         }
-
-    # ── tool: summarize episode ───────────────────────────────────────────────
-    if intent == "summarize_episode":
-        ep_title, context = summarize_episode_tool(sub_query, model_key)
-        answer = chat.generate(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}')
-        return {
-            "answer":    answer,
-            "sources":   [{"title": ep_title, "podcast": "", "date": None}],
-            "chunks":    [],
-            "model_key": model_key,
-            "intent":    intent,
-        }
-
-    # ── existing intents ──────────────────────────────────────────────────────
-    system  = _PROMPT_FOR_INTENT.get(intent, PODCAST_RAG_PROMPT)
-    use_rag = intent == "podcast_rag"
-
-    log.info("prompt=%s  retrieval=%s", system.splitlines()[0][:60], use_rag)
-
-    if not use_rag:
-        answer = chat.generate(system, query)
-        return {
-            "answer":    answer,
-            "sources":   [],
-            "chunks":    [],
-            "model_key": model_key,
-            "intent":    intent,
-        }
-
-    results      = semantic_search(query, top_k=top_k, model_key=model_key)
-    context      = format_context(results)
-    user_message = build_prompt(query, context)
-    answer       = chat.generate(system, user_message)
-
-    return {
-        "answer":    answer,
-        "sources":   _unique_sources(results),
-        "chunks":    results,
-        "model_key": model_key,
-        "intent":    intent,
-    }
 
 
 def ask_stream(
@@ -174,115 +246,164 @@ def ask_stream(
     llm_label = LLM_REGISTRY.get(llm_key or DEFAULT_LLM_KEY, LLM_REGISTRY[DEFAULT_LLM_KEY]).label
     chat      = get_chat_provider(llm_key)
 
-    # ── classify ──────────────────────────────────────────────────────────────
-    yield step("classify", "running")
-    try:
-        classified = classify(query, llm_key)
-    except Exception as exc:
-        yield step("classify", "error", str(exc))
-        yield {"type": "error", "detail": str(exc)}
-        return
-    intent    = classified["intent"]
-    sub_query = classified.get("query") or query
-    yield step("classify", "done", intent)
-
-    log.info("route=%s  sub_query=%r", intent, sub_query)
-
-    # ── tool: list episodes ───────────────────────────────────────────────────
-    if intent == "list_episodes":
-        yield step("fetch_episodes", "running")
+    with span(
+        "chat-request",
+        input    = {"query": query, "top_k": top_k},
+        metadata = {"model_key": model_key, "llm_key": llm_key or DEFAULT_LLM_KEY,
+                    "stream":    True},
+    ) as req:
+        # ── classify ──────────────────────────────────────────────────────────
+        yield step("classify", "running")
         try:
-            episode_list = list_episodes_text()
+            classified = classify(query, llm_key)
         except Exception as exc:
-            yield step("fetch_episodes", "error", str(exc))
+            yield step("classify", "error", str(exc))
             yield {"type": "error", "detail": str(exc)}
             return
-        yield step("fetch_episodes", "done")
+        intent    = classified["intent"]
+        sub_query = classified.get("query") or query
+        yield step("classify", "done", intent)
 
+        log.info("route=%s  sub_query=%r", intent, sub_query)
+
+        # ── tool: list episodes ───────────────────────────────────────────────
+        if intent == "list_episodes":
+            yield step("fetch_episodes", "running")
+            try:
+                episode_list = list_episodes_text()
+            except Exception as exc:
+                yield step("fetch_episodes", "error", str(exc))
+                yield {"type": "error", "detail": str(exc)}
+                return
+            yield step("fetch_episodes", "done")
+
+            yield step("generate", "running", llm_label)
+            chunks_text: list[str] = []
+            with span(
+                "final-generation",
+                input    = _gen_input(intent),
+                metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                            "prompt":  "LIST_EPISODES_PROMPT", "stream": True},
+            ) as gen:
+                try:
+                    for token in chat.generate_stream(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}"):
+                        chunks_text.append(token)
+                        yield {"type": "token", "text": token}
+                except Exception as exc:
+                    yield step("generate", "error", str(exc))
+                    yield {"type": "error", "detail": str(exc)}
+                    return
+                answer = "".join(chunks_text)
+                gen.update(output={"answer_length": len(answer)})
+            yield step("generate", "done", llm_label)
+
+            req.update(output={"intent": intent, "n_chunks": 0, "answer_length": len(answer)})
+            yield {"type": "result", "answer": answer, "sources": [],
+                   "chunks": [], "model_key": model_key, "intent": intent}
+            return
+
+        # ── tool: summarize episode ───────────────────────────────────────────
+        if intent == "summarize_episode":
+            yield step("fetch_chunks", "running")
+            try:
+                ep_title, context = summarize_episode_tool(sub_query, model_key)
+            except Exception as exc:
+                yield step("fetch_chunks", "error", str(exc))
+                yield {"type": "error", "detail": str(exc)}
+                return
+            yield step("fetch_chunks", "done", ep_title)
+
+            yield step("generate", "running", llm_label)
+            chunks_text: list[str] = []
+            user_message = f'Épisode : "{ep_title}"\n\n{context}'
+            with span(
+                "final-generation",
+                input    = _gen_input(
+                    intent,
+                    extra  = {"episode_title": ep_title, "context_chars": len(context)},
+                    prompt = user_message,
+                ),
+                metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                            "prompt":  "SUMMARIZE_PROMPT", "stream": True},
+            ) as gen:
+                try:
+                    for token in chat.generate_stream(SUMMARIZE_PROMPT, user_message):
+                        chunks_text.append(token)
+                        yield {"type": "token", "text": token}
+                except Exception as exc:
+                    yield step("generate", "error", str(exc))
+                    yield {"type": "error", "detail": str(exc)}
+                    return
+                answer = "".join(chunks_text)
+                gen.update(output={"answer_length": len(answer)})
+            yield step("generate", "done", llm_label)
+
+            req.update(output={"intent": intent, "n_chunks": 0, "answer_length": len(answer)})
+            yield {"type": "result", "answer": answer,
+                   "sources": [{"title": ep_title, "podcast": "", "date": None}],
+                   "chunks": [], "model_key": model_key, "intent": intent}
+            return
+
+        # ── existing intents ──────────────────────────────────────────────────
+        system  = _PROMPT_FOR_INTENT.get(intent, PODCAST_RAG_PROMPT)
+        use_rag = intent == "podcast_rag"
+
+        log.info("prompt=%s  retrieval=%s", system.splitlines()[0][:60], use_rag)
+
+        # ── search (only for podcast_rag) ─────────────────────────────────────
+        if use_rag:
+            yield step("search", "running")
+            try:
+                results = semantic_search(query, top_k=top_k, model_key=model_key)
+            except Exception as exc:
+                yield step("search", "error", str(exc))
+                yield {"type": "error", "detail": str(exc)}
+                return
+            yield step("search", "done", f"{len(results)} chunks")
+            context      = format_context(results)
+            user_message = build_prompt(query, context)
+        else:
+            results      = []
+            context      = ""
+            user_message = query
+
+        # ── generate ──────────────────────────────────────────────────────────
         yield step("generate", "running", llm_label)
         chunks_text: list[str] = []
-        try:
-            for token in chat.generate_stream(LIST_EPISODES_PROMPT, f"Liste des épisodes :\n{episode_list}"):
-                chunks_text.append(token)
-                yield {"type": "token", "text": token}
-        except Exception as exc:
-            yield step("generate", "error", str(exc))
-            yield {"type": "error", "detail": str(exc)}
-            return
-        answer = "".join(chunks_text)
+        prompt_label = "PODCAST_RAG_PROMPT" if use_rag else "APP_META_PROMPT"
+        with span(
+            "final-generation",
+            input    = _gen_input(
+                intent,
+                extra  = {
+                    "n_chunks":      len(results),
+                    "context_chars": len(context),
+                    "top_titles":    [r["title"] for r in results[:3]],
+                } if use_rag else None,
+                prompt = user_message,
+            ),
+            metadata = {"llm_key": llm_key or DEFAULT_LLM_KEY,
+                        "prompt":  prompt_label, "stream": True},
+        ) as gen:
+            try:
+                for token in chat.generate_stream(system, user_message):
+                    chunks_text.append(token)
+                    yield {"type": "token", "text": token}
+            except Exception as exc:
+                yield step("generate", "error", str(exc))
+                yield {"type": "error", "detail": str(exc)}
+                return
+            answer = "".join(chunks_text)
+            gen.update(output={"answer_length": len(answer)})
         yield step("generate", "done", llm_label)
 
-        yield {"type": "result", "answer": answer, "sources": [],
-               "chunks": [], "model_key": model_key, "intent": intent}
-        return
-
-    # ── tool: summarize episode ───────────────────────────────────────────────
-    if intent == "summarize_episode":
-        yield step("fetch_chunks", "running")
-        try:
-            ep_title, context = summarize_episode_tool(sub_query, model_key)
-        except Exception as exc:
-            yield step("fetch_chunks", "error", str(exc))
-            yield {"type": "error", "detail": str(exc)}
-            return
-        yield step("fetch_chunks", "done", ep_title)
-
-        yield step("generate", "running", llm_label)
-        chunks_text: list[str] = []
-        try:
-            for token in chat.generate_stream(SUMMARIZE_PROMPT, f'Épisode : "{ep_title}"\n\n{context}'):
-                chunks_text.append(token)
-                yield {"type": "token", "text": token}
-        except Exception as exc:
-            yield step("generate", "error", str(exc))
-            yield {"type": "error", "detail": str(exc)}
-            return
-        answer = "".join(chunks_text)
-        yield step("generate", "done", llm_label)
-
-        yield {"type": "result", "answer": answer,
-               "sources": [{"title": ep_title, "podcast": "", "date": None}],
-               "chunks": [], "model_key": model_key, "intent": intent}
-        return
-
-    # ── existing intents ──────────────────────────────────────────────────────
-    system  = _PROMPT_FOR_INTENT.get(intent, PODCAST_RAG_PROMPT)
-    use_rag = intent == "podcast_rag"
-
-    log.info("prompt=%s  retrieval=%s", system.splitlines()[0][:60], use_rag)
-
-    # ── search (only for podcast_rag) ─────────────────────────────────────────
-    if use_rag:
-        yield step("search", "running")
-        try:
-            results = semantic_search(query, top_k=top_k, model_key=model_key)
-        except Exception as exc:
-            yield step("search", "error", str(exc))
-            yield {"type": "error", "detail": str(exc)}
-            return
-        yield step("search", "done", f"{len(results)} chunks")
-        context      = format_context(results)
-        user_message = build_prompt(query, context)
-    else:
-        results      = []
-        user_message = query
-
-    # ── generate ──────────────────────────────────────────────────────────────
-    yield step("generate", "running", llm_label)
-    chunks_text: list[str] = []
-    try:
-        for token in chat.generate_stream(system, user_message):
-            chunks_text.append(token)
-            yield {"type": "token", "text": token}
-    except Exception as exc:
-        yield step("generate", "error", str(exc))
-        yield {"type": "error", "detail": str(exc)}
-        return
-    answer = "".join(chunks_text)
-    yield step("generate", "done", llm_label)
-
-    yield {"type": "result", "answer": answer, "sources": _unique_sources(results),
-           "chunks": results, "model_key": model_key, "intent": intent}
+        req.update(output={
+            "intent":        intent,
+            "n_chunks":      len(results),
+            "answer_length": len(answer),
+        })
+        yield {"type": "result", "answer": answer, "sources": _unique_sources(results),
+               "chunks": results, "model_key": model_key, "intent": intent}
 
 
 def compare(query: str, top_k: int = TOP_K, llm_key: str | None = None) -> dict[str, dict]:

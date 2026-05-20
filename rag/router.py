@@ -15,6 +15,7 @@ back to {"intent": "podcast_rag", "query": None} on any error.
 
 import json
 
+from rag.observability import span
 from rag.providers import get_chat_provider
 
 # ── Types & constants ─────────────────────────────────────────────────────────
@@ -64,11 +65,19 @@ def classify(query: str, llm_key: str | None = None) -> ClassifyResult:
     Classify query using the selected LLM.
     Always returns a valid ClassifyResult; falls back to FALLBACK on any error.
     """
-    try:
-        raw = get_chat_provider(llm_key).generate(ROUTER_SYSTEM, query)
-        return _parse(raw)
-    except Exception:
-        return FALLBACK
+    with span(
+        "router-classify",
+        input    = {"query": query},
+        metadata = {"llm_key": llm_key or "default"},
+    ) as s:
+        try:
+            raw    = get_chat_provider(llm_key).generate(ROUTER_SYSTEM, query)
+            result = _parse(raw)
+        except Exception as exc:
+            s.update(output={**FALLBACK, "fallback_reason": str(exc)[:200]})
+            return FALLBACK
+        s.update(output=result)
+        return result
 
 
 # ── Internal ──────────────────────────────────────────────────────────────────

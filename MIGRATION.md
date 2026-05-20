@@ -661,6 +661,118 @@ comparison.
 
 ---
 
+## Step 7 — Langfuse observability (step 3: app-level RAG spans)
+
+Make the trace UI explain the application pipeline, not just dump raw
+SDK calls. Step 1 wired the OpenAI drop-in (auto generation
+observations); Step 2 added a custom retrieval span; this step adds
+the rest of the application-level skeleton so a chat trace reads as a
+tree of meaningful steps with the auto SDK observations nested
+underneath as raw detail.
+
+### Target trace shape per chat request
+
+```
+chat-request                          (custom span, root)
+├── router-classify                   (custom span; wraps intent classifier)
+│   └── azure-chat-completion         (auto generation — raw SDK call)
+├── retrieval                         (custom span; from Step 2)
+│   └── azure-embedding-create        (auto generation — raw SDK call)
+└── final-generation                  (custom span; wraps answer LLM call)
+    └── azure-chat-completion         (auto generation — raw SDK call)
+```
+
+### What ships
+
+- **`rag/observability.py`** — new `span(name, ...)` context-manager
+  helper (no-op when Langfuse is disabled), plus a
+  `should_log_full_prompts()` reader.
+- **`rag/router.py`** — `classify()` body wrapped in `router-classify`
+  span. Input: `{query}`. Output: the classification result (or the
+  fallback with `fallback_reason`).
+- **`rag/chat.py`** — `ask()` and `ask_stream()` wrap their full body
+  in `chat-request` (root span). Each of the four LLM call sites
+  (list_episodes, summarize_episode, app_meta, podcast_rag — both
+  sync and stream) is wrapped in `final-generation`. `_gen_input()`
+  helper builds the span input with `intent`, `n_chunks`,
+  `context_chars`, `top_titles`, and optionally the full
+  system+user prompt when `LANGFUSE_LOG_FULL_PROMPTS=true`.
+- **`.env.agent-safe`** — adds `LANGFUSE_LOG_FULL_PROMPTS=false` as
+  the committed default.
+
+### What each layer captures
+
+| Observation | Source | Carries |
+|---|---|---|
+| `chat-request` | custom | `query`, `top_k`, `model_key`, `llm_key`, `stream`, then `intent`, `n_chunks`, `answer_length` |
+| `router-classify` | custom | `query` in / `{intent, query?}` out, `llm_key` metadata |
+| `retrieval` | custom (Step 2) | `query`, `top_k`, `model_key`, `embedding_provider`, `collection`, top chunk metadata (no `text`) |
+| `final-generation` | custom | `intent`, `n_chunks`, `context_chars`, `top_titles`, `prompt_label` (NOT the prompt text by default) |
+| auto-generation under any of the above | `langfuse.openai` drop-in (Step 1) | Raw message array, full request body, **token usage** when streaming is off |
+
+### Why embedding observations looked broken before
+
+The `langfuse.openai` drop-in tags every patched SDK call (chat
+completions AND embeddings) as `as_type="generation"`. Langfuse's
+trace UI shows generation observations with chat-message fields like
+`role`, `content`, `tools` — which are populated for chat completions
+but **undefined for embedding calls** because embeddings don't have
+those fields. The "noise" you saw was the UI rendering empty chat
+fields for an embedding observation; the actual token-usage data on
+those observations is still correct.
+
+This step doesn't fix the UI quirk (it's a Langfuse-side limitation)
+— it makes the quirk irrelevant by giving you clean application-level
+spans (`chat-request`, `retrieval`, `final-generation`) to read
+first. Drill into the SDK observation only when you need the raw
+request body.
+
+### Privacy
+
+| Field | Default | Notes |
+|---|---|---|
+| Chunk text bodies | not logged | already enforced in `retrieval` span (Step 2) |
+| Full system + user prompt | not logged | set `LANGFUSE_LOG_FULL_PROMPTS=true` to include in `final-generation` input; the auto SDK observation always has the raw message array regardless |
+| Secrets / API keys | never logged | none of the spans touch env-var values |
+
+### How to test with one chat request
+
+```bash
+# 1. Make sure Langfuse keys are in .env (see Step 1).
+# 2. Restart uvicorn so the new spans are picked up.
+.venv/bin/python -m uvicorn rag.api:app --reload
+
+# 3. From the UI, ask a question against any chat model.
+#    The /chat/stream endpoint is the common path.
+
+# 4. In Langfuse → Traces, you should see a single trace per request
+#    named "chat-request", with the three custom children
+#    (router-classify, retrieval, final-generation) and an auto SDK
+#    generation observation nested under each one that calls an LLM.
+```
+
+A non-streaming run (`ENABLE_LLM_STREAMING=false` in `.env`) gives the
+cleanest token-usage capture on the auto SDK observation underneath
+`final-generation`; that's the recommended debug mode while iterating
+on observability.
+
+### What did NOT change in this step
+
+- Retrieval behaviour (`semantic_search` unchanged — still has its
+  Step 2 span).
+- Routing logic, intent classifier prompt, RAG prompt, chunking,
+  embedding model selection, vector store, ranking.
+- Auto OpenAI tracing — deliberately kept. It provides token usage
+  for free; the trade-off is the "undefined chat fields on
+  embedding obs" quirk above. Disable per-call with
+  `langfuse_enabled=False` later if it ever becomes worse than the
+  signal it provides.
+- Research-mode parent trace — each `semantic_search` inside research
+  is still its own root. Wiring research mode into a single trace
+  is the next-step candidate.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.

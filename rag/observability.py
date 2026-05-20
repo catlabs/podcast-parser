@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import atexit
 import os
+from contextlib import contextmanager
 
 # Side effect: load_dotenv() — guarantees Langfuse sees the keys from .env.
 from rag import config  # noqa: F401
@@ -87,3 +88,55 @@ def flush() -> None:
 # Eagerly initialise so any later `from langfuse.openai import openai`
 # import sees the SDK already configured.
 get_langfuse()
+
+
+# ── Application-level spans ───────────────────────────────────────────────────
+# Thin wrapper around lf.start_as_current_observation that no-ops when
+# Langfuse is disabled. Use this for app-level steps (router, retrieval,
+# generation) so traces explain the pipeline rather than just dumping
+# raw SDK calls.
+
+class _NoOpSpan:
+    """Returned in place of a real Langfuse span when tracing is disabled.
+
+    Accepts .update(**kwargs) silently so call sites can use the same code
+    path regardless of whether Langfuse is configured.
+    """
+    def update(self, **_kwargs) -> None:
+        pass
+
+
+@contextmanager
+def span(name: str, *, as_type: str = "span", input=None, metadata=None):
+    """Application-level span. Yields an object with `.update(...)`.
+
+    Example:
+        with span("router-classify", input={"query": q}) as s:
+            result = run_classifier(q)
+            s.update(output=result)
+
+    When Langfuse is enabled, this creates a child observation under the
+    currently-active span (or a new trace root if none exists). When
+    disabled, yields a no-op object so callers can stay branch-free.
+    """
+    lf = get_langfuse()
+    if lf is None:
+        yield _NoOpSpan()
+        return
+    with lf.start_as_current_observation(
+        as_type  = as_type,
+        name     = name,
+        input    = input,
+        metadata = metadata,
+    ) as s:
+        yield s
+
+
+def should_log_full_prompts() -> bool:
+    """Whether the final-generation span input should include the full prompt
+    (system + user message with retrieved context). Off by default to keep
+    chunk text out of traces; enable for one-off prompt debugging.
+    """
+    return os.environ.get(
+        "LANGFUSE_LOG_FULL_PROMPTS", "false",
+    ).strip().lower() in ("1", "true", "yes")

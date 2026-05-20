@@ -221,6 +221,26 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 
 Restart the backend after setting the keys; open any chat from the UI and the trace appears in the Langfuse Traces tab. Local sentence-transformer embeddings and Ollama are not traced in this step — they are local-only and free.
 
+#### Reading a chat trace
+
+Each chat request produces a tree of application-level spans with the auto OpenAI/Anthropic SDK observations nested underneath as raw detail. Read the custom spans first; only drill into the SDK observation when you need the raw message array.
+
+```
+chat-request                          custom — query, top_k, intent, n_chunks, answer_length
+├── router-classify                   custom — wraps the intent classifier LLM call
+│   └── azure-chat-completion         auto    — raw SDK call, token usage
+├── retrieval                         custom — model_key, collection, top chunk titles + distances (no chunk text)
+│   └── azure-embedding-create        auto    — raw embedding API call
+└── final-generation                  custom — intent, n_chunks, context_chars, prompt label
+    └── azure-chat-completion         auto    — raw SDK call, token usage
+```
+
+Heads-up on the auto SDK observations: the `langfuse.openai` drop-in tags every patched call as `as_type="generation"`, including embedding calls. Langfuse's UI then shows chat-message fields (`role`, `content`, `tools`) as undefined for those embedding observations. That's expected — the custom `retrieval` span above it carries the readable metadata. Token usage on the embedding observation is still correct.
+
+For the cleanest token-usage capture on the chat-completion side, run with streaming off (`ENABLE_LLM_STREAMING=false` in `.env`).
+
+Privacy: chunk text is never logged. The full system+user prompt is hidden by default in the `final-generation` span input; flip `LANGFUSE_LOG_FULL_PROMPTS=true` (in `.env`, overriding the agent-safe default) for one-off prompt debugging. The auto SDK observation underneath still carries the raw message array regardless — that's a Langfuse-side decision.
+
 Not traced today and explicitly deferred: research-mode span hierarchy (planner → search → analyst → synthesizer → grounder as nested spans), context tags (`session_id`, `user_id`, `feature`), and a `mask=` callback for PII scrubbing. The bootstrap module (`rag/observability.py`) is the single hook point when those land.
 
 ### Frontend
