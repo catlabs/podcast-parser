@@ -28,6 +28,7 @@ from langfuse.openai import openai as _openai_sdk
 from rag.config import (
     ANTHROPIC_API_KEY,
     DEFAULT_LLM_KEY,
+    ENABLE_LLM_STREAMING,
     LLM_REGISTRY,
     LLMConfig,
     OLLAMA_BASE_URL,
@@ -51,7 +52,18 @@ def generate(system: str, user: str, llm_key: str | None = None) -> str:
 
 
 def generate_stream(system: str, user: str, llm_key: str | None = None):
-    """Yield text chunks from the selected LLM."""
+    """Yield text chunks from the selected LLM.
+
+    When ENABLE_LLM_STREAMING is false, short-circuit to the non-streaming
+    `generate()` path and yield its result as a single chunk. The streaming
+    API stays intact for callers (SSE consumers, research synthesis), but
+    the upstream SDK call is non-streaming so its response carries usage
+    data — letting Langfuse / OpenTelemetry capture tokens reliably.
+    """
+    if not ENABLE_LLM_STREAMING:
+        yield generate(system, user, llm_key)
+        return
+
     cfg = _resolve(llm_key)
     if cfg.provider == "ollama":
         yield from _ollama_stream(system, user, cfg.model)

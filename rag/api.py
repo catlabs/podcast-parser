@@ -44,6 +44,7 @@ from rag.config import (
     DEFAULT_LLM_KEY,
     DEFAULT_MODEL_KEY,
     EMBED_REGISTRY,
+    ENABLE_LLM_STREAMING,
     LLM_REGISTRY,
     OPENAI_API_KEY,
     TOP_K,
@@ -70,6 +71,11 @@ async def lifespan(app: FastAPI):
     conn = get_connection()
     init_db(conn)
     conn.close()
+    print(
+        "[startup] LLM streaming: "
+        + ("enabled" if ENABLE_LLM_STREAMING
+           else "DISABLED (debug/observability mode — non-streaming completions)")
+    )
     yield   # server runs here
     # Shutdown — drain any buffered traces before the process exits.
     from rag.observability import flush as flush_langfuse

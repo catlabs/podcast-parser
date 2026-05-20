@@ -31,6 +31,7 @@ from rag.config import (
     AZURE_OPENAI_API_VERSION,
     AZURE_OPENAI_DEPLOYMENT,
     AZURE_OPENAI_ENDPOINT,
+    ENABLE_LLM_STREAMING,
 )
 
 log = logging.getLogger(__name__)
@@ -153,6 +154,13 @@ class AzureOpenAIChatProvider:
         return response.choices[0].message.content or ""
 
     def generate_stream(self, system: str, user: str) -> Iterator[str]:
+        # When streaming is disabled, route through the non-streaming path
+        # so the Azure response carries usage data and Langfuse/OTel can
+        # capture token counts. The generator API stays intact for callers.
+        if not ENABLE_LLM_STREAMING:
+            yield self.generate(system, user)
+            return
+
         from openai import BadRequestError
         client   = self._ensure_client()
         messages = [

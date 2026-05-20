@@ -80,6 +80,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
 
+# Toggle streaming for LLM chat completions. Default: enabled (normal UX).
+# Set ENABLE_LLM_STREAMING=false to force non-streaming completions on every
+# chat-stream call site. The streaming-API entrypoint still works (the
+# generator yields the full response as a single chunk) but the upstream
+# SDK call uses chat.completions.create(stream=False), whose response
+# always carries usage data — making Langfuse / OpenTelemetry capture
+# token counts and generation metadata reliably for debugging.
+ENABLE_LLM_STREAMING = os.environ.get(
+    "ENABLE_LLM_STREAMING", "true",
+).strip().lower() not in ("0", "false", "no")
+
 # Azure OpenAI — optional, opt-in. The azure-openai LLM entry is added to the
 # registry only when AZURE_OPENAI_ENDPOINT is set, so users who never deploy
 # Azure don't see a non-functional option in the UI dropdown.
