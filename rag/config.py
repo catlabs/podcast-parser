@@ -11,7 +11,17 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()   # reads .env if present; no-op if not
+# Precedence (highest wins):
+#   1. shell environment variables (already set when this module imports)
+#   2. .env                 — secrets and per-developer overrides; gitignored
+#   3. .env.agent-safe      — non-sensitive project defaults; committed
+#
+# load_dotenv defaults to override=False, so values already in the env are
+# never replaced. Loading .env first means it wins over .env.agent-safe;
+# both lose to anything the shell already set.
+_REPO_ROOT = Path(__file__).parent.parent
+load_dotenv(_REPO_ROOT / ".env")
+load_dotenv(_REPO_ROOT / ".env.agent-safe")
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 # Defaults match the original layout. Each path can be overridden by an env

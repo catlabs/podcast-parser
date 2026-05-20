@@ -10,7 +10,7 @@ other AI helper. None of these files contain secrets.
 | Class | Examples | Agent may read? | Committed? |
 |---|---|---|---|
 | **secret** | `.env`, `*.pem`, `*.key`, anything under `~/.aws/`, customer audio | **no** | no |
-| **agent-safe env** | `.env.agent-safe` | yes | yes |
+| **agent-safe env** | `.env.agent-safe` — loaded by the app as non-sensitive defaults; precedence is shell > `.env` > `.env.agent-safe` | yes | yes |
 | **project knowledge** | `CLAUDE.md`, `README.md`, `MIGRATION.md`, source code | yes | yes |
 | **shared context** | this directory (`.ai/`) | yes (read; write rules below) | yes |
 | **per-developer scratch** | `.ai/memory/personal/**` | only the developer's own agent | gitignored |
