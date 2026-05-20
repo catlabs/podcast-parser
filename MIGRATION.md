@@ -447,6 +447,106 @@ the LLM selector show Azure entries without a code release.
 
 ---
 
+## Step 7 — Langfuse observability (Step 1: baseline)
+
+Opt-in tracing. No behaviour change when Langfuse env vars are unset; local
+mode runs exactly as before. Step 1 is scoped to the chat path and the
+Azure-OpenAI-SDK-backed embedding path — Anthropic, OpenAI (GPT-4o,
+GPT-4o-mini), Azure chat, and Azure embeddings.
+
+### What ships in Step 1
+
+- **`rag/observability.py` (new)** — Single bootstrap module.
+  `get_langfuse()` returns the configured client when keys are present,
+  else `None`. Registers an atexit flush so CLI scripts don't lose
+  traces. Eagerly initialises on import so the `langfuse.openai` patch
+  is in place before any client is constructed.
+- **`rag/llm.py`** — Replaces `import openai` with
+  `from langfuse.openai import openai`. Adds manual
+  `start_as_current_observation(as_type="generation")` wrappers around
+  both `_anthropic` and `_anthropic_stream`, with explicit
+  `input` / `output` and `usage_details` (input/output tokens from
+  Anthropic's response.usage).
+- **`rag/azure_openai.py`** — Both `AzureOpenAI` client constructors
+  switched to `from langfuse.openai import AzureOpenAI`. Covers
+  `AzureOpenAIChatProvider` (chat) and `AzureOpenAIEmbeddingProvider`
+  (embeddings via the same SDK).
+- **`rag/api.py`** — FastAPI lifespan calls `flush_langfuse()` on
+  shutdown so traces aren't dropped when uvicorn stops.
+- **`requirements.txt`** — adds `langfuse`.
+- **`.env.example`** / **`.env.agent-safe`** — documents keys (secrets
+  in `.env`, host + on/off in `.env.agent-safe`).
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `LANGFUSE_PUBLIC_KEY` | — | Secret — enables tracing when set with the secret key. |
+| `LANGFUSE_SECRET_KEY` | — | Secret. |
+| `LANGFUSE_HOST` | `https://cloud.langfuse.com` | EU cloud default. US is `us.cloud.langfuse.com`. Can be a self-hosted URL. |
+| `LANGFUSE_ENABLED` | `true` | Set to `false` to disable without removing keys. |
+
+### What gets traced (Step 1)
+
+| Path | Mechanism | Notes |
+|---|---|---|
+| OpenAI chat (`gpt-4o`, `gpt-4o-mini`) | OpenAI drop-in | Model name + token usage captured automatically. Streaming supported. |
+| Azure chat (any deployment) | OpenAI drop-in (`AzureOpenAI` class is part of the same SDK) | Same automatic capture. |
+| Azure embeddings | OpenAI drop-in | Each `client.embeddings.create(...)` becomes a generation observation. |
+| Anthropic chat (`claude-sonnet-4-5`, `claude-haiku-4-5`) | Manual `start_as_current_observation` | Both sync and stream paths instrumented; final usage is read from `stream.get_final_message()`. |
+
+### What does NOT get traced in Step 1
+
+- **Ollama** — local, free; observability is lower priority. Future
+  step if needed.
+- **Local sentence-transformer embeddings** — `LocalEmbeddingProvider`
+  runs on CPU; no upstream API. Skipped.
+- **Research-mode span hierarchy** — Step 2. The 5-agent pipeline
+  (planner / search / analyst / synthesizer / grounder) deserves
+  nested spans under a single `chat-research` trace, but that's its
+  own change.
+- **Context tags** (session_id, user_id, feature) — Step 3.
+
+### Activating in a session
+
+```bash
+# In .env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# LANGFUSE_HOST=https://cloud.langfuse.com    # EU default
+```
+
+Restart the backend. Open any chat in the UI, then check the Traces tab
+in the Langfuse UI. You should see one observation per call, with model
+name, prompt, completion, and token counts.
+
+### Failure modes & safety
+
+- **Langfuse SDK unreachable**: `get_langfuse()` catches the import
+  error and returns `None`; the app keeps running unobserved.
+- **Wrong/expired keys**: the SDK silently buffers and retries;
+  uvicorn shutdown's `flush()` won't block forever (langfuse uses a
+  short timeout).
+- **Secrets in traces**: explicit `input` / `output` is passed for
+  Anthropic; the OpenAI drop-in captures the full `messages` array
+  by default. If you handle PII or user emails, decide on a mask
+  callback before pointing this at Langfuse Cloud.
+
+### Smoke test
+
+```bash
+# Without keys — local mode unchanged
+.venv/bin/python -c "from rag.observability import is_enabled; print('enabled:', is_enabled())"
+# expect: enabled: False
+
+# With keys
+LANGFUSE_PUBLIC_KEY=pk-lf-x LANGFUSE_SECRET_KEY=sk-lf-y \
+  .venv/bin/python -c "from rag.observability import get_langfuse; print(get_langfuse())"
+# expect: <Langfuse object at 0x...>
+```
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.

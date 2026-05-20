@@ -17,7 +17,13 @@ import urllib.error
 import urllib.request
 
 import anthropic
-import openai as _openai_sdk
+
+# `rag.observability` triggers load_dotenv + Langfuse bootstrap. Importing it
+# BEFORE `langfuse.openai` guarantees env vars are loaded when the SDK patch
+# is initialised. The patched openai module behaves identically to vanilla
+# openai when Langfuse is not configured, so this is safe in local-only mode.
+from rag.observability import get_langfuse  # noqa: F401 (side-effect import)
+from langfuse.openai import openai as _openai_sdk
 
 from rag.config import (
     ANTHROPIC_API_KEY,
@@ -60,28 +66,84 @@ def generate_stream(system: str, user: str, llm_key: str | None = None):
 def _anthropic(system: str, user: str, model: str) -> str:
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
-    client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    response = client.messages.create(
-        model      = model,
-        max_tokens = 1024,
-        system     = system,
-        messages   = [{"role": "user", "content": user}],
-    )
-    return response.content[0].text
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    lf = get_langfuse()
+    if lf is None:
+        response = client.messages.create(
+            model      = model,
+            max_tokens = 1024,
+            system     = system,
+            messages   = [{"role": "user", "content": user}],
+        )
+        return response.content[0].text
+
+    # Explicit input/output (not all-args) per Langfuse best practice —
+    # avoids accidentally tracing config or kwargs.
+    with lf.start_as_current_observation(
+        as_type = "generation",
+        name    = "anthropic-chat",
+        model   = model,
+        input   = {"system": system, "user": user},
+    ) as gen:
+        response = client.messages.create(
+            model      = model,
+            max_tokens = 1024,
+            system     = system,
+            messages   = [{"role": "user", "content": user}],
+        )
+        text = response.content[0].text
+        gen.update(
+            output        = text,
+            usage_details = {
+                "input":  response.usage.input_tokens,
+                "output": response.usage.output_tokens,
+            },
+        )
+        return text
 
 
 def _anthropic_stream(system: str, user: str, model: str):
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    with client.messages.stream(
-        model      = model,
-        max_tokens = 1024,
-        system     = system,
-        messages   = [{"role": "user", "content": user}],
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
+
+    lf = get_langfuse()
+    if lf is None:
+        with client.messages.stream(
+            model      = model,
+            max_tokens = 1024,
+            system     = system,
+            messages   = [{"role": "user", "content": user}],
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+        return
+
+    with lf.start_as_current_observation(
+        as_type = "generation",
+        name    = "anthropic-chat-stream",
+        model   = model,
+        input   = {"system": system, "user": user},
+    ) as gen:
+        parts: list[str] = []
+        with client.messages.stream(
+            model      = model,
+            max_tokens = 1024,
+            system     = system,
+            messages   = [{"role": "user", "content": user}],
+        ) as stream:
+            for text in stream.text_stream:
+                parts.append(text)
+                yield text
+            final = stream.get_final_message()
+        gen.update(
+            output        = "".join(parts),
+            usage_details = {
+                "input":  final.usage.input_tokens,
+                "output": final.usage.output_tokens,
+            },
+        )
 
 
 # ── OpenAI ───────────────────────────────────────────────────────────────────

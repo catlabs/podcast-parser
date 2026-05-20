@@ -65,11 +65,15 @@ async def lifespan(app: FastAPI):
     """
     Runs once when the server starts.
     Creates the SQLite table if it doesn't exist yet — safe to call every time.
+    Flushes Langfuse pending traces on shutdown.
     """
     conn = get_connection()
     init_db(conn)
     conn.close()
     yield   # server runs here
+    # Shutdown — drain any buffered traces before the process exits.
+    from rag.observability import flush as flush_langfuse
+    flush_langfuse()
 
 
 app = FastAPI(title="Podcast RAG", lifespan=lifespan)

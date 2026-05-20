@@ -23,3 +23,8 @@ openai
 
 # ── Research orchestration ───────────────────────────────────────────────────
 langgraph
+
+# ── Observability ────────────────────────────────────────────────────────────
+# Opt-in: tracing is no-op unless LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
+# are set in .env. See MIGRATION.md Step 10 and .ai/README.md for details.
+langfuse

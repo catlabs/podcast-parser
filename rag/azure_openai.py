@@ -78,6 +78,10 @@ def _azure_client():
 
     Shared by the chat and embedding providers — they hit the same Azure
     resource, only differing in the deployment name passed at call time.
+
+    Imports the AzureOpenAI class from `langfuse.openai` so every chat and
+    embedding call is traced when Langfuse is configured. When Langfuse is
+    not configured, this class behaves exactly like the vanilla SDK class.
     """
     missing = [
         name for name, value in (
@@ -90,7 +94,8 @@ def _azure_client():
             f"Azure OpenAI is not fully configured. Missing: {', '.join(missing)}. "
             "Add the values to .env."
         )
-    from openai import AzureOpenAI
+    from rag.observability import get_langfuse  # noqa: F401 (bootstrap)
+    from langfuse.openai import AzureOpenAI
     return AzureOpenAI(
         api_key        = AZURE_OPENAI_API_KEY,
         api_version    = AZURE_OPENAI_API_VERSION,
@@ -120,7 +125,8 @@ class AzureOpenAIChatProvider:
                 f"Azure OpenAI is not fully configured. Missing: {', '.join(missing)}. "
                 "Add the values to .env."
             )
-        from openai import AzureOpenAI
+        from rag.observability import get_langfuse  # noqa: F401 (bootstrap)
+        from langfuse.openai import AzureOpenAI
         self._client = AzureOpenAI(
             api_key        = AZURE_OPENAI_API_KEY,
             api_version    = AZURE_OPENAI_API_VERSION,

@@ -52,6 +52,7 @@ rag/
   yt.py                  YouTube download via yt-dlp + ingest pipeline
   backfill.py            re-embed existing chunks into any non-baseline collection (--target)
   eval.py                minimal retrieval eval over a fixed query set (no LLM calls)
+  observability.py       Langfuse bootstrap (opt-in tracing for chat + Azure embeddings)
   api.py                 FastAPI: all HTTP endpoints + SSE streaming
 ui/
   src/
@@ -206,6 +207,22 @@ UI_DEFAULT_EMBED_KEY=multilingual
 UI_DEFAULT_LLM_KEY=azure-openai
 ```
 
+#### Langfuse observability (optional, opt-in)
+
+Tracing is off until both keys below are set. When configured, every chat call through the OpenAI SDK (GPT-4o, GPT-4o-mini, Azure chat) and every embedding call via the Azure OpenAI SDK is captured automatically. Anthropic chat (sync + stream) is wrapped manually with explicit input/output and token usage.
+
+```env
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+# LANGFUSE_HOST=https://cloud.langfuse.com         # EU cloud (default)
+# LANGFUSE_HOST=https://us.cloud.langfuse.com      # US cloud alternative
+# LANGFUSE_ENABLED=true                            # set to false to disable without removing keys
+```
+
+Restart the backend after setting the keys; open any chat from the UI and the trace appears in the Langfuse Traces tab. Local sentence-transformer embeddings and Ollama are not traced in this step — they are local-only and free.
+
+Not traced today and explicitly deferred: research-mode span hierarchy (planner → search → analyst → synthesizer → grounder as nested spans), context tags (`session_id`, `user_id`, `feature`), and a `mask=` callback for PII scrubbing. The bootstrap module (`rag/observability.py`) is the single hook point when those land.
+
 ### Frontend
 
 ```bash
@@ -340,3 +357,4 @@ rag/data/
 - **Azure 400 Bad Request** — usually a model/parameter mismatch (e.g. GPT-5 deployments reject `max_tokens` and require `max_completion_tokens`, or the deployment name doesn't match the endpoint segment). The full Azure error body is logged at `ERROR` level under `rag.azure_openai` — check the uvicorn console.
 - **Ollama not reachable** — ensure `ollama serve` is running and `OLLAMA_BASE_URL` points to it; run `ollama pull <model>` if the model isn't installed.
 - **SQLite threading errors** — always create connections inside the thread that uses them; never pass a connection across threads.
+- **Langfuse traces missing** — confirm both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set (the bootstrap requires both), confirm `LANGFUSE_ENABLED` is not `false`, and check `LANGFUSE_HOST` matches your project's region (EU vs US vs self-hosted). The lifespan flush on uvicorn shutdown is what drains the last buffered traces — if you `kill -9` uvicorn, those traces are lost. For CLI scripts, the `atexit` flush in `rag/observability.py` covers normal exits.

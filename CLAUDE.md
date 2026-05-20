@@ -52,11 +52,15 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 6a | done | consumer rewire — EmbeddingProvider (search / ingest / backfill) |
 | 6b | done | Azure OpenAI Embeddings (opt-in via `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`) |
 | 6c | done | UI surfacing — `/config.embed_options` drives the embed dropdown |
-| 7 | next | Azure Blob Storage |
-| 8 | — | Azure AI Search |
-| 9 | — | Azure Speech |
-| 10 | — | async ingestion jobs |
-| 11 | — | deployment |
+| 6d | done | Backfill safety rails (`--dry-run`, `--limit`, `--yes`, fail-fast) |
+| 7 (step 1) | done | Langfuse observability — chat path + Azure embeddings; opt-in |
+| 7 (step 2) | next | Langfuse — research-mode span hierarchy |
+| 7 (step 3) | — | Langfuse — context tags (session_id, user_id, feature) |
+| 8 | — | Azure Blob Storage |
+| 9 | — | Azure AI Search |
+| 10 | — | Azure Speech |
+| 11 | — | async ingestion jobs |
+| 12 | — | deployment |
 
 ## Key files
 

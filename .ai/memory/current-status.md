@@ -74,3 +74,9 @@ rewrite history.
 
 <!-- Append entries below as new milestones complete. Format:
      `YYYY-MM-DD — short summary (link to commit / PR if useful)` -->
+
+2026-05-20 — Langfuse step 1 wired (opt-in). `rag/observability.py` bootstrap,
+OpenAI/AzureOpenAI drop-in covers GPT/Azure chat + Azure embeddings, Anthropic
+chat instrumented manually (sync + stream). Local-only mode unchanged when
+keys are unset. Ollama, sentence-transformers, and research-mode span tree
+deliberately deferred to step 2.
