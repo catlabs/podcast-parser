@@ -1,0 +1,28 @@
+# Cursor index / AI context exclusions.
+# Files matched here are not embedded by Cursor's indexer and not sent
+# to its model context by default. Mirror this list in any other tool
+# that respects an ignore convention (.aiexclude, etc.).
+
+# Secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Local runtime data — not useful as context, and may contain
+# transcribed personal/customer content
+output/
+rag/data/
+
+# Caches and build artifacts
+.venv/
+node_modules/
+dist/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Per-developer agent scratchpad
+.ai/memory/personal/

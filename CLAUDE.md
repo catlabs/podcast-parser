@@ -27,6 +27,7 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
 - **Never commit automatically.** Wait for an explicit instruction ("commit" / "commit the changes").
 - Always provide a smoke-test command after any change.
 - Use `.venv/bin/python` and `.venv/bin/pip` directly — never `source .venv/bin/activate`.
+- **Respect agent boundaries.** Read `.ai/README.md` for file classifications. Default to `.env.agent-safe` for env knobs; do not read `.env` unless the user explicitly asks. Update `.ai/memory/current-status.md` (append-only) when a multi-session milestone completes.
 
 ## Standard smoke tests
 
