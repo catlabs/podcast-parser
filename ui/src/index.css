@@ -658,6 +658,91 @@ button:not(.nav-item):not(.mode-chip):not(.link-btn):not(.send-btn):not(.new-cha
   color: var(--text);
 }
 
+/* Markdown-rendered answers. Parser emits real <p>/<ul>/<h*> nodes, so we
+   leave whitespace handling to the elements themselves and only style the
+   children. Keeps font-size + color consistent with .answer-block. */
+.answer-md {
+  font-size: 0.9rem;
+  line-height: 1.7;
+  color: var(--text);
+}
+.answer-md > *:first-child { margin-top: 0; }
+.answer-md > *:last-child  { margin-bottom: 0; }
+
+.answer-md p {
+  margin: 0.5rem 0;
+}
+.answer-md h1,
+.answer-md h2,
+.answer-md h3,
+.answer-md h4 {
+  margin: 1rem 0 0.4rem;
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--text);
+}
+.answer-md h1 { font-size: 1.1rem; }
+.answer-md h2 { font-size: 1.05rem; }
+.answer-md h3 { font-size: 1rem; }
+.answer-md h4 { font-size: 0.95rem; }
+.answer-md hr {
+  margin: 1rem 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.answer-md ul,
+.answer-md ol {
+  padding-left: 1.4rem;
+  margin: 0.5rem 0;
+}
+.answer-md li {
+  margin: 0.2rem 0;
+}
+.answer-md blockquote {
+  margin: 0.6rem 0;
+  padding: 0.2rem 0.8rem;
+  border-left: 3px solid var(--border);
+  color: var(--muted, var(--text));
+}
+.answer-md strong { font-weight: 600; }
+.answer-md em     { font-style: italic; }
+.answer-md code {
+  background: var(--code-bg, rgba(127,127,127,0.12));
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.85em;
+}
+.answer-md pre {
+  background: var(--code-bg, rgba(127,127,127,0.12));
+  padding: 0.6rem 0.8rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0.6rem 0;
+}
+.answer-md pre code {
+  background: transparent;
+  padding: 0;
+}
+.answer-md a {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.answer-md table {
+  border-collapse: collapse;
+  margin: 0.6rem 0;
+}
+.answer-md th,
+.answer-md td {
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.6rem;
+  text-align: left;
+}
+
+/* Wrapper used while the answer is still streaming — keeps the blinking
+   cursor as a sibling of the markdown root so it appears after the last
+   rendered block. */
+.answer-streaming { position: relative; }
+
 .streaming-cursor {
   display: inline-block;
   width: 2px;

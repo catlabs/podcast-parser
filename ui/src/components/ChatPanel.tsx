@@ -17,6 +17,7 @@ import {
   type LLMOption,
   type ResearchResult,
 } from "../api";
+import { MarkdownAnswer } from "./MarkdownAnswer";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -105,7 +106,8 @@ function ResultPanel({ label, result }: { label?: string; result: ModelResult | 
     <div className="result-panel">
       {label && <div className="result-panel-label">{label}</div>}
 
-      <div className="answer-block">{result.answer}</div>
+      <MarkdownAnswer text={result.answer} />
+
 
       {result.sources.length > 0 && (
         <div className="result-sources">
@@ -360,8 +362,9 @@ function ChatTurn({ turn }: { turn: Turn }) {
         {turn.error && <p className="error">{turn.error}</p>}
 
         {isStreaming && (
-          <div className="answer-block">
-            {turn.streamingAnswer}<span className="streaming-cursor" />
+          <div className="answer-streaming">
+            <MarkdownAnswer text={turn.streamingAnswer ?? ""} />
+            <span className="streaming-cursor" />
           </div>
         )}
 
