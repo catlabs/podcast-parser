@@ -22,6 +22,7 @@ Public API:
                   → sync generator of SSE-compatible events
 """
 
+import contextvars
 import json
 import logging
 import operator
@@ -32,6 +33,7 @@ from typing import Annotated, Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
+from rag.observability import should_log_full_prompts, span
 from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text
@@ -221,11 +223,18 @@ def planner_node(state: ResearchState) -> dict:
     """Decompose the user query into sub-queries for multi-angle search."""
     events = [_agent_start("planner"), _ev("planner", "plan", "running", tool="generate")]
 
-    episode_list = list_episodes_text()
-    prompt = PLAN_SYSTEM.format(episode_list=episode_list)
-    raw = get_chat_provider(state["llm_key"]).generate(prompt, state["query"])
-    plan = _parse_json(raw)
-    sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [state["query"]]
+    with span(
+        "research-plan",
+        input    = {"query": state["query"]},
+        metadata = {"llm_key": state["llm_key"]},
+    ) as s:
+        episode_list = list_episodes_text()
+        prompt = PLAN_SYSTEM.format(episode_list=episode_list)
+        raw = get_chat_provider(state["llm_key"]).generate(prompt, state["query"])
+        plan = _parse_json(raw)
+        sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [state["query"]]
+        s.update(output={"n_sub_queries": len(sub_queries),
+                         "sub_queries":   sub_queries})
 
     events.append(_ev("planner", "plan", "done", f"{len(sub_queries)} sub-queries", tool="generate"))
     events.append({"type": "plan", "sub_queries": sub_queries})
@@ -243,24 +252,41 @@ def search_node(state: ResearchState) -> dict:
         _ev("search", "search", "running", f"{len(sub_queries)} sub-queries", tool="semantic_search"),
     ]
 
-    all_chunks: list[dict] = []
-    with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
-        futures = {
-            pool.submit(semantic_search, sq, top_k=CHUNKS_PER_QUERY, model_key=model_key): sq
-            for sq in sub_queries
-        }
-        for f in as_completed(futures):
-            all_chunks.extend(f.result())
+    with span(
+        "research-search",
+        input    = {"sub_queries": sub_queries, "top_k": CHUNKS_PER_QUERY},
+        metadata = {"model_key": model_key, "n_sub_queries": len(sub_queries)},
+    ) as s:
+        all_chunks: list[dict] = []
+        # Snapshot the active context (which has research-search as current span)
+        # so retrieval spans opened in worker threads nest under it. Each future
+        # gets its own copy to avoid races on shared Tokens.
+        with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
+            futures = {
+                pool.submit(
+                    contextvars.copy_context().run,
+                    semantic_search, sq,
+                    CHUNKS_PER_QUERY, model_key,
+                ): sq
+                for sq in sub_queries
+            }
+            for f in as_completed(futures):
+                all_chunks.extend(f.result())
 
-    chunks = _dedupe_chunks(all_chunks)
-    episodes_by_title = _group_by_episode(chunks)
+        chunks = _dedupe_chunks(all_chunks)
+        episodes_by_title = _group_by_episode(chunks)
 
-    # Rank episodes by best chunk distance, keep top N
-    scores = {t: min(c["distance"] for c in cs) for t, cs in episodes_by_title.items()}
-    top = sorted(scores, key=scores.get)[:MAX_EPISODES]
-    episodes_by_title = {t: episodes_by_title[t] for t in top}
+        # Rank episodes by best chunk distance, keep top N
+        scores = {t: min(c["distance"] for c in cs) for t, cs in episodes_by_title.items()}
+        top = sorted(scores, key=scores.get)[:MAX_EPISODES]
+        episodes_by_title = {t: episodes_by_title[t] for t in top}
 
-    total = sum(len(cs) for cs in episodes_by_title.values())
+        total = sum(len(cs) for cs in episodes_by_title.values())
+        s.update(output={
+            "episodes_found": len(episodes_by_title),
+            "total_chunks":   total,
+        })
+
     events.append(_ev("search", "search", "done", f"{total} chunks from {len(episodes_by_title)} episodes", tool="semantic_search"))
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})
     events.append(_agent_end("search"))
@@ -283,15 +309,22 @@ def analyst_node(state: ResearchState) -> dict:
 
     chat = get_chat_provider(llm_key)
     analyses: list[dict] = []
-    for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
-        events.append(_ev("analyst", "analyze", "running", f"{i + 1}/{n} episodes", tool="generate"))
-        context = format_context(ep_chunks)
-        notes = chat.generate(
-            ANALYZE_SYSTEM,
-            f'Question de recherche : {query}\n\nÉpisode : "{title}"\n\nExtraits :\n{context}',
-        )
-        analyses.append({"episode": title, "notes": notes})
-        events.append({"type": "episode_analysis", "episode": title, "notes": notes})
+    with span(
+        "research-analyze",
+        input    = {"query": query, "n_episodes": n},
+        metadata = {"llm_key": llm_key,
+                    "episode_titles": list(episodes_by_title.keys())},
+    ) as s:
+        for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
+            events.append(_ev("analyst", "analyze", "running", f"{i + 1}/{n} episodes", tool="generate"))
+            context = format_context(ep_chunks)
+            notes = chat.generate(
+                ANALYZE_SYSTEM,
+                f'Question de recherche : {query}\n\nÉpisode : "{title}"\n\nExtraits :\n{context}',
+            )
+            analyses.append({"episode": title, "notes": notes})
+            events.append({"type": "episode_analysis", "episode": title, "notes": notes})
+        s.update(output={"n_analyses": len(analyses)})
 
     events.append(_ev("analyst", "analyze", "done", f"{len(analyses)} episodes analyzed", tool="generate"))
     events.append(_agent_end("analyst"))
@@ -314,14 +347,27 @@ def synthesizer_node(state: ResearchState) -> dict:
     )
     user_msg = f"Question de recherche : {state['query']}\n\nAnalyses par épisode :\n\n{analyses_block}"
 
+    span_input: dict = {
+        "n_analyses": len(state["episode_analyses"]),
+        "query":      state["query"],
+    }
+    if should_log_full_prompts():
+        span_input["prompt"] = user_msg
+
     token_q: queue.Queue | None = state.get("_token_queue")
     tokens: list[str] = []
-    for tok in get_chat_provider(llm_key).generate_stream(SYNTHESIZE_SYSTEM, user_msg):
-        tokens.append(tok)
-        if token_q is not None:
-            token_q.put({"type": "token", "text": tok})
+    with span(
+        "research-synthesize",
+        input    = span_input,
+        metadata = {"llm_key": llm_key, "stream": True},
+    ) as s:
+        for tok in get_chat_provider(llm_key).generate_stream(SYNTHESIZE_SYSTEM, user_msg):
+            tokens.append(tok)
+            if token_q is not None:
+                token_q.put({"type": "token", "text": tok})
 
-    answer = "".join(tokens)
+        answer = "".join(tokens)
+        s.update(output={"answer_length": len(answer)})
 
     events.append(_ev("synthesizer", "synthesize", "done", llm_label, tool="generate_stream"))
     events.append(_agent_end("synthesizer"))
@@ -338,12 +384,23 @@ def critic_node(state: ResearchState) -> dict:
         f"---\n\nExtraits source :\n{source_context}"
     )
 
-    try:
-        raw = get_chat_provider(state["llm_key"]).generate(GROUND_SYSTEM, user_msg)
-        grounding = _parse_json(raw)
-    except Exception as exc:
-        log.warning("grounding check failed: %s", exc)
-        grounding = {"verdict": "unknown", "flags": [f"Grounding check failed: {exc}"]}
+    with span(
+        "research-ground",
+        input    = {"n_chunks_inspected": min(len(state["chunks"]), 20),
+                    "answer_length":      len(state["answer"])},
+        metadata = {"llm_key": state["llm_key"]},
+    ) as s:
+        try:
+            raw = get_chat_provider(state["llm_key"]).generate(GROUND_SYSTEM, user_msg)
+            grounding = _parse_json(raw)
+        except Exception as exc:
+            log.warning("grounding check failed: %s", exc)
+            grounding = {"verdict": "unknown", "flags": [f"Grounding check failed: {exc}"]}
+        s.update(output={
+            "verdict": grounding.get("verdict", "unknown"),
+            "n_flags": len(grounding.get("flags", []) or []),
+            "flags":   grounding.get("flags", []),
+        })
 
     events.append(_ev("critic", "ground", "done", grounding.get("verdict", "unknown"), tool="generate"))
     events.append({"type": "grounding", **grounding})
@@ -428,21 +485,35 @@ def research_graph_stream(
     events_yielded = 0
     final_state: dict | None = None
 
-    for state_snapshot in _graph.stream(initial_state, stream_mode="values"):
-        final_state = state_snapshot
-        all_events = state_snapshot.get("events", [])
-        # Yield only the new events since last snapshot
-        for ev in all_events[events_yielded:]:
-            yield ev
-        events_yielded = len(all_events)
+    with span(
+        "research-request",
+        input    = {"query": query, "top_k": top_k},
+        metadata = {"model_key": model_key, "llm_key": resolved_key,
+                    "mode":      "research-graph", "stream": True},
+    ) as req:
+        for state_snapshot in _graph.stream(initial_state, stream_mode="values"):
+            final_state = state_snapshot
+            all_events = state_snapshot.get("events", [])
+            # Yield only the new events since last snapshot
+            for ev in all_events[events_yielded:]:
+                yield ev
+            events_yielded = len(all_events)
 
-    # Signal token stream done
-    if token_queue is not None:
-        token_queue.put(None)
+        # Signal token stream done
+        if token_queue is not None:
+            token_queue.put(None)
 
-    if final_state is None:
-        yield {"type": "error", "detail": "Graph produced no output"}
-        return
+        if final_state is None:
+            req.update(output={"error": "Graph produced no output"})
+            yield {"type": "error", "detail": "Graph produced no output"}
+            return
+
+        req.update(output={
+            "n_sub_queries": len(final_state.get("sub_queries", [])),
+            "n_episodes":    len(final_state.get("episodes_by_title", {}) or {}),
+            "answer_length": len(final_state.get("answer", "") or ""),
+            "verdict":       (final_state.get("grounding") or {}).get("verdict"),
+        })
 
     # Orchestrator end
     yield {"type": "agent_end", "agent": "orchestrator"}

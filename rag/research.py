@@ -19,11 +19,13 @@ Event types yielded:
   error                     — unrecoverable failure
 """
 
+import contextvars
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
+from rag.observability import should_log_full_prompts, span
 from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text
@@ -205,169 +207,274 @@ def research_stream(
       result                 — final composite result
       error                  — unrecoverable failure
     """
-    llm_label = LLM_REGISTRY.get(
-        llm_key or DEFAULT_LLM_KEY, LLM_REGISTRY[DEFAULT_LLM_KEY]
-    ).label
+    resolved_llm = llm_key or DEFAULT_LLM_KEY
+    llm_label = LLM_REGISTRY.get(resolved_llm, LLM_REGISTRY[DEFAULT_LLM_KEY]).label
     chat = get_chat_provider(llm_key)
 
     yield _agent_start("orchestrator")
 
-    # ── Step 1: Plan ─────────────────────────────────────────────────────────
-    yield _agent_start("planner")
-    yield _step("plan", "running", agent="planner", tool="generate")
-    try:
-        episode_list = list_episodes_text()
-        plan_prompt = PLAN_SYSTEM.format(episode_list=episode_list)
-        raw_plan = chat.generate(plan_prompt, query)
-        plan = _parse_json(raw_plan)
-        sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES]
-        if not sub_queries:
-            sub_queries = [query]
-    except Exception as exc:
-        log.exception("plan failed")
-        yield _step("plan", "error", str(exc), agent="planner", tool="generate")
+    with span(
+        "research-request",
+        input    = {"query": query, "top_k": top_k},
+        metadata = {"model_key": model_key, "llm_key": resolved_llm,
+                    "mode":      "research", "stream": True},
+    ) as req:
+        # ── Step 1: Plan ─────────────────────────────────────────────────────
+        yield _agent_start("planner")
+        with span(
+            "research-plan",
+            input    = {"query": query},
+            metadata = {"llm_key": resolved_llm},
+        ) as plan_span:
+            yield _step("plan", "running", agent="planner", tool="generate")
+            try:
+                episode_list = list_episodes_text()
+                plan_prompt  = PLAN_SYSTEM.format(episode_list=episode_list)
+                raw_plan     = chat.generate(plan_prompt, query)
+                plan         = _parse_json(raw_plan)
+                sub_queries  = plan.get("sub_queries", [])[:MAX_SUB_QUERIES]
+                if not sub_queries:
+                    sub_queries = [query]
+            except Exception as exc:
+                plan_span.update(output={"error": str(exc)[:200]})
+                log.exception("plan failed")
+                yield _step("plan", "error", str(exc), agent="planner", tool="generate")
+                yield _agent_end("planner")
+                yield _agent_end("orchestrator")
+                yield {"type": "error", "detail": f"Planning failed: {exc}"}
+                return
+            plan_span.update(output={"n_sub_queries": len(sub_queries),
+                                     "sub_queries":   sub_queries})
+
+        yield _step("plan", "done", f"{len(sub_queries)} sub-queries", agent="planner", tool="generate")
+        yield {"type": "plan", "sub_queries": sub_queries}
         yield _agent_end("planner")
-        yield _agent_end("orchestrator")
-        yield {"type": "error", "detail": f"Planning failed: {exc}"}
-        return
 
-    yield _step("plan", "done", f"{len(sub_queries)} sub-queries", agent="planner", tool="generate")
-    yield {"type": "plan", "sub_queries": sub_queries}
-    yield _agent_end("planner")
+        # ── Step 2: Multi-search ─────────────────────────────────────────────
+        yield _agent_start("search")
+        with span(
+            "research-search",
+            input    = {"sub_queries": sub_queries, "top_k": CHUNKS_PER_QUERY},
+            metadata = {"model_key": model_key, "n_sub_queries": len(sub_queries)},
+        ) as search_span:
+            yield _step("search", "running", f"{len(sub_queries)} sub-queries",
+                        agent="search", tool="semantic_search")
+            try:
+                all_chunks: list[dict] = []
+                # Each future runs in its own copy of the current context so the
+                # `retrieval` span opened inside semantic_search nests under
+                # research-search (instead of becoming an orphan root span) and
+                # so concurrent Token sets/resets don't race on a shared ctx.
+                with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
+                    futures = {
+                        pool.submit(
+                            contextvars.copy_context().run,
+                            semantic_search, sq,
+                            CHUNKS_PER_QUERY, model_key,
+                        ): sq
+                        for sq in sub_queries
+                    }
+                    for future in as_completed(futures):
+                        all_chunks.extend(future.result())
 
-    # ── Step 2: Multi-search ─────────────────────────────────────────────────
-    yield _agent_start("search")
-    yield _step("search", "running", f"{len(sub_queries)} sub-queries", agent="search", tool="semantic_search")
-    try:
-        all_chunks: list[dict] = []
-        with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
-            futures = {
-                pool.submit(semantic_search, sq, top_k=CHUNKS_PER_QUERY, model_key=model_key): sq
-                for sq in sub_queries
-            }
-            for future in as_completed(futures):
-                all_chunks.extend(future.result())
+                chunks = _dedupe_chunks(all_chunks)
+                episodes_by_title = _group_by_episode(chunks)
 
-        chunks = _dedupe_chunks(all_chunks)
-        episodes_by_title = _group_by_episode(chunks)
+                # Keep only the top episodes by best chunk relevance
+                episode_scores = {
+                    title: min(c["distance"] for c in ep_chunks)
+                    for title, ep_chunks in episodes_by_title.items()
+                }
+                top_episodes = sorted(episode_scores, key=episode_scores.get)[:MAX_EPISODES]
+                episodes_by_title = {t: episodes_by_title[t] for t in top_episodes}
 
-        # Keep only the top episodes by best chunk relevance
-        episode_scores = {
-            title: min(c["distance"] for c in ep_chunks)
-            for title, ep_chunks in episodes_by_title.items()
-        }
-        top_episodes = sorted(episode_scores, key=episode_scores.get)[:MAX_EPISODES]
-        episodes_by_title = {t: episodes_by_title[t] for t in top_episodes}
+            except Exception as exc:
+                search_span.update(output={"error": str(exc)[:200]})
+                log.exception("search failed")
+                yield _step("search", "error", str(exc), agent="search", tool="semantic_search")
+                yield _agent_end("search")
+                yield _agent_end("orchestrator")
+                yield {"type": "error", "detail": f"Search failed: {exc}"}
+                return
 
-    except Exception as exc:
-        log.exception("search failed")
-        yield _step("search", "error", str(exc), agent="search", tool="semantic_search")
+            total_chunks = sum(len(c) for c in episodes_by_title.values())
+            search_span.update(output={
+                "episodes_found": len(episodes_by_title),
+                "total_chunks":   total_chunks,
+            })
+
+        yield _step("search", "done",
+                    f"{total_chunks} chunks from {len(episodes_by_title)} episodes",
+                    agent="search", tool="semantic_search")
+        yield {"type": "search_results", "episodes_found": len(episodes_by_title),
+               "total_chunks": total_chunks}
         yield _agent_end("search")
-        yield _agent_end("orchestrator")
-        yield {"type": "error", "detail": f"Search failed: {exc}"}
-        return
 
-    total_chunks = sum(len(c) for c in episodes_by_title.values())
-    yield _step("search", "done", f"{total_chunks} chunks from {len(episodes_by_title)} episodes", agent="search", tool="semantic_search")
-    yield {"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total_chunks}
-    yield _agent_end("search")
+        # ── Early exit: no relevant episodes ─────────────────────────────────
+        if not episodes_by_title:
+            yield _agent_start("synthesizer")
+            no_info = ("Je n'ai pas trouvé d'informations pertinentes sur ce sujet "
+                       "dans les épisodes indexés.")
+            with span(
+                "research-synthesize",
+                input    = {"reason": "no_episodes_found"},
+                metadata = {"llm_key": resolved_llm, "stream": False},
+            ) as synth_span:
+                yield _step("synthesize", "running", llm_label,
+                            agent="synthesizer", tool="generate_stream")
+                yield {"type": "token", "text": no_info}
+                synth_span.update(output={"answer_length": len(no_info)})
+                yield _step("synthesize", "done", llm_label,
+                            agent="synthesizer", tool="generate_stream")
+            yield _agent_end("synthesizer")
 
-    if not episodes_by_title:
-        yield _agent_start("synthesizer")
-        yield _step("synthesize", "running", llm_label, agent="synthesizer", tool="generate_stream")
-        no_info = "Je n'ai pas trouvé d'informations pertinentes sur ce sujet dans les épisodes indexés."
-        yield {"type": "token", "text": no_info}
-        yield _step("synthesize", "done", llm_label, agent="synthesizer", tool="generate_stream")
-        yield _agent_end("synthesizer")
-        yield _agent_end("orchestrator")
-        yield {
-            "type": "result", "answer": no_info,
-            "sources": [], "chunks": [], "model_key": model_key, "intent": "research",
-            "research": {"sub_queries": sub_queries, "episode_analyses": [], "grounding": None},
-        }
-        return
+            req.update(output={
+                "n_sub_queries": len(sub_queries),
+                "n_episodes":    0,
+                "answer_length": len(no_info),
+                "verdict":       None,
+            })
+            yield _agent_end("orchestrator")
+            yield {
+                "type": "result", "answer": no_info,
+                "sources": [], "chunks": [], "model_key": model_key,
+                "intent":  "research",
+                "research": {"sub_queries": sub_queries,
+                             "episode_analyses": [], "grounding": None},
+            }
+            return
 
-    # ── Step 3: Per-episode analysis ─────────────────────────────────────────
-    yield _agent_start("analyst")
-    yield _step("analyze", "running", f"0/{len(episodes_by_title)} episodes", agent="analyst", tool="generate")
-    episode_analyses: list[dict] = []
-    try:
-        for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
-            yield _step("analyze", "running", f"{i + 1}/{len(episodes_by_title)} episodes", agent="analyst", tool="generate")
+        # ── Step 3: Per-episode analysis ─────────────────────────────────────
+        yield _agent_start("analyst")
+        episode_analyses: list[dict] = []
+        with span(
+            "research-analyze",
+            input    = {"query": query, "n_episodes": len(episodes_by_title)},
+            metadata = {"llm_key": resolved_llm,
+                        "episode_titles": list(episodes_by_title.keys())},
+        ) as analyze_span:
+            yield _step("analyze", "running",
+                        f"0/{len(episodes_by_title)} episodes",
+                        agent="analyst", tool="generate")
+            try:
+                for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
+                    yield _step("analyze", "running",
+                                f"{i + 1}/{len(episodes_by_title)} episodes",
+                                agent="analyst", tool="generate")
 
-            context = format_context(ep_chunks)
-            analysis_input = (
-                f'Question de recherche : {query}\n\n'
-                f'Épisode : "{title}"\n\n'
-                f'Extraits :\n{context}'
-            )
-            notes = chat.generate(ANALYZE_SYSTEM, analysis_input)
-            episode_analyses.append({"episode": title, "notes": notes})
-            yield {"type": "episode_analysis", "episode": title, "notes": notes}
+                    context = format_context(ep_chunks)
+                    analysis_input = (
+                        f'Question de recherche : {query}\n\n'
+                        f'Épisode : "{title}"\n\n'
+                        f'Extraits :\n{context}'
+                    )
+                    notes = chat.generate(ANALYZE_SYSTEM, analysis_input)
+                    episode_analyses.append({"episode": title, "notes": notes})
+                    yield {"type": "episode_analysis", "episode": title, "notes": notes}
 
-    except Exception as exc:
-        log.exception("analysis failed")
-        yield _step("analyze", "error", str(exc), agent="analyst", tool="generate")
+            except Exception as exc:
+                analyze_span.update(output={"error": str(exc)[:200]})
+                log.exception("analysis failed")
+                yield _step("analyze", "error", str(exc), agent="analyst", tool="generate")
+                yield _agent_end("analyst")
+                yield _agent_end("orchestrator")
+                yield {"type": "error", "detail": f"Episode analysis failed: {exc}"}
+                return
+
+            analyze_span.update(output={"n_analyses": len(episode_analyses)})
+
+        yield _step("analyze", "done",
+                    f"{len(episode_analyses)} episodes analyzed",
+                    agent="analyst", tool="generate")
         yield _agent_end("analyst")
-        yield _agent_end("orchestrator")
-        yield {"type": "error", "detail": f"Episode analysis failed: {exc}"}
-        return
 
-    yield _step("analyze", "done", f"{len(episode_analyses)} episodes analyzed", agent="analyst", tool="generate")
-    yield _agent_end("analyst")
+        # ── Step 4: Synthesis (streamed) ─────────────────────────────────────
+        yield _agent_start("synthesizer")
+        analyses_block = "\n\n---\n\n".join(
+            f'## Épisode : "{a["episode"]}"\n\n{a["notes"]}'
+            for a in episode_analyses
+        )
+        synthesis_input = (
+            f"Question de recherche : {query}\n\n"
+            f"Analyses par épisode :\n\n{analyses_block}"
+        )
 
-    # ── Step 4: Synthesis (streamed) ─────────────────────────────────────────
-    yield _agent_start("synthesizer")
-    yield _step("synthesize", "running", llm_label, agent="synthesizer", tool="generate_stream")
+        synth_input_for_span: dict = {
+            "n_analyses": len(episode_analyses),
+            "query":      query,
+        }
+        if should_log_full_prompts():
+            synth_input_for_span["prompt"] = synthesis_input
 
-    analyses_block = "\n\n---\n\n".join(
-        f'## Épisode : "{a["episode"]}"\n\n{a["notes"]}'
-        for a in episode_analyses
-    )
-    synthesis_input = (
-        f"Question de recherche : {query}\n\n"
-        f"Analyses par épisode :\n\n{analyses_block}"
-    )
+        tokens: list[str] = []
+        with span(
+            "research-synthesize",
+            input    = synth_input_for_span,
+            metadata = {"llm_key": resolved_llm, "stream": True},
+        ) as synth_span:
+            yield _step("synthesize", "running", llm_label,
+                        agent="synthesizer", tool="generate_stream")
+            try:
+                for token in chat.generate_stream(SYNTHESIZE_SYSTEM, synthesis_input):
+                    tokens.append(token)
+                    yield {"type": "token", "text": token}
+            except Exception as exc:
+                synth_span.update(output={"error": str(exc)[:200]})
+                log.exception("synthesis failed")
+                yield _step("synthesize", "error", str(exc),
+                            agent="synthesizer", tool="generate_stream")
+                yield _agent_end("synthesizer")
+                yield _agent_end("orchestrator")
+                yield {"type": "error", "detail": f"Synthesis failed: {exc}"}
+                return
+            answer = "".join(tokens)
+            synth_span.update(output={"answer_length": len(answer)})
 
-    tokens: list[str] = []
-    try:
-        for token in chat.generate_stream(SYNTHESIZE_SYSTEM, synthesis_input):
-            tokens.append(token)
-            yield {"type": "token", "text": token}
-    except Exception as exc:
-        log.exception("synthesis failed")
-        yield _step("synthesize", "error", str(exc), agent="synthesizer", tool="generate_stream")
+        yield _step("synthesize", "done", llm_label,
+                    agent="synthesizer", tool="generate_stream")
         yield _agent_end("synthesizer")
-        yield _agent_end("orchestrator")
-        yield {"type": "error", "detail": f"Synthesis failed: {exc}"}
-        return
 
-    answer = "".join(tokens)
-    yield _step("synthesize", "done", llm_label, agent="synthesizer", tool="generate_stream")
-    yield _agent_end("synthesizer")
+        # ── Step 5: Grounding check ──────────────────────────────────────────
+        yield _agent_start("critic")
+        source_context = format_context(chunks[:20])  # cap context size
+        ground_input = (
+            f"Synthèse à vérifier :\n{answer}\n\n"
+            f"---\n\n"
+            f"Extraits source :\n{source_context}"
+        )
 
-    # ── Step 5: Grounding check ──────────────────────────────────────────────
-    yield _agent_start("critic")
-    yield _step("ground", "running", agent="critic", tool="generate")
+        grounding: dict | None = None
+        with span(
+            "research-ground",
+            input    = {"n_chunks_inspected": min(len(chunks), 20),
+                        "answer_length":      len(answer)},
+            metadata = {"llm_key": resolved_llm},
+        ) as ground_span:
+            yield _step("ground", "running", agent="critic", tool="generate")
+            try:
+                raw_ground = chat.generate(GROUND_SYSTEM, ground_input)
+                grounding  = _parse_json(raw_ground)
+            except Exception as exc:
+                log.warning("grounding check failed: %s", exc)
+                grounding = {"verdict": "unknown",
+                             "flags":   [f"Grounding check failed: {exc}"]}
+            ground_span.update(output={
+                "verdict":  grounding.get("verdict", "unknown"),
+                "n_flags":  len(grounding.get("flags", []) or []),
+                "flags":    grounding.get("flags", []),
+            })
 
-    source_context = format_context(chunks[:20])  # cap context size
-    ground_input = (
-        f"Synthèse à vérifier :\n{answer}\n\n"
-        f"---\n\n"
-        f"Extraits source :\n{source_context}"
-    )
+        yield _step("ground", "done", grounding.get("verdict", "unknown"),
+                    agent="critic", tool="generate")
+        yield {"type": "grounding", **grounding}
+        yield _agent_end("critic")
 
-    grounding: dict | None = None
-    try:
-        raw_ground = chat.generate(GROUND_SYSTEM, ground_input)
-        grounding = _parse_json(raw_ground)
-    except Exception as exc:
-        log.warning("grounding check failed: %s", exc)
-        grounding = {"verdict": "unknown", "flags": [f"Grounding check failed: {exc}"]}
-
-    yield _step("ground", "done", grounding.get("verdict", "unknown"), agent="critic", tool="generate")
-    yield {"type": "grounding", **grounding}
-    yield _agent_end("critic")
+        req.update(output={
+            "n_sub_queries": len(sub_queries),
+            "n_episodes":    len(episodes_by_title),
+            "answer_length": len(answer),
+            "verdict":       grounding.get("verdict", "unknown"),
+        })
 
     yield _agent_end("orchestrator")
 
