@@ -17,6 +17,7 @@ Run:
 """
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -244,15 +245,36 @@ async def chat_endpoint(body: ChatRequest):
 _SENTINEL = object()
 
 
+async def _drive_sse_generator(gen):
+    """Advance a sync generator from async code, yielding SSE `data:` lines.
+
+    The generator opens Langfuse/OTel spans via context managers, whose Tokens
+    live in `contextvars` and must be reset in the same Context they were
+    created in. `asyncio.to_thread` copies the context per call, which breaks
+    that invariant. We bind every `next()` to a single `copy_context()` so the
+    span entry on `next` #1 can be cleanly exited on `next` #N.
+    """
+    ctx  = contextvars.copy_context()
+    loop = asyncio.get_running_loop()
+    try:
+        while True:
+            event = await loop.run_in_executor(None, ctx.run, next, gen, _SENTINEL)
+            if event is _SENTINEL:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+    except Exception as exc:
+        yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+
+
 @app.post("/chat/stream")
 async def chat_stream_endpoint(body: ChatRequest):
     """
     Same as /chat but streams execution steps as SSE before the final result.
 
     The pipeline (ask_stream) is a sync generator that yields events between
-    blocking steps.  We advance it one yield at a time via to_thread(next, gen)
-    so each event is flushed to the SSE stream immediately — the event loop is
-    never blocked.
+    blocking steps. Each event is flushed to the SSE stream immediately — the
+    event loop is never blocked. See `_drive_sse_generator` for why we pin
+    every `next()` to a single contextvars Context.
 
     Events:
       {"type": "step",   "step": str, "status": "running"|"done"|"error", "detail": str|None}
@@ -268,14 +290,8 @@ async def chat_stream_endpoint(body: ChatRequest):
 
     async def generate():
         gen = ask_stream(body.query, body.top_k, body.model_key, body.llm_key)
-        try:
-            while True:
-                event = await asyncio.to_thread(next, gen, _SENTINEL)
-                if event is _SENTINEL:
-                    break
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        async for line in _drive_sse_generator(gen):
+            yield line
 
     return StreamingResponse(
         generate(),
@@ -322,14 +338,8 @@ async def research_endpoint(body: ResearchRequest):
 
     async def generate():
         gen = research_stream(body.query, body.top_k, body.model_key, body.llm_key)
-        try:
-            while True:
-                event = await asyncio.to_thread(next, gen, _SENTINEL)
-                if event is _SENTINEL:
-                    break
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:
-            yield f"data: {json.dumps({'type': 'error', 'detail': str(exc)})}\n\n"
+        async for line in _drive_sse_generator(gen):
+            yield line
 
     return StreamingResponse(
         generate(),
