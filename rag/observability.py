@@ -140,3 +140,65 @@ def should_log_full_prompts() -> bool:
     return os.environ.get(
         "LANGFUSE_LOG_FULL_PROMPTS", "false",
     ).strip().lower() in ("1", "true", "yes")
+
+
+@contextmanager
+def trace_context(
+    *,
+    user_id:    str | None = None,
+    session_id: str | None = None,
+    feature:    str | None = None,
+    tags:       list[str] | None = None,
+    metadata:   dict | None = None,
+):
+    """Propagate trace-level attributes onto the root span and every child.
+
+    Wrap the body of a root observation (chat-request, research-request)
+    with this so the auto SDK generations created underneath inherit the
+    same user_id / session_id / tags — Langfuse's UI surfaces user_id /
+    session_id only when the root observation carries them.
+
+    Enter this *inside* the root span and *before* any child spans, since
+    `propagate_attributes` does not retroactively tag pre-existing spans.
+
+    `feature` is folded into both:
+      - `tags`     — bare value (e.g. "chat"), shown as a tag chip
+      - `metadata` — under the key "feature", queryable as structured data
+
+    No-op when Langfuse is disabled, or when nothing tag-worthy is set.
+    Defensive: an unexpected SDK error degrades to a yield-without-context
+    so observability cannot fail the request.
+    """
+    lf = get_langfuse()
+    if lf is None:
+        yield
+        return
+    merged_tags: list[str] = list(tags) if tags else []
+    if feature and feature not in merged_tags:
+        merged_tags.append(feature)
+    merged_meta: dict[str, str] = {str(k): str(v) for k, v in (metadata or {}).items()}
+    if feature:
+        merged_meta.setdefault("feature", feature)
+    kwargs: dict = {}
+    if user_id:
+        kwargs["user_id"]    = user_id
+    if session_id:
+        kwargs["session_id"] = session_id
+    if merged_tags:
+        kwargs["tags"]       = merged_tags
+    if merged_meta:
+        kwargs["metadata"]   = merged_meta
+    if not kwargs:
+        yield
+        return
+    try:
+        from langfuse import propagate_attributes
+    except Exception:
+        yield
+        return
+    try:
+        with propagate_attributes(**kwargs):
+            yield
+    except Exception:
+        # Fall back to an unwrapped body — never let observability fail the request.
+        yield

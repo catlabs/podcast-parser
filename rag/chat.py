@@ -18,7 +18,7 @@ import logging
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, EMBED_MODELS, LLM_REGISTRY, TOP_K
 
 log = logging.getLogger(__name__)
-from rag.observability import should_log_full_prompts, span
+from rag.observability import should_log_full_prompts, span, trace_context
 from rag.providers import get_chat_provider
 from rag.router import classify
 from rag.search import format_context, semantic_search
@@ -95,7 +95,16 @@ Question : {query}
 
 # ── RAG call ──────────────────────────────────────────────────────────────────
 
-def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_key: str | None = None) -> dict:
+def ask(
+    query:      str,
+    top_k:      int = TOP_K,
+    model_key:  str = DEFAULT_MODEL_KEY,
+    llm_key:    str | None = None,
+    *,
+    session_id: str | None = None,
+    user_id:    str | None = None,
+    feature:    str = "chat",
+) -> dict:
     """
     Full RAG pipeline for one question using the given embedding model.
 
@@ -112,7 +121,11 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
         "chat-request",
         input    = {"query": query, "top_k": top_k},
         metadata = {"model_key": model_key, "llm_key": llm_key or DEFAULT_LLM_KEY},
-    ) as req:
+    ) as req, trace_context(
+        user_id    = user_id,
+        session_id = session_id,
+        feature    = feature,
+    ):
         result    = classify(query, llm_key)
         intent    = result["intent"]
         sub_query = result.get("query") or query
@@ -225,10 +238,14 @@ def ask(query: str, top_k: int = TOP_K, model_key: str = DEFAULT_MODEL_KEY, llm_
 
 
 def ask_stream(
-    query:     str,
-    top_k:     int = TOP_K,
-    model_key: str = DEFAULT_MODEL_KEY,
-    llm_key:   str | None = None,
+    query:      str,
+    top_k:      int = TOP_K,
+    model_key:  str = DEFAULT_MODEL_KEY,
+    llm_key:    str | None = None,
+    *,
+    session_id: str | None = None,
+    user_id:    str | None = None,
+    feature:    str = "chat",
 ):
     """
     Generator version of ask() that yields step events as execution progresses.
@@ -251,7 +268,11 @@ def ask_stream(
         input    = {"query": query, "top_k": top_k},
         metadata = {"model_key": model_key, "llm_key": llm_key or DEFAULT_LLM_KEY,
                     "stream":    True},
-    ) as req:
+    ) as req, trace_context(
+        user_id    = user_id,
+        session_id = session_id,
+        feature    = feature,
+    ):
         # ── classify ──────────────────────────────────────────────────────────
         yield step("classify", "running")
         try:
@@ -406,13 +427,24 @@ def ask_stream(
                "chunks": results, "model_key": model_key, "intent": intent}
 
 
-def compare(query: str, top_k: int = TOP_K, llm_key: str | None = None) -> dict[str, dict]:
+def compare(
+    query:      str,
+    top_k:      int = TOP_K,
+    llm_key:    str | None = None,
+    *,
+    session_id: str | None = None,
+    user_id:    str | None = None,
+) -> dict[str, dict]:
     """
     Run ask() for every configured embedding model concurrently.
 
     Both searches + LLM calls run in parallel threads (ThreadPoolExecutor)
     since ask() is I/O-bound (Anthropic API). The caller wraps this in
     asyncio.to_thread() so the event loop is not blocked.
+
+    Each per-model ask() opens its own `chat-request` trace; passing the
+    same session_id lets Langfuse group them under one Sessions entry,
+    and feature="chat-compare" tags them distinctly from solo /chat calls.
 
     Returns {model_key: ask_result} for each model.
     If one model's call fails, its exception propagates immediately.
@@ -421,8 +453,16 @@ def compare(query: str, top_k: int = TOP_K, llm_key: str | None = None) -> dict[
 
     results: dict[str, dict] = {}
 
+    def _ask_one(key: str) -> dict:
+        return ask(
+            query, top_k, key, llm_key,
+            session_id = session_id,
+            user_id    = user_id,
+            feature    = "chat-compare",
+        )
+
     with ThreadPoolExecutor(max_workers=len(EMBED_MODELS)) as pool:
-        futures = {pool.submit(ask, query, top_k, key, llm_key): key for key in EMBED_MODELS}
+        futures = {pool.submit(_ask_one, key): key for key in EMBED_MODELS}
         for future in as_completed(futures):
             key = futures[future]
             results[key] = future.result()

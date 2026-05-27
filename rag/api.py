@@ -46,6 +46,7 @@ from rag.config import (
     DEFAULT_MODEL_KEY,
     EMBED_REGISTRY,
     ENABLE_LLM_STREAMING,
+    LANGFUSE_DEFAULT_USER_ID,
     LLM_REGISTRY,
     OPENAI_API_KEY,
     TOP_K,
@@ -104,16 +105,23 @@ app.add_middleware(
 # ── Request / Response models ─────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    query:     str
-    top_k:     int = TOP_K
-    model_key: str = DEFAULT_MODEL_KEY
-    llm_key:   str = DEFAULT_LLM_KEY
+    query:      str
+    top_k:      int = TOP_K
+    model_key:  str = DEFAULT_MODEL_KEY
+    llm_key:    str = DEFAULT_LLM_KEY
+    # Optional Langfuse trace context. UI sets session_id per conversation and
+    # user_id from localStorage; backend falls back to LANGFUSE_DEFAULT_USER_ID
+    # when user_id is missing. None values are simply not stamped on the trace.
+    session_id: str | None = None
+    user_id:    str | None = None
 
 
 class CompareRequest(BaseModel):
-    query:   str
-    top_k:   int = TOP_K
-    llm_key: str = DEFAULT_LLM_KEY
+    query:      str
+    top_k:      int = TOP_K
+    llm_key:    str = DEFAULT_LLM_KEY
+    session_id: str | None = None
+    user_id:    str | None = None
 
 
 class RssEpisodeIn(BaseModel):
@@ -131,10 +139,12 @@ class RssIngestRequest(BaseModel):
 
 
 class ResearchRequest(BaseModel):
-    query:     str
-    top_k:     int = 8
-    model_key: str = DEFAULT_MODEL_KEY
-    llm_key:   str = DEFAULT_LLM_KEY
+    query:      str
+    top_k:      int = 8
+    model_key:  str = DEFAULT_MODEL_KEY
+    llm_key:    str = DEFAULT_LLM_KEY
+    session_id: str | None = None
+    user_id:    str | None = None
 
 
 class DetectRequest(BaseModel):
@@ -149,6 +159,11 @@ class UrlIngestRequest(BaseModel):
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _resolved_user_id(value: str | None) -> str:
+    """Fall back to the configured default when the UI omits user_id."""
+    return (value or "").strip() or LANGFUSE_DEFAULT_USER_ID
+
 
 def _require_llm(llm_key: str = DEFAULT_LLM_KEY) -> None:
     cfg = LLM_REGISTRY.get(llm_key, LLM_REGISTRY[DEFAULT_LLM_KEY])
@@ -238,7 +253,14 @@ async def chat_endpoint(body: ChatRequest):
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
         )
 
-    result = await asyncio.to_thread(ask, body.query, body.top_k, body.model_key, body.llm_key)
+    user_id = _resolved_user_id(body.user_id)
+    result = await asyncio.to_thread(
+        lambda: ask(
+            body.query, body.top_k, body.model_key, body.llm_key,
+            session_id = body.session_id,
+            user_id    = user_id,
+        )
+    )
     return result
 
 
@@ -288,8 +310,14 @@ async def chat_stream_endpoint(body: ChatRequest):
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
         )
 
+    user_id = _resolved_user_id(body.user_id)
+
     async def generate():
-        gen = ask_stream(body.query, body.top_k, body.model_key, body.llm_key)
+        gen = ask_stream(
+            body.query, body.top_k, body.model_key, body.llm_key,
+            session_id = body.session_id,
+            user_id    = user_id,
+        )
         async for line in _drive_sse_generator(gen):
             yield line
 
@@ -314,7 +342,14 @@ async def compare_endpoint(body: CompareRequest):
     """
     _require_llm(body.llm_key)
 
-    result = await asyncio.to_thread(compare, body.query, body.top_k, body.llm_key)
+    user_id = _resolved_user_id(body.user_id)
+    result = await asyncio.to_thread(
+        lambda: compare(
+            body.query, body.top_k, body.llm_key,
+            session_id = body.session_id,
+            user_id    = user_id,
+        )
+    )
     return result
 
 
@@ -336,8 +371,14 @@ async def research_endpoint(body: ResearchRequest):
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
         )
 
+    user_id = _resolved_user_id(body.user_id)
+
     async def generate():
-        gen = research_stream(body.query, body.top_k, body.model_key, body.llm_key)
+        gen = research_stream(
+            body.query, body.top_k, body.model_key, body.llm_key,
+            session_id = body.session_id,
+            user_id    = user_id,
+        )
         async for line in _drive_sse_generator(gen):
             yield line
 
@@ -370,6 +411,8 @@ async def research_graph_endpoint(body: ResearchRequest):
 
     import queue as stdlib_queue
 
+    user_id = _resolved_user_id(body.user_id)
+
     loop = asyncio.get_running_loop()
     async_q: asyncio.Queue[Optional[dict]] = asyncio.Queue()
     token_q: stdlib_queue.Queue = stdlib_queue.Queue()
@@ -392,6 +435,8 @@ async def research_graph_endpoint(body: ResearchRequest):
         try:
             for event in research_graph_stream(
                 body.query, body.top_k, body.model_key, body.llm_key, token_q,
+                session_id = body.session_id,
+                user_id    = user_id,
             ):
                 # Don't duplicate token events (they come via the drain thread)
                 if event.get("type") != "token":

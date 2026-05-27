@@ -773,6 +773,132 @@ on observability.
 
 ---
 
+## Step 7 — Langfuse observability (step 5: context tags)
+
+Every trace now carries `user_id`, `session_id`, and a `feature` tag so the
+Langfuse UI can slice by user, group multi-turn conversations under one
+Sessions entry, and filter by entry point. No behaviour change to the RAG
+pipeline — purely trace-level metadata.
+
+### What ships
+
+- **`rag/observability.py`** — new `trace_context(*, user_id, session_id,
+  feature, tags, metadata)` **context manager**. Wraps the body of a root
+  span and calls `langfuse.propagate_attributes(...)` so the root span AND
+  every child observation (including the auto OpenAI/Anthropic generations
+  patched by the langfuse.openai drop-in) inherit the trace-level fields.
+  No-ops when Langfuse is disabled; defensive on import / SDK errors so
+  observability cannot fail the request. `feature` is propagated **both**
+  as a bare tag (`chat`, `chat-compare`, `research`, `research-graph`) for
+  one-click filtering and as a `feature` key in trace metadata for
+  structured querying.
+
+  **Gotcha that cost a debugging cycle**: Langfuse 4.x removed the
+  `client.update_current_trace(...)` method that earlier docs describe;
+  `propagate_attributes()` (a context manager, not a one-shot call) is the
+  v4 way to set `user_id` / `session_id` / `tags` and **must be entered
+  before any child spans** — it does not retroactively tag existing spans.
+- **`rag/config.py`** — new `LANGFUSE_DEFAULT_USER_ID` (default `"local-user"`).
+  Stamped on traces when the request body omits a user_id (CLI smoke tests,
+  pre-UI traffic).
+- **`rag/api.py`** — `ChatRequest`, `CompareRequest`, `ResearchRequest`
+  gain optional `session_id` and `user_id` fields. A small `_resolved_user_id(...)`
+  helper falls back to `LANGFUSE_DEFAULT_USER_ID`. All five chat/research
+  endpoints (`/chat`, `/chat/stream`, `/chat/compare`, `/chat/research`,
+  `/chat/research-graph`) thread both values through to the pipeline
+  functions.
+- **`rag/chat.py`** — `ask`, `ask_stream`, `compare` accept keyword-only
+  `session_id`, `user_id`, `feature`. Each root `chat-request` span enters
+  `trace_context(...)` in the same `with` statement so attributes are
+  active before any child span (router-classify, retrieval,
+  final-generation, auto SDK observations) is created. `compare` fans out
+  per-model `ask()` calls tagged `feature="chat-compare"` and sharing the
+  parent's session_id, so all model traces group together in Sessions.
+- **`rag/research.py`** — `research_stream` accepts the same context;
+  `research-request` is tagged `feature="research"`.
+- **`rag/research_graph.py`** — `research_graph_stream` accepts the same
+  context; `research-request` is tagged `feature="research-graph"`.
+- **`ui/src/api.ts`** — generates one `session_id` per page load via
+  `crypto.randomUUID()` and persists a per-browser `user_id` UUID in
+  `localStorage`. Both are spread onto every `/chat*` and `/chat/research*`
+  request body via a `traceFields()` helper. Browsers without
+  `crypto.randomUUID` (or without localStorage access) fall back to a
+  random suffix.
+- **`.env.agent-safe`** — documents `LANGFUSE_DEFAULT_USER_ID`.
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `LANGFUSE_DEFAULT_USER_ID` | `local-user` | Stamped on traces when the request body omits `user_id`. UI overrides per request. |
+
+### Trace shape (new fields)
+
+| Field | Source | Used to |
+|---|---|---|
+| `user_id` | UI localStorage (or fallback) | Filter Traces / Users views per browser identity |
+| `session_id` | UI per-page-load UUID | Group multi-turn turns under one Sessions entry |
+| `tags` | `feature` value | One-click filter on entry point (`chat`, `chat-compare`, `research`, `research-graph`) |
+| `metadata.feature` | same value as tag | Structured-data query alternative to the tag |
+
+Stream vs non-stream isn't a separate tag — the existing `metadata.stream`
+on the root span already records it. A `chat-compare` trace will have one
+trace per embedding model (since `compare` fans out into independent
+`ask()` calls); all share the same `session_id` and tag.
+
+### What did NOT change
+
+- Retrieval, routing, prompting, embedding, chunking — unchanged.
+- Span hierarchy from Steps 1–4 is intact; `trace_context` only touches
+  trace-level attributes, not observation structure.
+- Local-only behaviour (no Langfuse keys) — the helper short-circuits and
+  is a no-op. `traceFields()` in the UI is harmless when Langfuse is off
+  because the backend simply ignores unset fields.
+
+### Smoke test
+
+```bash
+# 1. local-only — trace_context must be a silent no-op
+.venv/bin/python -c "
+from rag.observability import trace_context
+with trace_context(user_id='x', session_id='y', feature='chat'):
+    pass
+print('no-op OK')
+"
+# expect: no-op OK
+
+# 2. Backend up, hit /chat with context — verify in Langfuse UI
+.venv/bin/python -m uvicorn rag.api:app --reload &
+curl -sX POST localhost:8000/chat \
+  -H 'content-type: application/json' \
+  -d '{"query":"Qu'\''est-ce que Nanocorp?","session_id":"smoke-1","user_id":"julien"}' \
+  | jq '.intent'
+
+# In the Langfuse UI:
+#   - Traces tab: filter by user_id = "julien"  → one trace
+#   - Sessions tab: filter by id "smoke-1"      → groups it
+#   - Tags filter: tag "chat"                   → matches
+#   - On the root span, metadata.feature == "chat"
+
+# 3. UI smoke — open two tabs to localhost:5173, ask the same question
+#    in both. Each tab should have a distinct session_id (you'll see two
+#    Sessions entries) but the same user_id (one Users entry).
+```
+
+### Notes
+
+- Tags are bare values, no `feature:` prefix — keeps Langfuse's tag chips
+  readable.
+- A `compare` request creates one trace per embedding model. They share
+  session_id and tag `chat-compare`, but each gets its own trace ID. That's
+  intentional — fanning a single trace across parallel ThreadPoolExecutor
+  workers wouldn't surface per-model timings clearly.
+- `localStorage` `user_id` is a stable per-browser identity, not a real
+  authenticated user. When auth lands, swap `_loadUserId()` to read from
+  the auth context.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.

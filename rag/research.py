@@ -25,7 +25,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
-from rag.observability import should_log_full_prompts, span
+from rag.observability import should_log_full_prompts, span, trace_context
 from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
 from rag.tools import list_episodes_text
@@ -191,10 +191,13 @@ def _unique_sources(chunks: list[dict]) -> list[dict]:
 # ── Orchestrator ─────────────────────────────────────────────────────────────
 
 def research_stream(
-    query: str,
-    top_k: int = TOP_K,
-    model_key: str = DEFAULT_MODEL_KEY,
-    llm_key: str | None = None,
+    query:      str,
+    top_k:      int = TOP_K,
+    model_key:  str = DEFAULT_MODEL_KEY,
+    llm_key:    str | None = None,
+    *,
+    session_id: str | None = None,
+    user_id:    str | None = None,
 ):
     """
     Multi-step research pipeline generator.
@@ -218,7 +221,11 @@ def research_stream(
         input    = {"query": query, "top_k": top_k},
         metadata = {"model_key": model_key, "llm_key": resolved_llm,
                     "mode":      "research", "stream": True},
-    ) as req:
+    ) as req, trace_context(
+        user_id    = user_id,
+        session_id = session_id,
+        feature    = "research",
+    ):
         # ── Step 1: Plan ─────────────────────────────────────────────────────
         yield _agent_start("planner")
         with span(

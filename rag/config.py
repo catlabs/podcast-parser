@@ -201,3 +201,9 @@ UI_DEFAULT_EMBED_KEY = _ui_embed if _ui_embed in EMBED_REGISTRY else DEFAULT_MOD
 
 _ui_llm = os.environ.get("UI_DEFAULT_LLM_KEY", "").strip()
 UI_DEFAULT_LLM_KEY = _ui_llm if _ui_llm in LLM_REGISTRY else DEFAULT_LLM_KEY
+
+# ── Langfuse trace context ────────────────────────────────────────────────────
+# Default user_id stamped on traces when the HTTP request body omits one.
+# Local-first app has no auth; this lets a developer tag their own traces in
+# Langfuse without code changes. The UI is free to override per-request.
+LANGFUSE_DEFAULT_USER_ID = os.environ.get("LANGFUSE_DEFAULT_USER_ID", "local-user").strip() or "local-user"

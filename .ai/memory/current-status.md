@@ -4,7 +4,7 @@ Single source of truth for "where are we right now". Read this first in
 a new session. Append a dated entry when you finish a milestone; do not
 rewrite history.
 
-## Snapshot (last update 2026-05-20)
+## Snapshot (last update 2026-05-27)
 
 - **Provider abstractions** in place: `rag/interfaces.py` defines five
   protocols (Chat, Embedding, VectorStore, Speech, ObjectStore);
@@ -43,10 +43,10 @@ rewrite history.
 | 6b. Azure OpenAI embeddings | done |
 | 6c. UI surfacing of embed options | done |
 | 6d. Backfill safety rails | done |
-| 7. Azure Blob Storage | next |
-| 8. Azure AI Search | — |
-| 9. Azure Speech | — |
-| 10. Langfuse observability | — |
+| 7. Langfuse observability (steps 1–5) | done |
+| 8. Azure Blob Storage | next |
+| 9. Azure AI Search | — |
+| 10. Azure Speech | — |
 | 11. Async ingestion jobs | — |
 | 12. Deployment | — |
 
@@ -58,9 +58,7 @@ rewrite history.
 - **Azure Blob**: transcripts and audio still live on the local
   filesystem under `OUTPUT_DIR`.
 - **Azure Speech**: transcription is still local Whisper.
-- **Langfuse**: not installed yet. Will plug into the provider
-  factories (one decorator on `get_chat_provider` and
-  `get_embedding_provider`) rather than into every call site.
+- (Langfuse is now wired end-to-end through step 5 — see appendable log.)
 
 ## Known data inconsistencies
 
@@ -97,3 +95,22 @@ children under each custom span (raw payloads + token usage). New
 LANGFUSE_LOG_FULL_PROMPTS=false default keeps prompts out of custom-span
 inputs; auto SDK obs still carries the raw message array. Research-mode
 parent trace and context tags still deferred.
+
+2026-05-23 — Langfuse step 4 wired: research-mode span tree. Both
+`research_stream` (custom orchestrator) and `research_graph_stream`
+(LangGraph) now open a `research-request` root with per-agent children
+(`research-plan`, `research-search`, `research-analyze`,
+`research-synthesize`, `research-ground`). The ThreadPoolExecutor fan-out
+in the search agent submits `contextvars.copy_context().run(...)` per
+future so retrieval spans inside worker threads nest under
+`research-search` instead of becoming orphan roots.
+
+2026-05-27 — Langfuse step 5 wired: context tags. New `update_trace(...)`
+helper in `rag/observability.py` attaches `user_id`, `session_id`, and a
+`feature` tag (`chat` / `chat-compare` / `research` / `research-graph`) to
+every trace. `feature` is also stored as `metadata.feature` for structured
+queries. UI generates one `session_id` per page load and persists `user_id`
+in localStorage; backend falls back to `LANGFUSE_DEFAULT_USER_ID`
+(default `local-user`) for CLI / curl traffic. No pipeline behaviour
+change. All Langfuse step-7 work is now done; next migration step is
+**Azure Blob Storage** (transcripts/audio move off local filesystem).

@@ -6,6 +6,38 @@
 // (see ui/.env.example). Default preserves the original local-dev value.
 const BASE = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000") as string;
 
+// ── Langfuse trace context (session_id + user_id) ────────────────────────────
+// session_id: one ID per page load — groups all chat / research turns of a
+// conversation under a single entry in Langfuse's Sessions view.
+// user_id: persistent across page loads via localStorage so per-browser
+// activity stays grouped under the same identity in Langfuse.
+function _randomId(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  return "uid-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+const SESSION_ID: string = _randomId();
+
+function _loadUserId(): string {
+  try {
+    const existing = localStorage.getItem("podcast-rag.user_id");
+    if (existing) return existing;
+    const fresh = _randomId();
+    localStorage.setItem("podcast-rag.user_id", fresh);
+    return fresh;
+  } catch {
+    // SSR or privacy-restricted browser — fall back to a per-load ID.
+    return _randomId();
+  }
+}
+
+const USER_ID: string = _loadUserId();
+
+function traceFields(): { session_id: string; user_id: string } {
+  return { session_id: SESSION_ID, user_id: USER_ID };
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 export interface CollectionTag {
@@ -231,7 +263,7 @@ export async function* chatStream(
   const res = await fetch(`${BASE}/chat/stream`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
+    body:    JSON.stringify({ query, top_k, model_key, llm_key, ...traceFields() }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -261,7 +293,7 @@ export function chat(query: string, top_k = 5, model_key = "minilm", llm_key = "
   return apiFetch<ChatResponse>("/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k, model_key, llm_key }),
+    body: JSON.stringify({ query, top_k, model_key, llm_key, ...traceFields() }),
   });
 }
 
@@ -269,7 +301,7 @@ export function compareModels(query: string, top_k = 5, llm_key = "claude-sonnet
   return apiFetch<CompareResponse>("/chat/compare", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, top_k, llm_key }),
+    body: JSON.stringify({ query, top_k, llm_key, ...traceFields() }),
   });
 }
 
@@ -279,7 +311,7 @@ export async function* researchStream(
   const res = await fetch(`${BASE}/chat/research`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
+    body:    JSON.stringify({ query, top_k, model_key, llm_key, ...traceFields() }),
   });
   if (!res.ok) {
     const text = await res.text();
@@ -311,7 +343,7 @@ export async function* researchGraphStream(
   const res = await fetch(`${BASE}/chat/research-graph`, {
     method:  "POST",
     headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ query, top_k, model_key, llm_key }),
+    body:    JSON.stringify({ query, top_k, model_key, llm_key, ...traceFields() }),
   });
   if (!res.ok) {
     const text = await res.text();
