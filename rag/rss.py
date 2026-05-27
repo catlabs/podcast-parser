@@ -17,7 +17,6 @@ Three public functions:
 import html as html_lib
 import re
 import sqlite3
-from pathlib import Path
 from typing import Callable
 
 # transcribe.py lives at the project root.
@@ -31,9 +30,10 @@ from transcribe import (
     transcribe_audio,
 )
 
-from rag.config import DEFAULT_MODEL_KEY, EMBED_MODELS, OUTPUT_DIR
+from rag.config import DEFAULT_MODEL_KEY, EMBED_MODELS
 from rag.database import episode_exists_by_audio_url, record_model_indexing, upsert_episode
 from rag.ingest import ingest_file
+from rag.providers import get_object_store
 
 
 # ── Feed parsing ──────────────────────────────────────────────────────────────
@@ -115,14 +115,6 @@ def annotate_ingested(conn: sqlite3.Connection, episodes: list[dict]) -> list[di
 
 # ── Per-episode pipeline ──────────────────────────────────────────────────────
 
-def _podcast_dir(podcast_name: str) -> Path:
-    """Absolute output subfolder for a podcast, using rag.config.OUTPUT_DIR."""
-    folder = sanitize_filename(podcast_name.strip() or "unknown_podcast", max_length=100)
-    d = OUTPUT_DIR / folder
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def _ingest_one(
     episode: dict,
     podcast_name: str,
@@ -138,40 +130,46 @@ def _ingest_one(
     step_cb("downloading" | "transcribing" | "indexing") is called at each step.
     Returns (chunk_count, loaded_model) — model is returned so the caller can
     pass it to the next episode and avoid reloading Whisper weights.
+
+    All filesystem I/O is mediated by an ObjectStore (LocalObjectStore today,
+    AzureBlobObjectStore in a future step). The staging_dir context unit covers
+    the whole episode: audio + transcript live or arrive together.
     """
-    podcast_dir = _podcast_dir(podcast_name)
-    date        = episode.get("date") or "0000-00-00"
-    file_stem   = f"{date}_{sanitize_filename(episode['title'], max_length=100)}"
+    store     = get_object_store()
+    folder    = sanitize_filename(podcast_name.strip() or "unknown_podcast", max_length=100)
+    date      = episode.get("date") or "0000-00-00"
+    file_stem = f"{date}_{sanitize_filename(episode['title'], max_length=100)}"
 
-    # 1. Download
-    step_cb("downloading")
-    audio_path = download_audio(episode["audio_url"], podcast_dir, file_stem)
+    with store.staging_dir(folder) as podcast_dir:
+        # 1. Download
+        step_cb("downloading")
+        audio_path = download_audio(episode["audio_url"], podcast_dir, file_stem)
 
-    # 2. Transcribe
-    step_cb("transcribing")
-    text, loaded_model = transcribe_audio(audio_path, whisper_model, loaded_model)
+        # 2. Transcribe
+        step_cb("transcribing")
+        text, loaded_model = transcribe_audio(audio_path, whisper_model, loaded_model)
 
-    # 3. Write transcript file
-    transcript_path = podcast_dir / (file_stem + ".txt")
-    transcript_path.write_text(text)
+        # 3. Write transcript file
+        transcript_path = podcast_dir / (file_stem + ".txt")
+        transcript_path.write_text(text)
 
-    # 4. Chunk + embed → ChromaDB + SQLite (all models)
-    step_cb("indexing")
-    model_keys  = list(EMBED_MODELS.keys())
-    counts      = ingest_file(transcript_path, model_keys=model_keys)
-    chunk_count = counts[DEFAULT_MODEL_KEY]
+        # 4. Chunk + embed → ChromaDB + SQLite (all models)
+        step_cb("indexing")
+        model_keys  = list(EMBED_MODELS.keys())
+        counts      = ingest_file(transcript_path, model_keys=model_keys)
+        chunk_count = counts[DEFAULT_MODEL_KEY]
 
-    ep_id = upsert_episode(
-        conn,
-        podcast     = podcast_name,
-        title       = episode["title"],
-        date        = episode.get("date"),
-        file_path   = str(transcript_path),
-        chunk_count = chunk_count,
-        audio_url   = episode["audio_url"],
-    )
-    for key in model_keys:
-        record_model_indexing(conn, ep_id, key)
+        ep_id = upsert_episode(
+            conn,
+            podcast     = podcast_name,
+            title       = episode["title"],
+            date        = episode.get("date"),
+            file_path   = str(transcript_path),
+            chunk_count = chunk_count,
+            audio_url   = episode["audio_url"],
+        )
+        for key in model_keys:
+            record_model_indexing(conn, ep_id, key)
 
     return chunk_count, loaded_model
 

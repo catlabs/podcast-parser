@@ -4,7 +4,7 @@ Single source of truth for "where are we right now". Read this first in
 a new session. Append a dated entry when you finish a milestone; do not
 rewrite history.
 
-## Snapshot (last update 2026-05-27)
+## Snapshot (last update 2026-05-27, Step 8a)
 
 - **Provider abstractions** in place: `rag/interfaces.py` defines five
   protocols (Chat, Embedding, VectorStore, Speech, ObjectStore);
@@ -44,7 +44,8 @@ rewrite history.
 | 6c. UI surfacing of embed options | done |
 | 6d. Backfill safety rails | done |
 | 7. Langfuse observability (steps 1–5) | done |
-| 8. Azure Blob Storage | next |
+| 8a. ObjectStore consumer rewire | done |
+| 8b. Azure Blob Storage | next |
 | 9. Azure AI Search | — |
 | 10. Azure Speech | — |
 | 11. Async ingestion jobs | — |
@@ -62,11 +63,10 @@ rewrite history.
 
 ## Known data inconsistencies
 
-- 4 of the 12 ingested episodes have **0 chunks** in the baseline
-  Chroma collection. They appear in SQLite's `episodes` table but
-  the baseline indexing wrote no vectors for them. The new backfill
-  dry-run surfaces this. Investigating these is its own small task
-  before any further ingestion work.
+- (Cleared 2026-05-27.) Previously: 4 of 12 episodes lacked chunks in
+  the baseline collection. The Step 8a smoke run incidentally
+  completed model coverage for them — all 12 episodes now have full
+  3-model coverage (`minilm`, `multilingual`, `azure-openai`).
 
 ## Appendable log
 
@@ -112,5 +112,16 @@ every trace. `feature` is also stored as `metadata.feature` for structured
 queries. UI generates one `session_id` per page load and persists `user_id`
 in localStorage; backend falls back to `LANGFUSE_DEFAULT_USER_ID`
 (default `local-user`) for CLI / curl traffic. No pipeline behaviour
-change. All Langfuse step-7 work is now done; next migration step is
-**Azure Blob Storage** (transcripts/audio move off local filesystem).
+change. (Implementation initially used `lf.update_current_trace(...)` —
+silently no-op on Langfuse 4.x. Fixed in same commit to use
+`langfuse.propagate_attributes(...)` context manager.)
+
+2026-05-27 — Step 8a wired: storage-layer consumer rewire. `ObjectStore`
+protocol gains `local_view(key)` and `staging_dir(prefix)` context
+managers. `LocalObjectStore` canonicalises its root to absolute at init
+(stabilises SQLite `file_path` UNIQUE keys across env spellings). `rss.py`
+/ `yt.py` ingest pipelines run inside `staging_dir(...)`; `ingest.py`
+walks via `store.list("")` and `local_view`. Behaviour identical to
+pre-rewire; smoke run confirms 12/12 episodes skipped. Next migration
+step is **Step 8b: AzureBlobObjectStore** (opt-in Azure provider, auth
+via `DefaultAzureCredential` only — no connection strings).

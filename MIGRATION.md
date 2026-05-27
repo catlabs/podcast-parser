@@ -899,6 +899,95 @@ curl -sX POST localhost:8000/chat \
 
 ---
 
+## Step 8a — consumer rewire to ObjectStore
+
+Mirrors Step 4 (chat) and Step 6a (embeddings) for the storage layer.
+Every transcript / audio read and write now goes through an
+`ObjectStore` instead of touching `OUTPUT_DIR` directly. The
+implementation is still `LocalObjectStore`; this step ships zero
+behaviour change. The future `AzureBlobObjectStore` (Step 8b) plugs
+in by implementing the same protocol.
+
+### What ships
+
+- **`rag/interfaces.py`** — extends the `ObjectStore` protocol with two
+  context managers:
+  - `local_view(key) -> ContextManager[Path]` — yields a readable
+    filesystem path for an existing object. Libraries that require a
+    real file (Whisper, ffprobe) consume this. Local impl returns the
+    underlying path (no copy); Azure impl will download to a tempfile
+    and clean up on exit.
+  - `staging_dir(prefix) -> ContextManager[Path]` — yields a writable
+    directory under `prefix`. Producers that emit several files in one
+    unit (audio + transcript, multi-format yt-dlp output) work inside
+    this context. Local impl returns the underlying directory (no
+    copy, no-op exit); Azure impl will yield a tempdir and upload its
+    contents on exit.
+- **`rag/storage.py`** — `LocalObjectStore.__init__` now canonicalises
+  `root` via `.expanduser().resolve()`. Same physical location regardless
+  of whether the env spells it `./output` or `/abs/path/output` — keeps
+  the `episodes.file_path` UNIQUE column stable across env tweaks.
+  Implements `local_view` and `staging_dir` as no-copy passthroughs.
+- **`rag/rss.py`** — `_ingest_one` removes `_podcast_dir` (formerly built
+  `OUTPUT_DIR / folder` directly). The whole episode pipeline runs inside
+  `with store.staging_dir(folder) as podcast_dir: …` — audio download,
+  transcription, transcript write, and index commit all happen there.
+- **`rag/yt.py`** — `ingest_youtube` rewires the same way: `with
+  store.staging_dir("youtube") as output_dir:` covers yt-dlp +
+  transcription + transcript write + index.
+- **`rag/ingest.py`** — `ingest_all` no longer takes `output_dir`; it
+  walks `store.list("")` filtered to `.txt`, and uses
+  `with store.local_view(key) as path: ingest_file(path)` per file.
+  `ingest_file(path: Path)` signature unchanged — the path-based
+  contract is preserved for any external caller.
+
+### Smoke test (validated)
+
+```bash
+.venv/bin/python -m rag.ingest
+# expect: indexed=0  skipped=12  errors=0  (when DB is healthy)
+```
+
+`store.local_view` yields a path with the same string as the old
+`output_dir.rglob` walker produced (now that the root is resolved), so
+the SQLite `file_path` keys stay byte-identical to the pre-rewire run.
+
+### Hazard the smoke test caught
+
+The first run after the rewire re-indexed everything instead of
+skipping. Cause: `.env.agent-safe` sets `OUTPUT_DIR=./output` (relative),
+but the original ingest had run under the absolute default
+(`BASE_DIR / "output"`). The new walker faithfully reproduced the
+relative form, which did not match the SQLite UNIQUE `file_path`
+column — 12 duplicate rows. Resolved by:
+
+1. Canonicalising `LocalObjectStore.root` via `.resolve()` so the
+   store has one stable view regardless of how the env is spelled.
+2. Deleting the 12 phantom rows and their `episode_models` join rows.
+
+Lesson worth remembering for Step 8b: any change that affects the
+shape of the `file_path` value risks creating duplicate rows. The
+`file_path` column is the de-facto natural key for episode identity
+and `chunk_id` is seeded from it. A future migration that switches to
+store-relative keys needs a separate one-shot migration script, not a
+silent re-ingest.
+
+### What did NOT change in Step 8a
+
+- `LocalObjectStore` is still the only `ObjectStore` impl. No Azure
+  yet.
+- `rag/storage.py` already existed (Step 3); only `__init__` and the
+  two new methods are new.
+- CLI `transcribe.py` at the project root is unchanged — it has its
+  own `OUTPUT_DIR = Path("output")` and is a dev-only script not on
+  the production data plane (which goes through `rss.py` / `yt.py`).
+- `chunk_id`, chunking parameters, embedding code, SQLite schema,
+  Chroma collections, the API surface, the UI — none of these moved.
+- `ingest_file(path: Path)` signature preserved so future callers
+  that still hold a `Path` work without change.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Blob, Azure Speech, Azure AI Search — none introduced here.

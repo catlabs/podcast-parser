@@ -20,6 +20,7 @@ rag.providers.get_*() when the first Azure variant lands.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from pathlib import Path
 from typing import Iterator, Protocol, Sequence, runtime_checkable
 
@@ -126,4 +127,26 @@ class ObjectStore(Protocol):
         ...
 
     def list(self, prefix: str) -> list[str]:
+        ...
+
+    def local_view(self, key: str) -> AbstractContextManager[Path]:
+        """Yield a readable local filesystem path for an existing object.
+
+        For libraries that require a real file (Whisper / ffprobe). For
+        LocalObjectStore the yielded path is the underlying file — no copy.
+        A future blob implementation downloads to a temp file and removes
+        it on exit.
+        """
+        ...
+
+    def staging_dir(self, prefix: str) -> AbstractContextManager[Path]:
+        """Yield a writable local directory rooted under `prefix`.
+
+        Use this when one logical unit produces several files of varying
+        types (audio + transcript, multi-format yt-dlp output). The entire
+        directory's contents are committed to the store under `prefix/...`
+        on exit. LocalObjectStore yields the real subdirectory under its
+        root — no copy, exit is a no-op. A future blob implementation
+        yields a tempdir and uploads everything under it on exit.
+        """
         ...

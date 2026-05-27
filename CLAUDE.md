@@ -58,7 +58,8 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 7 (step 3) | done | Langfuse — app-level RAG spans (chat-request, router-classify, final-generation) |
 | 7 (step 4) | done | Langfuse — research-mode span hierarchy |
 | 7 (step 5) | done | Langfuse — context tags (session_id, user_id, feature) |
-| 8 | next | Azure Blob Storage |
+| 8a | done | Storage consumer rewire — rss/yt/ingest go through ObjectStore |
+| 8b | next | Azure Blob Storage (opt-in `AzureBlobObjectStore`) |
 | 9 | — | Azure AI Search |
 | 10 | — | Azure Speech |
 | 11 | — | async ingestion jobs |

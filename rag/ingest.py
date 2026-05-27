@@ -38,7 +38,7 @@ from rag.database import (
     upsert_episode,
 )
 from rag.embed import get_collection
-from rag.providers import get_embedding_provider
+from rag.providers import get_embedding_provider, get_object_store
 
 
 # ── Parsing ───────────────────────────────────────────────────────────────────
@@ -157,57 +157,60 @@ def ingest_file(
 
 # ── Full ingestion run ────────────────────────────────────────────────────────
 
-def ingest_all(output_dir: Path = OUTPUT_DIR, reindex: bool = False) -> dict:
+def ingest_all(reindex: bool = False) -> dict:
     """
-    Walk output_dir, find every .txt file, and index it.
+    Walk the object store, find every .txt transcript, and index it.
 
     Skips files already recorded in episode_models for ALL requested models
     unless reindex=True.
     Returns a summary: {"indexed": [...], "skipped": [...], "errors": [...]}.
     """
+    store      = get_object_store()
     model_keys = list(EMBED_MODELS.keys())
-    txt_files  = sorted(output_dir.rglob("*.txt"))
+    txt_keys   = sorted(k for k in store.list("") if k.endswith(".txt"))
 
-    if not txt_files:
-        print(f"No .txt files found in {output_dir}")
+    if not txt_keys:
+        print("No .txt files found in object store")
         return {"indexed": [], "skipped": [], "errors": []}
 
-    print(f"Found {len(txt_files)} transcript(s)\n")
+    print(f"Found {len(txt_keys)} transcript(s)\n")
 
     conn    = get_connection()
     init_db(conn)
     results: dict = {"indexed": [], "skipped": [], "errors": []}
 
-    for path in txt_files:
-        file_path = str(path)
+    for key in txt_keys:
+        with store.local_view(key) as path:
+            file_path = str(path)
+            name      = path.name
 
-        if not reindex and all(
-            episode_indexed_by_model(conn, file_path, key) for key in model_keys
-        ):
-            results["skipped"].append(path.name)
-            print(f"  –  {path.name!r}  (all models indexed, skipping)")
-            continue
+            if not reindex and all(
+                episode_indexed_by_model(conn, file_path, model) for model in model_keys
+            ):
+                results["skipped"].append(name)
+                print(f"  –  {name!r}  (all models indexed, skipping)")
+                continue
 
-        try:
-            counts = ingest_file(path, model_keys=model_keys)
-            n      = counts[DEFAULT_MODEL_KEY]
-            meta   = parse_transcript_path(path)
-            ep_id  = upsert_episode(
-                conn,
-                podcast     = meta["podcast"],
-                title       = meta["title"],
-                date        = meta["date"],
-                file_path   = file_path,
-                chunk_count = n,
-            )
-            for key in model_keys:
-                record_model_indexing(conn, ep_id, key)
+            try:
+                counts = ingest_file(path, model_keys=model_keys)
+                n      = counts[DEFAULT_MODEL_KEY]
+                meta   = parse_transcript_path(path)
+                ep_id  = upsert_episode(
+                    conn,
+                    podcast     = meta["podcast"],
+                    title       = meta["title"],
+                    date        = meta["date"],
+                    file_path   = file_path,
+                    chunk_count = n,
+                )
+                for model in model_keys:
+                    record_model_indexing(conn, ep_id, model)
 
-            results["indexed"].append({"file": path.name, "chunks": n})
-            print(f"  ✓  {path.name!r}  →  {n} chunks  ({', '.join(model_keys)})")
-        except Exception as exc:
-            results["errors"].append({"file": path.name, "error": str(exc)})
-            print(f"  ✗  {path.name!r}  →  ERROR: {exc}")
+                results["indexed"].append({"file": name, "chunks": n})
+                print(f"  ✓  {name!r}  →  {n} chunks  ({', '.join(model_keys)})")
+            except Exception as exc:
+                results["errors"].append({"file": name, "error": str(exc)})
+                print(f"  ✗  {name!r}  →  ERROR: {exc}")
 
     conn.close()
 

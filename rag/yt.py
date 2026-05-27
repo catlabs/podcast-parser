@@ -19,9 +19,10 @@ from typing import Callable
 import yt_dlp
 
 from transcribe import transcribe_audio
-from rag.config import DEFAULT_MODEL_KEY, EMBED_MODELS, OUTPUT_DIR
+from rag.config import DEFAULT_MODEL_KEY, EMBED_MODELS
 from rag.database import episode_exists_by_audio_url, record_model_indexing, upsert_episode
 from rag.ingest import ingest_file
+from rag.providers import get_object_store
 
 
 # ── Audio download ────────────────────────────────────────────────────────────
@@ -139,48 +140,53 @@ def ingest_youtube(
       step_cb("indexing")
 
     Returns (chunk_count, loaded_model).
+
+    All filesystem I/O is mediated by an ObjectStore. The staging_dir context
+    covers download + transcript so a future blob backend can upload both as
+    one atomic unit.
     """
-    output_dir = OUTPUT_DIR / "youtube"
-    file_stem  = _safe_stem(title)
+    store     = get_object_store()
+    file_stem = _safe_stem(title)
 
-    # 1. Download with per-percent progress
-    step_cb("downloading", percent=0)
+    with store.staging_dir("youtube") as output_dir:
+        # 1. Download with per-percent progress
+        step_cb("downloading", percent=0)
 
-    def on_download_percent(pct: int) -> None:
-        step_cb("downloading", percent=pct)
+        def on_download_percent(pct: int) -> None:
+            step_cb("downloading", percent=pct)
 
-    audio_path = download_youtube_audio(url, output_dir, file_stem,
-                                        percent_cb=on_download_percent)
-    step_cb("downloading", percent=100)
+        audio_path = download_youtube_audio(url, output_dir, file_stem,
+                                            percent_cb=on_download_percent)
+        step_cb("downloading", percent=100)
 
-    # 2. Transcribe — emit audio duration as a hint so the UI can set expectations
-    audio_duration_s = _get_audio_duration(audio_path)
-    detail = _format_duration(audio_duration_s)
-    step_cb("transcribing", detail=detail if detail else None)
+        # 2. Transcribe — emit audio duration as a hint so the UI can set expectations
+        audio_duration_s = _get_audio_duration(audio_path)
+        detail = _format_duration(audio_duration_s)
+        step_cb("transcribing", detail=detail if detail else None)
 
-    text, loaded_model = transcribe_audio(audio_path, whisper_model, loaded_model)
+        text, loaded_model = transcribe_audio(audio_path, whisper_model, loaded_model)
 
-    # 3. Write transcript
-    transcript_path = output_dir / f"{file_stem}.txt"
-    transcript_path.write_text(text)
+        # 3. Write transcript
+        transcript_path = output_dir / f"{file_stem}.txt"
+        transcript_path.write_text(text)
 
-    # 4. Chunk + embed → ChromaDB + SQLite (all models)
-    step_cb("indexing")
-    model_keys  = list(EMBED_MODELS.keys())
-    counts      = ingest_file(transcript_path, model_keys=model_keys)
-    chunk_count = counts[DEFAULT_MODEL_KEY]
+        # 4. Chunk + embed → ChromaDB + SQLite (all models)
+        step_cb("indexing")
+        model_keys  = list(EMBED_MODELS.keys())
+        counts      = ingest_file(transcript_path, model_keys=model_keys)
+        chunk_count = counts[DEFAULT_MODEL_KEY]
 
-    ep_id = upsert_episode(
-        conn,
-        podcast     = "YouTube",
-        title       = title,
-        date        = None,
-        file_path   = str(transcript_path),
-        chunk_count = chunk_count,
-        audio_url   = url,
-    )
-    for key in model_keys:
-        record_model_indexing(conn, ep_id, key)
+        ep_id = upsert_episode(
+            conn,
+            podcast     = "YouTube",
+            title       = title,
+            date        = None,
+            file_path   = str(transcript_path),
+            chunk_count = chunk_count,
+            audio_url   = url,
+        )
+        for key in model_keys:
+            record_model_indexing(conn, ep_id, key)
 
     return chunk_count, loaded_model
 
