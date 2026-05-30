@@ -988,6 +988,158 @@ silent re-ingest.
 
 ---
 
+## Step 8b — `AzureBlobObjectStore` (opt-in)
+
+Mirrors Step 5 (Azure chat) and Step 6b (Azure embeddings) for the
+storage layer. Adds a second `ObjectStore` implementation backed by
+Azure Blob Storage. Activation is gated on two non-sensitive env vars;
+absent them, the factory still returns `LocalObjectStore` and nothing
+about local development changes.
+
+### What ships
+
+- **`rag/azure_blob.py`** — new `AzureBlobObjectStore` class.
+  Constructor takes `(account, container)` and builds a
+  `BlobServiceClient` with `DefaultAzureCredential()`. All eight
+  `ObjectStore` methods are implemented:
+  - `read_text` / `write_text` / `read_bytes` / `write_bytes` map
+    directly to `BlobClient.download_blob().readall()` and
+    `upload_blob(..., overwrite=True)`.
+  - `exists(key)` calls `BlobClient.exists()` (handles 404s internally).
+  - `list(prefix)` calls `ContainerClient.list_blobs(name_starts_with=...)`
+    and returns blob names.
+  - `local_view(key)` streams the blob into `<tempdir>/<key>`,
+    preserving the key's directory structure so callers that inspect
+    `path.parent.name` (`rag/ingest.py:parse_transcript_path`) see the
+    same `Podcast/episode.txt` shape they would locally. Tempdir is
+    removed on context exit.
+  - `staging_dir(prefix)` yields a fresh tempdir; on **successful**
+    exit walks `rglob("*")` and uploads each file to
+    `<prefix>/<relpath>`. If the body raises, the yield re-raises
+    before the upload loop runs — a half-finished episode never lands
+    in the container.
+- **`rag/providers.py`** — `get_object_store()` is now env-gated:
+  - Both `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_CONTAINER` set →
+    `AzureBlobObjectStore`.
+  - Otherwise → `LocalObjectStore(root=OUTPUT_DIR)`.
+  - The Azure module is imported lazily inside the gate, so local
+    setups never load `azure-storage-blob` / `azure-identity`.
+- **`rag/config.py`** — adds `AZURE_STORAGE_ACCOUNT` and
+  `AZURE_STORAGE_CONTAINER` reads (both `.strip()`-ed, default empty).
+- **`requirements.txt`** — adds `azure-storage-blob` and
+  `azure-identity` under a new "Storage providers" section. The
+  comment explicitly calls out the opt-in gate and the no-secrets
+  rule.
+- **`.env.agent-safe`** — adds commented-out examples for both vars
+  under the existing Azure block, with a paragraph explaining the
+  `DefaultAzureCredential` auth model and the "no connection strings,
+  no account keys in any env file" rule.
+
+### Auth model — non-negotiable
+
+`DefaultAzureCredential` only. The auth chain tries, in order:
+
+1. Environment variables (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` +
+   `AZURE_CLIENT_SECRET`, or workload-identity vars in AKS).
+2. Managed Identity (when running inside an Azure VM, Container App,
+   App Service, etc.).
+3. Azure CLI (`az login` token cache — the local-dev path).
+4. Azure PowerShell / Developer CLI / Visual Studio (rarely used here).
+
+**Not supported**: connection strings, account keys, SAS tokens. The
+project rule (see `.claude/memory/feedback_no_dotenv_reads.md`) is
+that long-lived credentials must not enter `.env` — they live in Key
+Vault, the macOS Keychain, or the user's CLI session.
+
+### Local-dev workflow
+
+```bash
+# One-time
+az login                                # opens browser
+az account set --subscription <name>    # optional, picks the sub
+
+# Per-shell (opt in)
+export AZURE_STORAGE_ACCOUNT=mystorageacct
+export AZURE_STORAGE_CONTAINER=podcast-transcripts
+
+# Or commit the two var names (not values) to .env.agent-safe for a
+# whole team — they are public resource identifiers, not credentials.
+```
+
+The token is fetched from the `az` cache transparently the first time
+a blob method is called. No env-var key, no provisioned SP.
+
+### Smoke tests (validated)
+
+```bash
+# 1. Default factory still returns LocalObjectStore.
+.venv/bin/python -c "
+from rag.providers import get_object_store
+from rag.storage import LocalObjectStore
+assert isinstance(get_object_store(), LocalObjectStore)
+print('local default unchanged')
+"
+
+# 2. AzureBlobObjectStore exposes the full ObjectStore surface.
+.venv/bin/python -c "
+from rag.azure_blob import AzureBlobObjectStore
+required = {'read_text','write_text','read_bytes','write_bytes',
+            'exists','list','local_view','staging_dir'}
+missing = required - set(dir(AzureBlobObjectStore))
+assert not missing, missing
+print('protocol complete')
+"
+
+# 3. Env gate routes correctly.
+AZURE_STORAGE_ACCOUNT=x AZURE_STORAGE_CONTAINER=y .venv/bin/python -c "
+from rag.providers import get_object_store
+assert type(get_object_store()).__name__ == 'AzureBlobObjectStore'
+print('env gate works')
+"
+
+# 4. Local ingest skip-list is unchanged.
+.venv/bin/python -m rag.ingest
+# expect: indexed=0  skipped=12  errors=0
+```
+
+The end-to-end Azure smoke test (upload an mp3 via the YouTube path,
+re-ingest via `local_view`) is left for the first real user that
+sets the env vars — it requires `az login` and a real storage
+account, neither of which the agent can or should provision.
+
+### What did NOT change in Step 8b
+
+- `LocalObjectStore` — same code as Step 8a. Local development is the
+  default path; Azure is purely additive behind an env gate.
+- The `ObjectStore` protocol — already extended in Step 8a with
+  `local_view` and `staging_dir`. No new interface methods.
+- `rss.py` / `yt.py` / `ingest.py` — consumers stay protocol-only;
+  they have no idea whether the store is local or remote.
+- SQLite schema, Chroma collections, embeddings, chunking, the API
+  surface, the UI — none touched.
+- `transcribe.py` CLI at project root — still independent of the
+  factory (Step 8a observation still applies).
+
+### Hazards to watch for the first real Azure run
+
+- **`local_view` cost on every ingest.** `rag/ingest.py:ingest_all`
+  calls `local_view(key)` for every `.txt` file just to compute the
+  skip check. With a blob backend that means a full download per
+  episode on every cron / manual re-ingest, even when no work is
+  done. Acceptable for tens of files; revisit when the catalog grows
+  by an order of magnitude (e.g. add a metadata-only fast path on
+  the store, or pre-load the SQLite skip set before walking).
+- **`parse_transcript_path` on a top-level stray.** A blob key with
+  no `/` lands at the tempdir root, and `path.parent.name` becomes
+  the tempdir's auto-generated suffix instead of `"unknown"`. The
+  active dataset has no such files, but a future bulk import should
+  enforce the `<podcast>/<title>.txt` shape.
+- **`exists()` is N+1.** A future skip-set optimisation that calls
+  `exists()` per blob will hit one HTTP round-trip per key; prefer
+  a single `list()` and a Python-side `set` membership check.
+
+---
+
 ## Out of scope (later steps)
 
-Azure Blob, Azure Speech, Azure AI Search — none introduced here.
+Azure Speech, Azure AI Search — none introduced here.

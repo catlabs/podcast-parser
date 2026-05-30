@@ -70,7 +70,23 @@ def get_speech_transcriber(model: str = "medium") -> SpeechTranscriber:
 
 
 def get_object_store() -> ObjectStore:
-    """Return an ObjectStore rooted at OUTPUT_DIR (filesystem today)."""
-    from rag.config import OUTPUT_DIR
+    """Return an ObjectStore.
+
+    Routes to AzureBlobObjectStore when both AZURE_STORAGE_ACCOUNT and
+    AZURE_STORAGE_CONTAINER are set (Step 8b, opt-in). Otherwise returns
+    LocalObjectStore rooted at OUTPUT_DIR. Local mode is the default — no
+    Azure dependency is imported until the env gate is satisfied.
+    """
+    from rag.config import (
+        AZURE_STORAGE_ACCOUNT,
+        AZURE_STORAGE_CONTAINER,
+        OUTPUT_DIR,
+    )
+    if AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_CONTAINER:
+        from rag.azure_blob import AzureBlobObjectStore
+        return AzureBlobObjectStore(
+            account   = AZURE_STORAGE_ACCOUNT,
+            container = AZURE_STORAGE_CONTAINER,
+        )
     from rag.storage import LocalObjectStore
     return LocalObjectStore(root=OUTPUT_DIR)

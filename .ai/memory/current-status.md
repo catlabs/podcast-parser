@@ -4,7 +4,7 @@ Single source of truth for "where are we right now". Read this first in
 a new session. Append a dated entry when you finish a milestone; do not
 rewrite history.
 
-## Snapshot (last update 2026-05-27, Step 8a)
+## Snapshot (last update 2026-05-30, Step 8b)
 
 - **Provider abstractions** in place: `rag/interfaces.py` defines five
   protocols (Chat, Embedding, VectorStore, Speech, ObjectStore);
@@ -45,8 +45,8 @@ rewrite history.
 | 6d. Backfill safety rails | done |
 | 7. Langfuse observability (steps 1–5) | done |
 | 8a. ObjectStore consumer rewire | done |
-| 8b. Azure Blob Storage | next |
-| 9. Azure AI Search | — |
+| 8b. Azure Blob Storage | done |
+| 9. Azure AI Search | next |
 | 10. Azure Speech | — |
 | 11. Async ingestion jobs | — |
 | 12. Deployment | — |
@@ -56,8 +56,10 @@ rewrite history.
 - **Azure AI Search**: Chroma still hosts every vector, including
   Azure-embedded ones. The swap to Azure AI Search would replace
   the `VectorStore` implementation only.
-- **Azure Blob**: transcripts and audio still live on the local
-  filesystem under `OUTPUT_DIR`.
+- **Azure Blob**: provider implemented (Step 8b) — opt-in via
+  `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_CONTAINER`, auth via
+  `DefaultAzureCredential` only. Local default unchanged; no transcripts
+  uploaded automatically.
 - **Azure Speech**: transcription is still local Whisper.
 - (Langfuse is now wired end-to-end through step 5 — see appendable log.)
 
@@ -125,3 +127,21 @@ walks via `store.list("")` and `local_view`. Behaviour identical to
 pre-rewire; smoke run confirms 12/12 episodes skipped. Next migration
 step is **Step 8b: AzureBlobObjectStore** (opt-in Azure provider, auth
 via `DefaultAzureCredential` only — no connection strings).
+
+2026-05-30 — Step 8b wired: AzureBlobObjectStore. New `rag/azure_blob.py`
+implements the full ObjectStore protocol against Azure Blob Storage; auth
+is `DefaultAzureCredential` only (Managed Identity → `az login` → env),
+no connection strings and no account keys in any `.env` file. Activation
+gate is presence of `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_CONTAINER`,
+both non-sensitive and committed to `.env.agent-safe` (still commented
+out by default). `local_view(key)` streams the blob to a tempdir
+preserving the key prefix so `parse_transcript_path` keeps reading
+`path.parent.name` correctly; `staging_dir(prefix)` yields a tempdir and
+uploads every file beneath it on successful exit (skip on exception, so
+a half-finished episode never pollutes the container). `rag/providers.py`
+dispatches to the Azure impl only when both env vars are set — local
+default unchanged. `requirements.txt` gains `azure-storage-blob` and
+`azure-identity`. Smoke: local factory still returns `LocalObjectStore`,
+ingest still skips 12/12; env-gated dispatch confirmed via test override.
+Next migration step is **Step 9: Azure AI Search** (replace the
+`VectorStore` impl, keep Chroma as the local default).

@@ -116,6 +116,14 @@ AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-2
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT = os.environ.get("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "")
 AZURE_OPENAI_EMBEDDING_COLLECTION = os.environ.get("AZURE_OPENAI_EMBEDDING_COLLECTION", "podcasts_azure")
 
+# Azure Blob Storage — opt-in (Step 8b). Presence of BOTH vars routes the
+# ObjectStore factory to AzureBlobObjectStore; otherwise LocalObjectStore is
+# used. Auth is DefaultAzureCredential only — no connection strings, no
+# account keys in .env. Both values are non-sensitive resource identifiers,
+# so they live in .env.agent-safe.
+AZURE_STORAGE_ACCOUNT   = os.environ.get("AZURE_STORAGE_ACCOUNT", "").strip()
+AZURE_STORAGE_CONTAINER = os.environ.get("AZURE_STORAGE_CONTAINER", "").strip()
+
 
 @dataclass(frozen=True)
 class LLMConfig:

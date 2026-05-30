@@ -28,3 +28,11 @@ langgraph
 # Opt-in: tracing is no-op unless LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
 # are set in .env. See MIGRATION.md Step 10 and .ai/README.md for details.
 langfuse
+
+# ── Storage providers ────────────────────────────────────────────────────────
+# Opt-in: AzureBlobObjectStore loads only when AZURE_STORAGE_ACCOUNT +
+# AZURE_STORAGE_CONTAINER are set. Auth uses DefaultAzureCredential
+# (Managed Identity → az login → env baseline). No connection strings,
+# no account keys in any env file.
+azure-storage-blob
+azure-identity

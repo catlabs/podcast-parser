@@ -59,8 +59,8 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 7 (step 4) | done | Langfuse — research-mode span hierarchy |
 | 7 (step 5) | done | Langfuse — context tags (session_id, user_id, feature) |
 | 8a | done | Storage consumer rewire — rss/yt/ingest go through ObjectStore |
-| 8b | next | Azure Blob Storage (opt-in `AzureBlobObjectStore`) |
-| 9 | — | Azure AI Search |
+| 8b | done | Azure Blob Storage (opt-in `AzureBlobObjectStore`, `DefaultAzureCredential` only) |
+| 9 | next | Azure AI Search |
 | 10 | — | Azure Speech |
 | 11 | — | async ingestion jobs |
 | 12 | — | deployment |
@@ -73,6 +73,7 @@ cd ui && npm run dev                                  # http://localhost:5173
 | `rag/providers.py` | Factory — returns local or Azure impl based on env vars |
 | `rag/config.py` | All env-var reading and `LLM_REGISTRY` |
 | `rag/azure_openai.py` | `AzureOpenAIChatProvider` (Step 5) + `AzureOpenAIEmbeddingProvider` (Step 6b) |
+| `rag/azure_blob.py` | `AzureBlobObjectStore` (Step 8b, `DefaultAzureCredential` only) |
 | `rag/storage.py` | `LocalObjectStore` |
 | `rag/llm.py` | `LocalChatProvider` + raw `generate`/`generate_stream` |
 | `rag/embed.py` | `LocalEmbeddingProvider` + `LocalVectorStore` |
@@ -100,5 +101,9 @@ Active (Steps 1–6):
 | `AZURE_OPENAI_DEPLOYMENT` | — | Chat-only — chat deployment name (NOT model name) |
 | `AZURE_OPENAI_EMBEDDING_DEPLOYMENT` | — | Embeddings-only — presence enables the `azure-openai` embed key |
 | `AZURE_OPENAI_EMBEDDING_COLLECTION` | `podcasts_azure` | Embeddings-only — Chroma collection (use a unique name per deployment if vector dim changes) |
+| `AZURE_STORAGE_ACCOUNT` | — | Blob storage — storage account name; presence (with container) routes ObjectStore to Azure |
+| `AZURE_STORAGE_CONTAINER` | — | Blob storage — container name; both vars are non-sensitive and live in `.env.agent-safe` |
 
-Reserved (not active yet): `AZURE_STORAGE_*`, `AZURE_SEARCH_*`, `AZURE_SPEECH_*`.
+Auth for `AZURE_STORAGE_*` uses `DefaultAzureCredential` (Managed Identity in Azure → `az login` locally → env baseline). Do NOT add `AZURE_STORAGE_ACCESS_KEY` or connection strings — credentials must never enter `.env`.
+
+Reserved (not active yet): `AZURE_SEARCH_*`, `AZURE_SPEECH_*`.
