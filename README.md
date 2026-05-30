@@ -36,6 +36,7 @@ rag/
   interfaces.py          Protocol contracts: Chat / Embedding / VectorStore / Speech / ObjectStore
   providers.py           factory: returns local or Azure impl based on env vars
   azure_openai.py        AzureOpenAIChatProvider + AzureOpenAIEmbeddingProvider (opt-in)
+  azure_blob.py          AzureBlobObjectStore (opt-in, DefaultAzureCredential only)
   storage.py             LocalObjectStore (filesystem-backed ObjectStore)
   embed.py               embedding model/collection registry (lazy-loaded, shared ChromaDB client)
   llm.py                 LocalChatProvider + Anthropic / OpenAI / Ollama dispatch
@@ -145,9 +146,7 @@ brew install ffmpeg
 python3 -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install feedparser requests openai-whisper sentence-transformers \
-            chromadb fastapi uvicorn python-dotenv anthropic openai yt-dlp \
-            langgraph
+pip install -r requirements.txt
 ```
 
 Copy the environment file and fill in the keys for the providers you want to use:
@@ -198,6 +197,46 @@ python -m rag.backfill --target azure-openai
 
 GPT-5 / o-series chat deployments (e.g. `gpt-5.2-chat`) require API version `2024-12-01-preview` or newer. The chat provider sends `max_completion_tokens` (the parameter that current Azure models accept).
 
+#### Azure Blob Storage (optional, opt-in)
+
+Routes transcripts and audio to an Azure Blob container instead of the local `OUTPUT_DIR`. Activation is gated on **both** vars being set; without them, the factory still returns `LocalObjectStore` and nothing changes.
+
+```env
+AZURE_STORAGE_ACCOUNT=<storage-account-name>
+AZURE_STORAGE_CONTAINER=<container-name>
+```
+
+Auth is `DefaultAzureCredential` only — Managed Identity in Azure → `az login` for local dev → env-based credentials as a baseline. **No connection strings, no account keys, no SAS tokens.** Long-lived credentials must not enter `.env`.
+
+The signed-in identity needs the **`Storage Blob Data Contributor`** role on the account or container (NOT `Storage Account Contributor` — that's a management-plane role and does not grant blob read/write).
+
+```bash
+# One-time, locally
+az login
+OBJECT_ID=$(az ad signed-in-user show --query id -o tsv)
+ACCOUNT_ID=$(az storage account show \
+  --name <account-name> --resource-group <rg> --query id -o tsv)
+az role assignment create \
+  --assignee-object-id "$OBJECT_ID" \
+  --assignee-principal-type User \
+  --role "Storage Blob Data Contributor" \
+  --scope "$ACCOUNT_ID"
+```
+
+Quick wiring check:
+
+```bash
+.venv/bin/python -c "
+from rag.providers import get_object_store
+s = get_object_store()
+print(type(s).__name__)                 # → AzureBlobObjectStore
+s.write_text('smoke-test.txt', 'hello')
+print(s.read_text('smoke-test.txt'))
+"
+```
+
+If you get `AuthorizationPermissionMismatch`, the role assignment hasn't propagated yet — wait ~60s and retry.
+
 #### UI defaults (optional)
 
 Pin which entries the toolbar selectors are pre-selected to. Unknown keys silently fall back to `minilm` / `claude-sonnet-4-5`. These only affect the `/config` payload — they do not change the baseline backfill source or the LLM-registry fallback.
@@ -235,13 +274,29 @@ chat-request                          custom — query, top_k, intent, n_chunks,
     └── azure-chat-completion         auto    — raw SDK call, token usage
 ```
 
+Research mode (both the custom orchestrator and the LangGraph variant) emits a parallel tree:
+
+```
+research-request                      custom — query, mode, n_sub_queries, n_episodes
+├── research-plan                     custom — Query Planner LLM call
+├── research-search                   custom — fan-out semantic_search() per sub-query
+│   └── retrieval × N                 custom — one child per sub-query (with embedding obs underneath)
+├── research-analyze × N              custom — per-episode analysis LLM calls
+├── research-synthesize               custom — cross-episode answer (streamed)
+└── research-ground                   custom — grounding-critic LLM call
+```
+
+The fan-out in `research-search` runs under `ThreadPoolExecutor`; the workers `contextvars.copy_context().run(...)` themselves so retrieval spans inside worker threads nest under `research-search` instead of becoming orphan roots.
+
+Every trace carries `user_id` / `session_id` / `feature` context. The UI generates a `session_id` per page load and persists a `user_id` in `localStorage`; CLI / curl traffic falls back to `LANGFUSE_DEFAULT_USER_ID` (default `local-user`). `feature` is one of `chat`, `chat-compare`, `research`, `research-graph`, and is also stored as `metadata.feature` so you can filter / group on it in Langfuse.
+
 Heads-up on the auto SDK observations: the `langfuse.openai` drop-in tags every patched call as `as_type="generation"`, including embedding calls. Langfuse's UI then shows chat-message fields (`role`, `content`, `tools`) as undefined for those embedding observations. That's expected — the custom `retrieval` span above it carries the readable metadata. Token usage on the embedding observation is still correct.
 
 For the cleanest token-usage capture on the chat-completion side, run with streaming off (`ENABLE_LLM_STREAMING=false` in `.env`).
 
 Privacy: chunk text is never logged. The full system+user prompt is hidden by default in the `final-generation` span input; flip `LANGFUSE_LOG_FULL_PROMPTS=true` (in `.env`, overriding the agent-safe default) for one-off prompt debugging. The auto SDK observation underneath still carries the raw message array regardless — that's a Langfuse-side decision.
 
-Not traced today and explicitly deferred: research-mode span hierarchy (planner → search → analyst → synthesizer → grounder as nested spans), context tags (`session_id`, `user_id`, `feature`), and a `mask=` callback for PII scrubbing. The bootstrap module (`rag/observability.py`) is the single hook point when those land.
+Still deferred: a `mask=` callback for PII scrubbing inside captured content. The bootstrap module (`rag/observability.py`) is the single hook point when that lands.
 
 ### Frontend
 
@@ -356,15 +411,31 @@ python -m rag.eval --top 5 --model azure-openai     # single model
 
 ## Output layout
 
+Local mode (default):
+
 ```
 output/
   Podcast Name/
     YYYY-MM-DD_episode_title.mp3
     YYYY-MM-DD_episode_title.txt
 rag/data/
-  chroma/        ChromaDB vector store (podcasts + podcasts_multilingual)
-  episodes.db    SQLite metadata
+  chroma/        ChromaDB vector store (podcasts + podcasts_multilingual [+ podcasts_azure])
+  metadata.db    SQLite metadata
 ```
+
+Azure Blob mode (when `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_CONTAINER` are set):
+
+```
+<container>/
+  Podcast Name/
+    YYYY-MM-DD_episode_title.mp3
+    YYYY-MM-DD_episode_title.txt
+  youtube/
+    <safe-title>.mp3
+    <safe-title>.txt
+```
+
+The vector store and SQLite metadata stay under `rag/data/` either way — only the `ObjectStore` (transcripts + audio) is swapped. Step 9 (Azure AI Search) is what would move the vectors off the local filesystem.
 
 ---
 
@@ -378,3 +449,6 @@ rag/data/
 - **Ollama not reachable** — ensure `ollama serve` is running and `OLLAMA_BASE_URL` points to it; run `ollama pull <model>` if the model isn't installed.
 - **SQLite threading errors** — always create connections inside the thread that uses them; never pass a connection across threads.
 - **Langfuse traces missing** — confirm both `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set (the bootstrap requires both), confirm `LANGFUSE_ENABLED` is not `false`, and check `LANGFUSE_HOST` matches your project's region (EU vs US vs self-hosted). The lifespan flush on uvicorn shutdown is what drains the last buffered traces — if you `kill -9` uvicorn, those traces are lost. For CLI scripts, the `atexit` flush in `rag/observability.py` covers normal exits.
+- **Langfuse `user_id` column empty** — happens when traces fire before `propagate_attributes(...)` is entered. The fix is already in place (`trace_context()` in `rag/observability.py` wraps the whole request span); if you add a new endpoint, make sure to open `trace_context(...)` *before* any child spans for the request, not after.
+- **Azure Blob `AuthorizationPermissionMismatch`** — the signed-in identity is missing the `Storage Blob Data Contributor` role at the account or container scope. Re-check with `az role assignment list --assignee $(az ad signed-in-user show --query id -o tsv) --all`. Don't use `Storage Account Contributor`; that's a management-plane role and does not grant data-plane access.
+- **Azure Blob `DefaultAzureCredential failed to retrieve a token`** — `az login` token expired or the wrong subscription is active. Re-run `az login` and `az account set --subscription <name>`.
