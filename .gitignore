@@ -32,3 +32,8 @@ dist/
 
 # Per-developer agent scratchpad — see .ai/README.md
 .ai/memory/personal/
+
+# Per-developer agent local context — see .ai/README.md
+# Sibling .local.md files complement public agent contracts with
+# personal/situational info (employer, mission, secret-adjacent context).
+.ai/agents/*.local.md

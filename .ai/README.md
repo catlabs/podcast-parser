@@ -14,6 +14,7 @@ other AI helper. None of these files contain secrets.
 | **project knowledge** | `CLAUDE.md`, `README.md`, `MIGRATION.md`, source code | yes | yes |
 | **shared context** | this directory (`.ai/`) | yes (read; write rules below) | yes |
 | **per-developer scratch** | `.ai/memory/personal/**` | only the developer's own agent | gitignored |
+| **agent-local context** | `.ai/agents/*.local.md` — personal context that complements a public agent contract (employer, mission, secret-adjacent details) | only the developer's own agent | gitignored |
 | **runtime data** | `output/`, `rag/data/` | only when explicitly asked | gitignored |
 
 ## Boundary mechanics
@@ -105,3 +106,19 @@ on the factory, not a refactor across every call site.
 4. Reference the role from your tool's own agent config (e.g.
    `.claude/agents/<role-name>.md` can be a thin wrapper that includes
    the contract by reference).
+
+### Public contract vs local context
+
+When an agent's role depends on personal or situational context that
+shouldn't be public (employer, mission, sector-specific constraints,
+non-secret-but-private details), use a two-layer pattern:
+
+- `.ai/agents/<role-name>.md` — public, committed, sector-agnostic
+- `.ai/agents/<role-name>.local.md` — private, gitignored, personal
+  context that completes the public contract
+
+The public file should reference the `.local.md` sibling explicitly so
+future agents know to read both. The `.gitignore` pattern
+`.ai/agents/*.local.md` covers all such files. Agents must never quote
+`.local.md` content verbatim in publishable surfaces (PR descriptions,
+commit messages, issue comments).
