@@ -26,6 +26,8 @@ from __future__ import annotations
 import logging
 from typing import Iterator, Sequence
 
+from opentelemetry.trace import Status as _OtStatus, StatusCode as _OtStatusCode
+
 from rag.config import (
     AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_API_VERSION,
@@ -33,8 +35,45 @@ from rag.config import (
     AZURE_OPENAI_ENDPOINT,
     ENABLE_LLM_STREAMING,
 )
+# Pure-OTel side track (warm-up step C). Same shape as in `rag/llm.py`:
+# the ContextVar `_OTEL_CHAT_SPAN` is published by the provider so the
+# usage-capture helper writes to *our* OTel span regardless of what is
+# "current" in the OTel context (Langfuse SDK's auto-traced OpenAI-chat
+# span opens on top of ours during the API call). The cross-module
+# import is a deliberate temporary smell — the contextvar should move
+# to `rag/otel.py` once a third provider also needs it.
+from rag.llm import _OTEL_CHAT_SPAN
+from rag.otel import get_tracer as _get_otel_tracer
 
 log = logging.getLogger(__name__)
+
+# Canonical OTel GenAI semantic-convention identifier for Azure OpenAI.
+# Used as the `gen_ai.system` attribute — the OTel registry distinguishes
+# `az.ai.openai` (Azure OpenAI Service) from `az.ai.inference` (Azure AI
+# Inference Service) and from plain `openai` (api.openai.com).
+_GEN_AI_SYSTEM = "az.ai.openai"
+
+
+def _otel_set_azure_usage(response) -> None:
+    """Stamp canonical gen_ai.usage.* / response.* attributes on the
+    `AzureOpenAIChatProvider` OTel span published by `_OTEL_CHAT_SPAN`.
+    Mirror of `_otel_set_anthropic_usage` in rag/llm.py with OpenAI
+    field names (`prompt_tokens` / `completion_tokens`). No-op when
+    nothing is published (OTEL_ENABLED=false, or called outside the
+    provider)."""
+    span = _OTEL_CHAT_SPAN.get()
+    if span is None or not span.is_recording():
+        return
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        span.set_attribute("gen_ai.usage.input_tokens",  usage.prompt_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", usage.completion_tokens)
+    resp_id    = getattr(response, "id", None)
+    resp_model = getattr(response, "model", None)
+    if resp_id:
+        span.set_attribute("gen_ai.response.id",    resp_id)
+    if resp_model:
+        span.set_attribute("gen_ai.response.model", resp_model)
 
 
 def _log_azure_bad_request(exc, *, messages, **params) -> None:
@@ -136,53 +175,97 @@ class AzureOpenAIChatProvider:
         return self._client
 
     def generate(self, system: str, user: str) -> str:
+        # Pure-OTel instrumentation (warm-up step C). Mirror of
+        # `LocalChatProvider.generate`: span name `chat {deployment}` and
+        # the OTel GenAI canonical attribute set. The deployment name is
+        # what the caller specifies on Azure (the actual model lands in
+        # `gen_ai.response.model`, set by `_otel_set_azure_usage`).
         from openai import BadRequestError
         client   = self._ensure_client()
         messages = [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
-        try:
-            response = client.chat.completions.create(
-                model                 = AZURE_OPENAI_DEPLOYMENT,
-                messages              = messages,
-                max_completion_tokens = 1024,
-            )
-        except BadRequestError as exc:
-            _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024)
-            raise
-        return response.choices[0].message.content or ""
+        tracer = _get_otel_tracer()
+        with tracer.start_as_current_span(f"chat {AZURE_OPENAI_DEPLOYMENT}") as span:
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.system",         _GEN_AI_SYSTEM)
+            span.set_attribute("gen_ai.request.model",  AZURE_OPENAI_DEPLOYMENT)
+            token = _OTEL_CHAT_SPAN.set(span)
+            try:
+                try:
+                    response = client.chat.completions.create(
+                        model                 = AZURE_OPENAI_DEPLOYMENT,
+                        messages              = messages,
+                        max_completion_tokens = 1024,
+                    )
+                except BadRequestError as exc:
+                    _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024)
+                    raise
+                _otel_set_azure_usage(response)
+                return response.choices[0].message.content or ""
+            finally:
+                _OTEL_CHAT_SPAN.reset(token)
 
     def generate_stream(self, system: str, user: str) -> Iterator[str]:
         # When streaming is disabled, route through the non-streaming path
         # so the Azure response carries usage data and Langfuse/OTel can
-        # capture token counts. The generator API stays intact for callers.
+        # capture token counts. `self.generate` is already wrapped with an
+        # OTel span (step C), so this branch inherits it — no double-wrap.
         if not ENABLE_LLM_STREAMING:
             yield self.generate(system, user)
             return
 
+        # Streaming-symmetric wrap (warm-up step C, mirror of
+        # `LocalChatProvider.generate_stream` from step B): same gen_ai.*
+        # canonical attribute set, same `_OTEL_CHAT_SPAN` handoff, same
+        # generator-lifetime span via the inner `_stream()`. Usage capture
+        # on the streaming chunks would require `stream_options={
+        # "include_usage": True}` at call time — deferred to a later step.
         from openai import BadRequestError
         client   = self._ensure_client()
         messages = [
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
-        try:
-            stream = client.chat.completions.create(
-                model                 = AZURE_OPENAI_DEPLOYMENT,
-                messages              = messages,
-                max_completion_tokens = 1024,
-                stream                = True,
-            )
-        except BadRequestError as exc:
-            _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024, stream=True)
-            raise
-        for chunk in stream:
-            if not chunk.choices:
-                continue
-            text = chunk.choices[0].delta.content
-            if text:
-                yield text
+        tracer = _get_otel_tracer()
+
+        def _stream() -> Iterator[str]:
+            with tracer.start_as_current_span(
+                f"chat {AZURE_OPENAI_DEPLOYMENT}",
+                record_exception        = False,
+                set_status_on_exception = False,
+            ) as span:
+                span.set_attribute("gen_ai.operation.name", "chat")
+                span.set_attribute("gen_ai.system",         _GEN_AI_SYSTEM)
+                span.set_attribute("gen_ai.request.model",  AZURE_OPENAI_DEPLOYMENT)
+                token = _OTEL_CHAT_SPAN.set(span)
+                try:
+                    try:
+                        stream = client.chat.completions.create(
+                            model                 = AZURE_OPENAI_DEPLOYMENT,
+                            messages              = messages,
+                            max_completion_tokens = 1024,
+                            stream                = True,
+                        )
+                    except BadRequestError as exc:
+                        _log_azure_bad_request(exc, messages=messages,
+                                               max_completion_tokens=1024, stream=True)
+                        raise
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        text = chunk.choices[0].delta.content
+                        if text:
+                            yield text
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(_OtStatus(_OtStatusCode.ERROR, str(exc)))
+                    raise
+                finally:
+                    _OTEL_CHAT_SPAN.reset(token)
+
+        yield from _stream()
 
 
 # ── Embeddings ───────────────────────────────────────────────────────────────
