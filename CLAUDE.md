@@ -12,6 +12,50 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
 - Prefer provider abstractions (protocols in `rag/interfaces.py`, factory in `rag/providers.py`).
 - Every step must be testable locally before enabling Azure.
 
+## Long-term architecture target
+
+Beyond the Azure migration (Steps 1–12), this project is an **apprenticeship
+terrain for production-grade multi-agent systems** in an enterprise
+production context. The 12–18 month target architecture is:
+
+- Specialized agents per responsibility (ingester, chunker, retriever,
+  synthesizer, critic) — each individually **observable, evaluable,
+  versionable, deployable**.
+- An **orchestrator** (supervisor or graph router) coordinating them.
+- **MCP** as the open interop protocol between agents and tools.
+- **Azure-native runtime** (Azure AI Foundry Agent Service, Semantic Kernel,
+  or Container Apps).
+- Each agent governed by **Azure AI Content Safety**, audited via
+  **Application Insights + Azure AI Foundry tracing** (over OpenTelemetry),
+  evaluated via **Azure AI Evaluation SDK**.
+
+The research-mode (`rag/research.py` + `rag/research_graph.py`) is the
+in-process seed of this architecture — 5 implicit agents already exist
+and will be formalized first.
+
+Every product decision should ask: *"does this push toward, or away from,
+the long-term multi-agent target?"* This vision drives the priority list
+in `.ai/agents/ai-mentor.md`.
+
+## Pedagogical phases (post Azure migration)
+
+Once Steps 1–12 are done, the project enters a maturation sequence. Each
+phase adds **one** new dimension of complexity (never more):
+
+| Phase | Focus | New complexity dimension |
+|-------|-------|---|
+| 0 | Foundations: OTel discipline, Azure migration, AI Foundry obs | Portable observability, Azure stack |
+| 1 | Multi-agent **in-process** formalized (research-mode) | Agent contracts, registry, per-agent obs |
+| 2 | Per-agent evaluation (dataset + scoring) | Granular eval discipline |
+| 3 | Per-agent prompt versioning + A/B | Agent lifecycle (LLMOps) |
+| 4 | Extract one agent as remote service (Azure Function / Container App) | Process boundary, AgentOps prod |
+| 5 | MCP as inter-agent protocol | Standard interop |
+| 6 | Managed multi-agent runtime (Foundry / Semantic Kernel) | Managed agent runtime |
+| 7 | Governance + security (Content Safety, audit logs, pen-test) | Production hardening (regulated-environment posture) |
+
+Phases 1+ are **not** promoted to concrete migration Steps yet — they will be,
+one at a time, as predecessors complete.
+
 ## AI tool roles
 
 - **ChatGPT**: architecture planning and Azure reasoning.
@@ -25,6 +69,7 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
 - Do not introduce Azure services unless explicitly requested by the user.
 - Do not remove or degrade local providers (`LocalChatProvider`, `LocalEmbeddingProvider`, `LocalVectorStore`, `LocalObjectStore`, `LocalSpeechTranscriber`).
 - **Never commit automatically.** Wait for an explicit instruction ("commit" / "commit the changes").
+- **Commit responsibility**: the agent whose session produced the changes is responsible for committing them, when the user explicitly requests. Avoid one agent committing another agent's work — provenance and commit message quality suffer. If multiple sessions have uncommitted changes, split into separate commits per agent.
 - Always provide a smoke-test command after any change.
 - Use `.venv/bin/python` and `.venv/bin/pip` directly — never `source .venv/bin/activate`.
 - **Respect agent boundaries.** Read `.ai/README.md` for file classifications. Default to `.env.agent-safe` for env knobs; do not read `.env` unless the user explicitly asks. Update `.ai/memory/current-status.md` (append-only) when a multi-session milestone completes.

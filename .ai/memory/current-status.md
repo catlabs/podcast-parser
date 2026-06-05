@@ -145,3 +145,33 @@ default unchanged. `requirements.txt` gains `azure-storage-blob` and
 ingest still skips 12/12; env-gated dispatch confirmed via test override.
 Next migration step is **Step 9: Azure AI Search** (replace the
 `VectorStore` impl, keep Chroma as the local default).
+
+2026-06-05 — Strategic recalibration via ai-mentor agent (`.ai/agents/ai-mentor.md`).
+Four decisions taken in-session, no code yet:
+  (1) Learning priorities reordered: Azure AI Foundry promoted to #1
+      (includes Azure AI Search); MCP demoted from #1 to #8 — the rationale
+      is that an MCP server exposing Azure AI Search as backend is more
+      representative of an enterprise regulated-environment RAG setup
+      than MCP over local Chroma.
+  (2) Long-term architecture target adopted: distributed multi-agent system
+      over Azure (orchestrator + specialist agents + MCP interop + Azure
+      AI Foundry runtime + Content Safety + governance). Documented in
+      `CLAUDE.md` under "Long-term architecture target" and "Pedagogical
+      phases". This is the lens for every future product decision.
+  (3) New milestone inserted before Step 9: **OTel warm-up refactor**.
+      Migrate Langfuse instrumentation from direct SDK calls to OpenTelemetry
+      GenAI semantic conventions, with Langfuse as the OTLP backend. Goal:
+      backend-agnostic instrumentation, prepares dual-emit to Azure AI
+      Foundry later. Cadrage 9-étapes complet en session.
+  (4) **Azure AI Foundry milestone** scope-locked (executed after Step 9,
+      detail deferred): dual-emit obs (Langfuse + Foundry via OTel),
+      Application Insights, Azure Monitor + Log Analytics, Azure AI Content
+      Safety, Azure AI Evaluation SDK, Managed Identity end-to-end, Azure
+      Policy / Defender posture for governance. Hors-scope explicite:
+      data migration from Langfuse, Azure Prompt Flow, Azure AI Agent
+      Service (these come in phases 3 / 5 / 6).
+Next immediate action: sub-step A of OTel warm-up (add `opentelemetry-sdk`
++ OTLP exporter pointing to Langfuse, instrument ONE call site —
+recommended `LocalChatProvider.generate` in `rag/llm.py` — verify trace
+appears in Langfuse with `gen_ai.*` canonical attributes). To be executed
+by coder agent in a separate session.
