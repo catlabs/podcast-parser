@@ -31,6 +31,7 @@ from langfuse.openai import openai as _openai_sdk
 # tracer bound to a private TracerProvider that exports through OTLP HTTP
 # to Langfuse's OTel endpoint. Otherwise it returns an OTel no-op tracer,
 # so the call site below stays branch-free.
+from opentelemetry.trace import Status as _OtStatus, StatusCode as _OtStatusCode
 from rag.otel import get_tracer as _get_otel_tracer
 
 # Handoff slot for our OTel chat span. We can't just use
@@ -341,4 +342,39 @@ class LocalChatProvider:
                 _OTEL_CHAT_SPAN.reset(token)
 
     def generate_stream(self, system: str, user: str):
-        return generate_stream(system, user, self.llm_key)
+        # Streaming-symmetric instrumentation to `.generate` (warm-up step B).
+        # Same gen_ai.* attribute set, same `_OTEL_CHAT_SPAN` handoff. The
+        # span must live for the FULL generator lifetime, not just its
+        # construction: we wrap the dispatch in an inner generator so the
+        # `with` block opens on the first __next__ and closes only when the
+        # generator is exhausted or closed (early consumer break → close()
+        # raises GeneratorExit, which propagates through the with cleanly).
+        #
+        # `record_exception` / `set_status_on_exception` are disabled at the
+        # span level so an early consumer close (GeneratorExit, a
+        # BaseException — not Exception) does not falsely mark the span as
+        # ERROR. Real SDK errors still flow through `except Exception` below
+        # and are recorded explicitly.
+        cfg    = _resolve(self.llm_key)
+        tracer = _get_otel_tracer()
+
+        def _stream():
+            with tracer.start_as_current_span(
+                f"chat {cfg.model}",
+                record_exception        = False,
+                set_status_on_exception = False,
+            ) as span:
+                span.set_attribute("gen_ai.operation.name", "chat")
+                span.set_attribute("gen_ai.system",         cfg.provider)
+                span.set_attribute("gen_ai.request.model",  cfg.model)
+                token = _OTEL_CHAT_SPAN.set(span)
+                try:
+                    yield from generate_stream(system, user, self.llm_key)
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(_OtStatus(_OtStatusCode.ERROR, str(exc)))
+                    raise
+                finally:
+                    _OTEL_CHAT_SPAN.reset(token)
+
+        return _stream()
