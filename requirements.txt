@@ -28,6 +28,11 @@ langgraph
 # Opt-in: tracing is no-op unless LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
 # are set in .env. See MIGRATION.md Step 10 and .ai/README.md for details.
 langfuse
+# Pure-OTel side track (warm-up step A): one call site instrumented with
+# canonical gen_ai.* attributes, shipped via OTLP HTTP to Langfuse's OTel
+# endpoint. Activated by OTEL_ENABLED=true; otherwise the bootstrap no-ops.
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
 
 # ── Storage providers ────────────────────────────────────────────────────────
 # Opt-in: AzureBlobObjectStore loads only when AZURE_STORAGE_ACCOUNT +

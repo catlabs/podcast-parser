@@ -1,7 +1,10 @@
 """
 rag/observability.py
 ====================
-Langfuse observability bootstrap.
+Langfuse observability bootstrap. A second, *parallel* observability
+pipeline lives in `rag/otel.py` — a pure-OpenTelemetry side track that
+exports through OTLP HTTP to Langfuse's OTel endpoint. The two
+pipelines are deliberately independent (see rag/otel.py header).
 
 Single place where Langfuse is configured. Other modules call `get_langfuse()`
 and either receive a real client (when configured) or `None` (so they can
@@ -88,6 +91,14 @@ def flush() -> None:
 # Eagerly initialise so any later `from langfuse.openai import openai`
 # import sees the SDK already configured.
 get_langfuse()
+
+
+# Pure-OTel side track (warm-up step A). Imported here so the bootstrap
+# runs at app boot — the call sites that use it (`from rag.otel import
+# get_tracer`) can then rely on the tracer being ready. No-op when
+# OTEL_ENABLED is unset.
+from rag import otel as _otel  # noqa: E402,F401
+_otel.get_tracer()
 
 
 # ── Application-level spans ───────────────────────────────────────────────────

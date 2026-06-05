@@ -12,18 +12,39 @@ Public API:
   generate_stream(system, user, llm_key=None) -> Generator[str]
 """
 
+import contextvars
 import json
 import urllib.error
 import urllib.request
 
 import anthropic
 
-# `rag.observability` triggers load_dotenv + Langfuse bootstrap. Importing it
-# BEFORE `langfuse.openai` guarantees env vars are loaded when the SDK patch
+# `rag.observability` triggers load_dotenv + Langfuse bootstrap (and the
+# parallel OTel bootstrap in rag/otel.py). Importing it BEFORE
+# `langfuse.openai` guarantees env vars are loaded when the SDK patch
 # is initialised. The patched openai module behaves identically to vanilla
 # openai when Langfuse is not configured, so this is safe in local-only mode.
 from rag.observability import get_langfuse  # noqa: F401 (side-effect import)
 from langfuse.openai import openai as _openai_sdk
+
+# Pure-OTel side track: when OTEL_ENABLED=true, `get_tracer()` returns a
+# tracer bound to a private TracerProvider that exports through OTLP HTTP
+# to Langfuse's OTel endpoint. Otherwise it returns an OTel no-op tracer,
+# so the call site below stays branch-free.
+from rag.otel import get_tracer as _get_otel_tracer
+
+# Handoff slot for our OTel chat span. We can't just use
+# `trace.get_current_span()` inside `_anthropic` because the Langfuse SDK
+# opens its own OTel span (`anthropic-chat`) on top of ours via
+# `lf.start_as_current_observation(...)`, so the *current* span at usage-
+# capture time is the Langfuse SDK one — bound to the global TracerProvider
+# Langfuse SDK installed, not to our private one. Attributes written on it
+# never reach our OTLP exporter. The ContextVar lets `LocalChatProvider`
+# publish *its* span explicitly so the usage helper writes to the right
+# observation regardless of what is current.
+_OTEL_CHAT_SPAN: contextvars.ContextVar = contextvars.ContextVar(
+    "_otel_chat_span", default=None,
+)
 
 from rag.config import (
     ANTHROPIC_API_KEY,
@@ -75,6 +96,25 @@ def generate_stream(system: str, user: str, llm_key: str | None = None):
 
 # ── Anthropic ─────────────────────────────────────────────────────────────────
 
+def _otel_set_anthropic_usage(response) -> None:
+    """Stamp canonical gen_ai.usage.* attributes on the LocalChatProvider
+    OTel span published by `_OTEL_CHAT_SPAN`. No-op when nothing is
+    published (OTEL_ENABLED=false, or called outside the provider)."""
+    span = _OTEL_CHAT_SPAN.get()
+    if span is None or not span.is_recording():
+        return
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        span.set_attribute("gen_ai.usage.input_tokens",  usage.input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
+    resp_id    = getattr(response, "id", None)
+    resp_model = getattr(response, "model", None)
+    if resp_id:
+        span.set_attribute("gen_ai.response.id",    resp_id)
+    if resp_model:
+        span.set_attribute("gen_ai.response.model", resp_model)
+
+
 def _anthropic(system: str, user: str, model: str) -> str:
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is not set. Add it to .env.")
@@ -88,6 +128,7 @@ def _anthropic(system: str, user: str, model: str) -> str:
             system     = system,
             messages   = [{"role": "user", "content": user}],
         )
+        _otel_set_anthropic_usage(response)
         return response.content[0].text
 
     # Explicit input/output (not all-args) per Langfuse best practice —
@@ -112,6 +153,7 @@ def _anthropic(system: str, user: str, model: str) -> str:
                 "output": response.usage.output_tokens,
             },
         )
+        _otel_set_anthropic_usage(response)
         return text
 
 
@@ -278,7 +320,25 @@ class LocalChatProvider:
         self.llm_key = llm_key
 
     def generate(self, system: str, user: str) -> str:
-        return generate(system, user, self.llm_key)
+        # Pure-OTel instrumentation (warm-up step A). The span name and
+        # attribute keys follow the OpenTelemetry GenAI semantic conventions
+        # so that any OTel-aware backend — not just Langfuse — can render
+        # this trace meaningfully. When OTEL_ENABLED is unset, the tracer
+        # is an OTel no-op and this block costs nothing. We publish the
+        # span via `_OTEL_CHAT_SPAN` so the per-provider helpers (which run
+        # underneath a Langfuse SDK span that hides us from
+        # `get_current_span()`) can still target our observation directly.
+        cfg    = _resolve(self.llm_key)
+        tracer = _get_otel_tracer()
+        with tracer.start_as_current_span(f"chat {cfg.model}") as span:
+            span.set_attribute("gen_ai.operation.name", "chat")
+            span.set_attribute("gen_ai.system",         cfg.provider)
+            span.set_attribute("gen_ai.request.model",  cfg.model)
+            token = _OTEL_CHAT_SPAN.set(span)
+            try:
+                return generate(system, user, self.llm_key)
+            finally:
+                _OTEL_CHAT_SPAN.reset(token)
 
     def generate_stream(self, system: str, user: str):
         return generate_stream(system, user, self.llm_key)
