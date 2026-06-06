@@ -32,11 +32,12 @@ from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from rag.agents import get as get_agent
+from rag.agents.base import _run_with_span
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
 from rag.observability import should_log_full_prompts, span, trace_context
 from rag.providers import get_chat_provider
 from rag.search import format_context, semantic_search
-from rag.tools import list_episodes_text
 
 log = logging.getLogger(__name__)
 
@@ -57,23 +58,9 @@ NODE_META: dict[str, dict[str, str]] = {
 }
 
 # ── Prompts (same as research.py) ────────────────────────────────────────────
-
-PLAN_SYSTEM = """\
-Tu es un planificateur de recherche pour un assistant spécialisé dans des podcasts.
-
-L'utilisateur pose une question complexe. Ton rôle est de la décomposer en
-sous-requêtes de recherche pertinentes qui, ensemble, couvriront le sujet.
-
-Voici la liste des épisodes indexés :
-{episode_list}
-
-Règles :
-- Génère entre 2 et 5 sous-requêtes courtes et distinctes (en français).
-- Chaque sous-requête doit être formulée pour une recherche sémantique dans
-  des transcriptions de podcast.
-- Ne reformule pas simplement la question — explore différents angles.
-- Réponds en JSON strict : {{"sub_queries": ["...", "..."]}}
-- Rien d'autre que le JSON."""
+# Note: PLAN_SYSTEM moved into rag/agents/planner.py with the Phase 1.1a
+# PlannerAgent refactor. The remaining prompts still live here until their
+# agents are formalized in following sub-steps.
 
 ANALYZE_SYSTEM = """\
 Tu es un analyste de contenu de podcast.
@@ -220,7 +207,18 @@ def _unique_sources(chunks: list[dict]) -> list[dict]:
 
 
 def planner_node(state: ResearchState) -> dict:
-    """Decompose the user query into sub-queries for multi-angle search."""
+    """LangGraph adapter around ``PlannerAgent`` (Phase 1.1a).
+
+    The agent itself (``rag/agents/planner.py``) owns the prompt, the LLM
+    call, and the sub-query post-processing. This adapter just bridges
+    LangGraph's TypedDict state with the agent's dict-in / dict-out
+    contract, and keeps the existing Langfuse SDK span + SSE event
+    emissions exactly where they were.
+
+    The OTel ``agent planner`` span (opened by ``_run_with_span``) nests
+    inside ``research-plan`` — parallel observability for now, will be
+    deduped once every agent is on the new contract.
+    """
     events = [_agent_start("planner"), _ev("planner", "plan", "running", tool="generate")]
 
     with span(
@@ -228,11 +226,8 @@ def planner_node(state: ResearchState) -> dict:
         input    = {"query": state["query"]},
         metadata = {"llm_key": state["llm_key"]},
     ) as s:
-        episode_list = list_episodes_text()
-        prompt = PLAN_SYSTEM.format(episode_list=episode_list)
-        raw = get_chat_provider(state["llm_key"]).generate(prompt, state["query"])
-        plan = _parse_json(raw)
-        sub_queries = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [state["query"]]
+        output      = _run_with_span(get_agent("planner"), dict(state))
+        sub_queries = output["sub_queries"]
         s.update(output={"n_sub_queries": len(sub_queries),
                          "sub_queries":   sub_queries})
 
