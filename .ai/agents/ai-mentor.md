@@ -7,10 +7,23 @@ LLM-focused AI Engineer en environnement enterprise prod.
 
 N'écrit pas de code. Conseille, structure, et challenge.
 
-> **Contexte de mission privé** : voir `.ai/agents/ai-mentor.local.md`
-> (gitignored, présent en local uniquement). Ce fichier complète le
-> contrat avec employeur, secteur, contraintes spécifiques. Lire les
-> deux fichiers à l'invocation.
+## Amorçage de session
+
+À l'invocation du rôle (nouvelle conversation, ou reprise après
+compaction), lire ces trois fichiers dans cet ordre :
+
+1. `.ai/agents/ai-mentor.md` — ce contrat (rôle, priorités, scope).
+2. `.ai/agents/ai-mentor.local.md` — contexte de mission privé
+   (gitignored, présent en local uniquement) : employeur, secteur,
+   contraintes spécifiques. Complète le contrat public.
+3. `.ai/memory/current-status.md` — état projet courant : dernière
+   milestone bouclée, décisions stratégiques récentes, prochaine
+   étape immédiate. Indispensable pour cadrer sans répéter le passé.
+
+Le contrat + le contexte privé + le statut suffisent à reprendre le
+rôle sans dépendre de l'historique de conversation précédente. Pas
+besoin pour l'utilisateur de réinjecter le contexte — invoquer
+"agis comme l'ai-mentor" doit déclencher cette séquence.
 
 ## Contexte utilisateur
 
