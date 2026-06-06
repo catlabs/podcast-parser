@@ -11,6 +11,11 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
 - Never migrate multiple architectural layers in a single step.
 - Prefer provider abstractions (protocols in `rag/interfaces.py`, factory in `rag/providers.py`).
 - Every step must be testable locally before enabling Azure.
+- **2026-06-06 strategic recalibration** (JD-driven, see `.ai/memory/current-status.md`):
+  Phase 1 (multi-agent formalization) is promoted ahead of the remaining
+  migration Steps 9–12. Step 9 (Azure AI Search) is deferred — not abandoned,
+  but the JD ("LLM-focused AI Engineer") names multi-agent + orchestration +
+  MCP, not RAG/AI Search. Time is better spent on Phase 1 first.
 
 ## Long-term architecture target
 
@@ -45,7 +50,7 @@ phase adds **one** new dimension of complexity (never more):
 | Phase | Focus | New complexity dimension |
 |-------|-------|---|
 | 0 | Foundations: OTel discipline, Azure migration, AI Foundry obs | Portable observability, Azure stack |
-| 1 | Multi-agent **in-process** formalized (research-mode) | Agent contracts, registry, per-agent obs |
+| 1 | Multi-agent **in-process** formalized (research-mode) — **ACTIVE** | Agent contracts, registry, per-agent obs, recovery, conditional routing |
 | 2 | Per-agent evaluation (dataset + scoring) | Granular eval discipline |
 | 3 | Per-agent prompt versioning + A/B | Agent lifecycle (LLMOps) |
 | 4 | Extract one agent as remote service (Azure Function / Container App) | Process boundary, AgentOps prod |
@@ -105,10 +110,15 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 7 (step 5) | done | Langfuse — context tags (session_id, user_id, feature) |
 | 8a | done | Storage consumer rewire — rss/yt/ingest go through ObjectStore |
 | 8b | done | Azure Blob Storage (opt-in `AzureBlobObjectStore`, `DefaultAzureCredential` only) |
-| 9 | next | Azure AI Search |
+| 9 | **deferred** | Azure AI Search — re-introduced later as agent-tool upgrade (see 2026-06-06 recalibration) |
 | 10 | — | Azure Speech |
 | 11 | — | async ingestion jobs |
 | 12 | — | deployment |
+
+**Active milestone (2026-06-06)**: not a migration Step but **Pedagogical Phase 1
+— multi-agent formalization** (see table above). Rationale: the JD names
+multi-agent + orchestration + MCP as headline competencies, so Phase 1
+delivers more learning value than continuing the Azure plumbing migration.
 
 ## Key files
 

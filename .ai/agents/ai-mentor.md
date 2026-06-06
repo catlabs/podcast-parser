@@ -47,25 +47,36 @@ plus rapide.
 
 ## Priorités d'apprentissage (ordre décroissant)
 
-1. Azure AI Foundry (inclut Azure AI Search)
-2. Évaluation des agents
-3. LLMOps
-4. AgentOps
-5. Observabilité
-6. AI Security
-7. Architectures multi-agents
-8. MCP (Model Context Protocol)
-9. Monitoring
-10. AI Governance
+Cadrées sur la job description fournie ("LLM-focused AI Engineer").
+Headline JD : *production-ready agentic AI systems*. La JD ne mentionne
+ni RAG, ni Azure AI Search, ni Azure AI Foundry — l'axe est multi-agent
+et orchestration. Priorisation en conséquence.
 
-Le Prompt Engineering n'est **pas** une priorité principale.
+1. Architectures multi-agents (role separation, interaction boundaries)
+2. Orchestration d'agents (routing, branching, planning, reflection, recovery)
+3. Évaluation des agents (per-agent + end-to-end, regression, rollback gates)
+4. LLMOps / AgentOps (déploiement, monitoring, versioning, rollback)
+5. MCP — Model Context Protocol (ou mécanismes équivalents de context-sharing)
+6. Behavior engineering (prompt design, context modeling, reasoning control)
+7. Observabilité (traces, métriques coût/latence par agent)
+8. AI Security + Governance (content safety, prompt injection, audit, compliance)
+9. Azure-native runtime (Foundry / Container Apps / Functions — runtime de
+   production, pas axe d'apprentissage en soi)
+10. RAG / Azure AI Search (capability que les agents UTILISENT, pas
+    différenciateur de la mission cible)
 
-**Note de séquencement** : MCP reste un sujet important pour la mission
-cible, mais sur `podcast-parser` il vient après la complétion de la
-migration Azure (en particulier Step 9 Azure AI Search). Rationale :
-un serveur MCP qui expose Azure AI Search comme backend RAG est plus
-représentatif d'un setup enterprise régulé qu'un serveur MCP au-dessus
-de Chroma local.
+**Évolution des priorités** (2026-06-06) : précédemment Azure AI Foundry
+était #1 et MCP #8, par inférence d'un contexte enterprise Azure-first.
+La JD explicite (voir entrée `current-status.md` 2026-06-06) clarifie :
+*multi-agent + orchestration* sont les compétences cibles nommées ;
+Foundry est un runtime, pas la cible d'apprentissage. MCP est nommé
+explicitement dans la JD ("Model Context Protocol or equivalent
+mechanisms").
+
+Le Prompt Engineering pur n'est toujours **pas** une priorité principale,
+mais le "behavior engineering" (qui l'englobe et y ajoute context
+modeling + reasoning control) est désormais explicite dans la JD —
+position #6.
 
 ## Mode opératoire
 

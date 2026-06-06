@@ -175,3 +175,69 @@ Next immediate action: sub-step A of OTel warm-up (add `opentelemetry-sdk`
 recommended `LocalChatProvider.generate` in `rag/llm.py` — verify trace
 appears in Langfuse with `gen_ai.*` canonical attributes). To be executed
 by coder agent in a separate session.
+
+2026-06-06 — OTel warm-up milestone complete. Four sub-steps shipped:
+A (3f6ce41) — private TracerProvider + OTLP HTTP exporter to Langfuse,
+`LocalChatProvider.generate` instrumented with `gen_ai.*` canonical
+attributes. B (0522162) — `.generate_stream` symmetrically instrumented
+(inner-generator pattern so the span lives for the full streaming
+lifetime). C (a78488a) — `AzureOpenAIChatProvider.generate` +
+`.generate_stream`. C2 (eb930c0) — both embedding providers (local +
+Azure). GenAI semantic conventions now cover 100% of chat and embedding
+call sites, both sync and streaming, across local and Azure providers.
+Coexistence with the Langfuse SDK pipeline is deliberate (double-counting
+on cost rollups is a known transient artefact). Sub-step D (remove
+redundant Langfuse SDK manual wrapping + drop-in to resolve the
+double-counting) deliberately deferred to the Azure AI Foundry milestone,
+where the dual-emit story (Langfuse + Foundry over OTel) reopens the
+instrumentation surface end-to-end. Mentor session also added a
+"Bootstrap" section to `.ai/agents/ai-mentor.md` (42edab7) so the role
+self-loads its three context files on session start. Next migration step
+resumes: **Step 9 Azure AI Search** — swap VectorStore impl only,
+Chroma stays as local default.
+
+2026-06-06 — JD-driven strategic pivot via ai-mentor session. Job
+description ("LLM-focused AI Engineer") confirmed *multi-agent +
+orchestration* as headline target competencies and explicitly named
+**MCP** ("Model Context Protocol or equivalent mechanisms"). The JD does
+NOT mention RAG, Azure AI Search, or Azure AI Foundry. Three consequences:
+(1) Priority list in `.ai/agents/ai-mentor.md` reordered. Multi-agent
+    now #1 (was #7); orchestration explicit at #2 (new); MCP at #5 (was
+    #8); behavior engineering re-introduced at #6; Foundry at #9 (was #1,
+    demoted from learning target to production runtime); RAG / Azure AI
+    Search at explicit #10.
+(2) Migration Step 9 (Azure AI Search) deferred. The infra work doesn't
+    muscle JD-named competencies. Chroma stays as the vector backend.
+    Step 9 to be re-introduced later as "an agent needs production-grade
+    retrieval — swap its tool" framing, not as a layer migration.
+(3) Pedagogical Phase 1 promoted from "future" to **active milestone**.
+    The existing research-mode (planner / search / analyst / synthesizer
+    / critic in `rag/research_graph.py`) is the formalization target —
+    already a 5-agent LangGraph DAG with typed ResearchState; Phase 1
+    adds the discipline (agent contracts, registry / capability cards,
+    per-agent OTel obs, failure handling / recovery, conditional routing
+    for reflection loop on critic verdict).
+`CLAUDE.md` updated: "Current strategy" gains a recalibration bullet;
+migration table marks Step 9 as deferred; pedagogical Phase 1 marked
+ACTIVE. Next mentor turn: Phase 1 sub-step 1a cadrage (9-step protocol).
+
+2026-06-06 — Phase 1 cadrage validated in mentor session. Five sub-steps
+locked in (original four + 1e folded in after user request for a CLI
+front-door orchestrator):
+  1a — `Agent` protocol + `AgentRegistry` + `PlannerAgent` refactor (sets
+       the pattern; LangGraph node becomes a thin adapter).
+  1b — Refactor `search`, `analyst`, `synthesizer`, `critic` as `Agent`
+       classes.
+  1c — Per-agent failure handling/recovery + conditional routing
+       (critic verdict `flagged` → loop back to planner, capped at 2).
+  1d — Orchestrator span + per-agent OTel rollup metrics (cost, latency,
+       reflection.loop_count).
+  1e — Front-door `Orchestrator` agent (LLM intent classifier — Level 2)
+       + `rag/cli.py` (typer + rich, one-shot + REPL, session_id
+       persistence). Routes user query to chat / research / list_episodes
+       / etc. via the registry. Exercises the JD-named "routing"
+       competency and makes the system usable without the web UI.
+JD competencies muscled per sub-step recorded in cadrage; sub-step 1e
+also preps MCP (Phase 5: tools-as-functions becomes tools-over-JSON-RPC)
+and Foundry deployment (Phase 6: agents already runtime-agnostic).
+Coder brief for 1a prepared next.
