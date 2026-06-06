@@ -19,6 +19,7 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 from rag.config import CHROMA_DIR, COLLECTIONS, DEFAULT_MODEL_KEY, EMBED_MODELS, EMBED_REGISTRY
+from rag.otel import get_tracer as _get_otel_tracer
 
 # ── Internal caches ───────────────────────────────────────────────────────────
 
@@ -88,11 +89,21 @@ class LocalEmbeddingProvider:
         self.name      = EMBED_MODELS[model_key]
 
     def encode(self, texts):
-        return (
-            get_model(self.model_key)
-            .encode(list(texts), show_progress_bar=False)
-            .tolist()
-        )
+        # Pure-OTel instrumentation (warm-up step C2, embeddings symmetry
+        # with chat steps A/B/C). Span name follows the OTel GenAI semconv
+        # `{operation_name} {model_name}` pattern. sentence-transformers
+        # runs entirely on-device, so no token-usage attributes are
+        # emitted — only the base operation/system/request.model trio.
+        tracer = _get_otel_tracer()
+        with tracer.start_as_current_span(f"embeddings {self.name}") as span:
+            span.set_attribute("gen_ai.operation.name", "embeddings")
+            span.set_attribute("gen_ai.system",         "sentence-transformers")
+            span.set_attribute("gen_ai.request.model",  self.name)
+            return (
+                get_model(self.model_key)
+                .encode(list(texts), show_progress_bar=False)
+                .tolist()
+            )
 
 
 class LocalVectorStore:

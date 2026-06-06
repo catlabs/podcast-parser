@@ -301,15 +301,41 @@ class AzureOpenAIEmbeddingProvider:
         return self._client
 
     def encode(self, texts: Sequence[str]) -> list[list[float]]:
+        # Pure-OTel instrumentation (warm-up step C2, mirror of chat step C
+        # for the embeddings operation). Same gen_ai.* canonical attribute
+        # set, same `gen_ai.system = az.ai.openai` value as the chat
+        # provider. Usage tokens are summed across batches so a single
+        # `encode()` call surfaces one aggregate `gen_ai.usage.input_tokens`
+        # on the span — there is no streaming or per-batch nesting to
+        # worry about here.
         client = self._ensure_client()
         items  = list(texts)
         out: list[list[float]] = []
 
-        for start in range(0, len(items), _AZURE_EMBED_BATCH_SIZE):
-            batch = items[start : start + _AZURE_EMBED_BATCH_SIZE]
-            resp  = client.embeddings.create(model=self.deployment, input=batch)
-            # The OpenAI SDK preserves order, but sort by `index` defensively.
-            ordered = sorted(resp.data, key=lambda d: d.index)
-            out.extend(d.embedding for d in ordered)
+        tracer = _get_otel_tracer()
+        with tracer.start_as_current_span(f"embeddings {self.deployment}") as span:
+            span.set_attribute("gen_ai.operation.name", "embeddings")
+            span.set_attribute("gen_ai.system",         _GEN_AI_SYSTEM)
+            span.set_attribute("gen_ai.request.model",  self.deployment)
+
+            total_input_tokens = 0
+            last_resp_model: str | None = None
+            for start in range(0, len(items), _AZURE_EMBED_BATCH_SIZE):
+                batch = items[start : start + _AZURE_EMBED_BATCH_SIZE]
+                resp  = client.embeddings.create(model=self.deployment, input=batch)
+                # The OpenAI SDK preserves order, but sort by `index` defensively.
+                ordered = sorted(resp.data, key=lambda d: d.index)
+                out.extend(d.embedding for d in ordered)
+                usage = getattr(resp, "usage", None)
+                if usage is not None:
+                    total_input_tokens += getattr(usage, "prompt_tokens", 0) or 0
+                resp_model = getattr(resp, "model", None)
+                if resp_model:
+                    last_resp_model = resp_model
+
+            if total_input_tokens:
+                span.set_attribute("gen_ai.usage.input_tokens", total_input_tokens)
+            if last_resp_model:
+                span.set_attribute("gen_ai.response.model", last_resp_model)
 
         return out
