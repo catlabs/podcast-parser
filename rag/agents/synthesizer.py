@@ -4,22 +4,26 @@ rag/agents/synthesizer.py
 SynthesizerAgent — final structured answer from per-episode analyses.
 
 Consumes the LLM's token stream synchronously: tokens are forwarded to
-``state['_token_queue']`` (a ``queue.Queue`` set up by the API layer so
-the SSE response can stream tokens to the browser) and accumulated into
-the final answer string. ``run()`` blocks until the stream is exhausted,
+``ctx.token_queue`` (a ``queue.Queue`` set up by the API layer so the
+SSE response can stream tokens to the browser) and accumulated into the
+final answer string. ``run()`` blocks until the stream is exhausted,
 which keeps the OTel ``agent synthesizer`` span well-defined — it opens
 on entry and closes on return, no generator-lifecycle subtleties.
 
-``_token_queue`` may be ``None`` (e.g. the legacy ``rag/research.py``
+``ctx.token_queue`` may be ``None`` (e.g. the legacy ``rag/research.py``
 orchestrator doesn't currently inject one) — in that case the agent
-just accumulates and returns. This preserves today's behaviour.
+just accumulates and returns. Same as 1b behaviour.
 """
 
 from __future__ import annotations
 
-import queue
-
-from rag.agents.base import Agent, CapabilityCard, register
+from rag.agents.base import (
+    Agent,
+    AgentContext,
+    AgentResult,
+    CapabilityCard,
+    register,
+)
 from rag.observability import should_log_full_prompts
 from rag.providers import get_chat_provider
 
@@ -55,17 +59,17 @@ class SynthesizerAgent:
         name               = "synthesizer",
         version            = "v1",
         description        = "Synthesize per-episode analyses into a final streamed answer",
-        reads              = ("episode_analyses", "query", "llm_key", "_token_queue"),
+        reads              = ("episode_analyses", "query", "llm_key"),
         writes             = ("answer",),
         requires_llm       = True,
         requires_retrieval = False,
     )
 
-    def run(self, state: dict) -> dict:
+    def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         query    = state["query"]
         llm_key  = state["llm_key"]
         analyses = state["episode_analyses"]
-        token_q: queue.Queue | None = state.get("_token_queue")
+        token_q  = ctx.token_queue
 
         user_msg = _build_user_message(query, analyses)
         tokens: list[str] = []
@@ -74,7 +78,7 @@ class SynthesizerAgent:
             if token_q is not None:
                 token_q.put({"type": "token", "text": tok})
 
-        return {"answer": "".join(tokens)}
+        return AgentResult.ok({"answer": "".join(tokens)})
 
 
 # Re-exported so the adapter can decide whether to fold the full prompt

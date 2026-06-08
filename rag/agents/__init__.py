@@ -11,6 +11,9 @@ returns.
 
 from rag.agents.base import (
     Agent,
+    AgentContext,
+    AgentResult,
+    AgentStatus,
     CapabilityCard,
     all_capabilities,
     get,
@@ -22,6 +25,9 @@ from rag.agents import analyst, critic, planner, search, synthesizer  # noqa: F4
 
 __all__ = [
     "Agent",
+    "AgentContext",
+    "AgentResult",
+    "AgentStatus",
     "CapabilityCard",
     "all_capabilities",
     "get",

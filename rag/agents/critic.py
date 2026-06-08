@@ -5,15 +5,16 @@ CriticAgent — grounding verification of the synthesized answer.
 
 Calls the LLM with the answer + top source chunks and asks for a JSON
 verdict (``supported`` | ``partial`` | ``unsupported``). Soft-fails to
-``verdict='unknown'`` when the LLM call or JSON parsing errors out — the
-exception is caught **inside** ``run()`` on purpose, so the OTel ``agent
-critic`` span finishes with status ``UNSET`` (a soft fail isn't an
-agent-level error; the grounding result already carries the failure
-signal).
+``verdict='unknown'`` when the LLM call or JSON parsing errors out: the
+agent catches its own exception and returns an
+``AgentResult(SOFT_FAIL)`` whose ``data`` still carries a usable
+``grounding`` payload for the downstream UI. The OTel ``agent critic``
+span finishes with status ``UNSET`` but records an ``agent.soft_fail``
+event so the failure is visible in traces.
 
-Hard-fail vs soft-fail discipline will be formalized in sub-step 1c
-(likely an ``AgentResult`` wrapper or a CapabilityCard field). Until
-then, agents encapsulate their own policy.
+This pattern is formalized in 1c.1 via ``CapabilityCard.failure_policy
+= "soft"`` — a future orchestrator can route on ``result.status``
+without reading critic source.
 """
 
 from __future__ import annotations
@@ -21,7 +22,14 @@ from __future__ import annotations
 import json
 import logging
 
-from rag.agents.base import Agent, CapabilityCard, register
+from rag.agents.base import (
+    Agent,
+    AgentContext,
+    AgentResult,
+    AgentStatus,
+    CapabilityCard,
+    register,
+)
 from rag.providers import get_chat_provider
 from rag.search import format_context
 
@@ -71,9 +79,10 @@ class CriticAgent:
         writes             = ("grounding",),
         requires_llm       = True,
         requires_retrieval = False,
+        failure_policy     = "soft",
     )
 
-    def run(self, state: dict) -> dict:
+    def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         answer  = state["answer"]
         chunks  = state["chunks"]
         llm_key = state["llm_key"]
@@ -89,9 +98,15 @@ class CriticAgent:
             grounding = _parse_json(raw)
         except Exception as exc:
             log.warning("grounding check failed: %s", exc)
-            grounding = {"verdict": "unknown", "flags": [f"Grounding check failed: {exc}"]}
+            err_msg   = f"Grounding check failed: {exc}"
+            grounding = {"verdict": "unknown", "flags": [err_msg]}
+            return AgentResult(
+                status = AgentStatus.SOFT_FAIL,
+                data   = {"grounding": grounding},
+                errors = (err_msg,),
+            )
 
-        return {"grounding": grounding}
+        return AgentResult.ok({"grounding": grounding})
 
 
 register(CriticAgent())

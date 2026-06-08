@@ -11,28 +11,23 @@ Progress emission
 -----------------
 The legacy ``analyst_node`` body emitted two events per episode iteration
 (a ``step analyze running`` tick and an ``episode_analysis`` content
-event with the notes payload). Dropping them visibly degraded the UI
-(0/5 stuck for the full analyst step, all five notes appearing in a
-single late batch via the final ``result`` event). Restored here as an
-``emit`` callback that the orchestrator injects via ``state['emit']``.
-
-The agent treats ``emit`` as optional (no-op when absent), which keeps
-it usable from any caller that doesn't care about progress (custom
-orchestrators, batch evaluation, tests). Per-iteration callbacks are
-the standard pattern for streaming agents — the LangGraph stream-mode
-"values" only yields between nodes, so the events still arrive in one
-batch at the SSE layer, but they remain semantically owned by the
-agent (it knows the iteration index, title, and notes content).
-
-A formal progress / partial-output channel will land in sub-step 1c
-or Phase 2; for now the lightweight callback keeps parity.
+event with the notes payload). As of 1c.1, the orchestrator injects an
+``emit`` callback through ``AgentContext.emit`` instead of smuggling it
+into ``state`` — keeping ``state`` for pure data and ``ctx`` for
+side-channels. The agent treats ``emit`` as optional (no-op when
+``None``), which keeps it usable from any caller that doesn't care
+about progress (batch evaluation, tests).
 """
 
 from __future__ import annotations
 
-from typing import Callable
-
-from rag.agents.base import Agent, CapabilityCard, register
+from rag.agents.base import (
+    Agent,
+    AgentContext,
+    AgentResult,
+    CapabilityCard,
+    register,
+)
 from rag.providers import get_chat_provider
 from rag.search import format_context
 
@@ -61,17 +56,17 @@ class AnalystAgent:
         name               = "analyst",
         version            = "v1",
         description        = "Analyze each ranked episode's chunks against the user query",
-        reads              = ("episodes_by_title", "query", "llm_key", "emit"),
+        reads              = ("episodes_by_title", "query", "llm_key"),
         writes             = ("episode_analyses",),
         requires_llm       = True,
         requires_retrieval = False,
     )
 
-    def run(self, state: dict) -> dict:
+    def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         episodes_by_title = state["episodes_by_title"]
         query             = state["query"]
         llm_key           = state["llm_key"]
-        emit: Callable[[dict], None] = state.get("emit") or _noop_emit
+        emit              = ctx.emit or _noop_emit
         n = len(episodes_by_title)
 
         chat     = get_chat_provider(llm_key)
@@ -88,7 +83,7 @@ class AnalystAgent:
             analyses.append({"episode": title, "notes": notes})
             emit({"type": "episode_analysis", "episode": title, "notes": notes})
 
-        return {"episode_analyses": analyses}
+        return AgentResult.ok({"episode_analyses": analyses})
 
 
 register(AnalystAgent())

@@ -26,7 +26,13 @@ from __future__ import annotations
 import contextvars
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from rag.agents.base import Agent, CapabilityCard, register
+from rag.agents.base import (
+    Agent,
+    AgentContext,
+    AgentResult,
+    CapabilityCard,
+    register,
+)
 from rag.embed import get_collection
 from rag.search import semantic_search
 
@@ -74,7 +80,7 @@ class SearchAgent:
         requires_retrieval = True,
     )
 
-    def run(self, state: dict) -> dict:
+    def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         sub_queries = state["sub_queries"]
         model_key   = state["model_key"]
 
@@ -110,11 +116,11 @@ class SearchAgent:
         top    = sorted(scores, key=scores.get)[:MAX_EPISODES]
         episodes_by_title = {t: episodes_by_title[t] for t in top}
 
-        return {
+        return AgentResult.ok({
             "chunks":            chunks,
             "episodes_by_title": episodes_by_title,
             "sources":           _unique_sources(chunks),
-        }
+        })
 
 
 register(SearchAgent())

@@ -29,7 +29,7 @@ from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from rag.agents import get as get_agent
+from rag.agents import AgentContext, get as get_agent
 from rag.agents.base import _run_with_span
 from rag.agents.search import CHUNKS_PER_QUERY
 from rag.agents.synthesizer import _build_user_message as _build_synth_user_msg
@@ -142,8 +142,8 @@ def planner_node(state: ResearchState) -> dict:
         input    = {"query": state["query"]},
         metadata = {"llm_key": state["llm_key"]},
     ) as s:
-        output      = _run_with_span(get_agent("planner"), dict(state))
-        sub_queries = output["sub_queries"]
+        result      = _run_with_span(get_agent("planner"), dict(state), AgentContext.empty())
+        sub_queries = result.data["sub_queries"]
         s.update(output={"n_sub_queries": len(sub_queries),
                          "sub_queries":   sub_queries})
 
@@ -175,8 +175,8 @@ def search_node(state: ResearchState) -> dict:
         input    = {"sub_queries": sub_queries, "top_k": CHUNKS_PER_QUERY},
         metadata = {"model_key": model_key, "n_sub_queries": len(sub_queries)},
     ) as s:
-        output            = _run_with_span(get_agent("search"), dict(state))
-        episodes_by_title = output["episodes_by_title"]
+        result            = _run_with_span(get_agent("search"), dict(state), AgentContext.empty())
+        episodes_by_title = result.data["episodes_by_title"]
         total             = sum(len(cs) for cs in episodes_by_title.values())
         s.update(output={
             "episodes_found": len(episodes_by_title),
@@ -187,22 +187,22 @@ def search_node(state: ResearchState) -> dict:
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})
     events.append(_agent_end("search"))
 
-    return {**output, "events": events}
+    return {**result.data, "events": events}
 
 
 def analyst_node(state: ResearchState) -> dict:
     """LangGraph adapter around ``AnalystAgent`` (Phase 1.1b).
 
     Per-iteration SSE events (running ticks + ``episode_analysis``
-    content) are emitted by the agent itself via a callback we inject as
+    content) are emitted by the agent itself via a callback injected as
     ``state['emit']``. This keeps the agent the source of progress
     signals (it owns the iteration index, the title, and the notes)
-    while leaving the SSE event shape under adapter control.
+    while the SSE event shape stays under adapter control.
     """
     episodes_by_title = state["episodes_by_title"]
     n      = len(episodes_by_title)
     events = [_agent_start("analyst"), _ev("analyst", "analyze", "running", f"0/{n} episodes", tool="generate")]
-    agent_state = {**state, "emit": events.append}
+    ctx    = AgentContext(emit=events.append)
 
     with span(
         "research-analyze",
@@ -210,8 +210,8 @@ def analyst_node(state: ResearchState) -> dict:
         metadata = {"llm_key": state["llm_key"],
                     "episode_titles": list(episodes_by_title.keys())},
     ) as s:
-        output    = _run_with_span(get_agent("analyst"), agent_state)
-        analyses  = output["episode_analyses"]
+        result    = _run_with_span(get_agent("analyst"), dict(state), ctx)
+        analyses  = result.data["episode_analyses"]
         s.update(output={"n_analyses": len(analyses)})
 
     events.append(_ev("analyst", "analyze", "done", f"{len(analyses)} episodes analyzed", tool="generate"))
@@ -242,8 +242,9 @@ def synthesizer_node(state: ResearchState) -> dict:
         input    = span_input,
         metadata = {"llm_key": state["llm_key"], "stream": True},
     ) as s:
-        output = _run_with_span(get_agent("synthesizer"), dict(state))
-        answer = output["answer"]
+        ctx    = AgentContext(token_queue=state.get("_token_queue"))
+        result = _run_with_span(get_agent("synthesizer"), dict(state), ctx)
+        answer = result.data["answer"]
         s.update(output={"answer_length": len(answer)})
 
     events.append(_ev("synthesizer", "synthesize", "done", llm_label, tool="generate_stream"))
@@ -268,8 +269,8 @@ def critic_node(state: ResearchState) -> dict:
                     "answer_length":      len(state["answer"])},
         metadata = {"llm_key": state["llm_key"]},
     ) as s:
-        output    = _run_with_span(get_agent("critic"), dict(state))
-        grounding = output["grounding"]
+        result    = _run_with_span(get_agent("critic"), dict(state), AgentContext.empty())
+        grounding = result.data.get("grounding") or {"verdict": "unknown", "flags": list(result.errors)}
         s.update(output={
             "verdict": grounding.get("verdict", "unknown"),
             "n_flags": len(grounding.get("flags", []) or []),

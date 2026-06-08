@@ -22,7 +22,13 @@ from __future__ import annotations
 
 import json
 
-from rag.agents.base import Agent, CapabilityCard, register
+from rag.agents.base import (
+    Agent,
+    AgentContext,
+    AgentResult,
+    CapabilityCard,
+    register,
+)
 from rag.providers import get_chat_provider
 from rag.tools import list_episodes_text
 
@@ -70,7 +76,7 @@ class PlannerAgent:
         requires_retrieval = False,
     )
 
-    def run(self, state: dict) -> dict:
+    def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         query   = state["query"]
         llm_key = state["llm_key"]
 
@@ -80,7 +86,7 @@ class PlannerAgent:
         plan         = _parse_json(raw)
         sub_queries  = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [query]
 
-        return {"sub_queries": sub_queries}
+        return AgentResult.ok({"sub_queries": sub_queries})
 
 
 register(PlannerAgent())
