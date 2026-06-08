@@ -21,7 +21,14 @@ from rag.agents.base import (
 )
 
 # Side-effect imports — each module's bottom registers its agent.
-from rag.agents import analyst, critic, planner, search, synthesizer  # noqa: F401
+from rag.agents import (  # noqa: F401
+    analyst,
+    critic,
+    orchestrator,
+    planner,
+    search,
+    synthesizer,
+)
 
 __all__ = [
     "Agent",

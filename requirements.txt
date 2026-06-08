@@ -24,6 +24,12 @@ openai
 # ── Research orchestration ───────────────────────────────────────────────────
 langgraph
 
+# ── CLI front door (Phase 1.1e) ──────────────────────────────────────────────
+# Typer drives the ``rag.cli`` entry points; rich handles streamed token
+# rendering and per-agent progress indicators in the terminal.
+typer>=0.12
+rich>=13.7
+
 # ── Observability ────────────────────────────────────────────────────────────
 # Opt-in: tracing is no-op unless LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
 # are set in .env. See MIGRATION.md Step 10 and .ai/README.md for details.
