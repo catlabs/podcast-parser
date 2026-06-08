@@ -22,30 +22,21 @@ Public API:
                   → sync generator of SSE-compatible events
 """
 
-import contextvars
-import json
 import logging
 import operator
 import queue
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 from rag.agents import get as get_agent
 from rag.agents.base import _run_with_span
+from rag.agents.search import CHUNKS_PER_QUERY
+from rag.agents.synthesizer import _build_user_message as _build_synth_user_msg
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
 from rag.observability import should_log_full_prompts, span, trace_context
-from rag.providers import get_chat_provider
-from rag.search import format_context, semantic_search
 
 log = logging.getLogger(__name__)
-
-# ── Limits ───────────────────────────────────────────────────────────────────
-
-MAX_SUB_QUERIES  = 5
-MAX_EPISODES     = 5
-CHUNKS_PER_QUERY = 6
 
 # ── Agent / node metadata ───────────────────────────────────────────────────
 
@@ -57,58 +48,9 @@ NODE_META: dict[str, dict[str, str]] = {
     "critic":      {"agent": "critic",      "label": "Grounding Critic"},
 }
 
-# ── Prompts (same as research.py) ────────────────────────────────────────────
-# Note: PLAN_SYSTEM moved into rag/agents/planner.py with the Phase 1.1a
-# PlannerAgent refactor. The remaining prompts still live here until their
-# agents are formalized in following sub-steps.
-
-ANALYZE_SYSTEM = """\
-Tu es un analyste de contenu de podcast.
-
-On te fournit des extraits d'un épisode en rapport avec une question de recherche.
-Rédige des notes d'analyse concises et structurées :
-- Points clés abordés dans cet épisode en lien avec la question
-- Citations ou exemples notables
-- Position ou opinion exprimée (si applicable)
-
-Réponds en français. Sois concis (150-250 mots max).
-Ne réponds pas à la question — analyse ce que l'épisode dit sur le sujet."""
-
-SYNTHESIZE_SYSTEM = """\
-Tu es un assistant de recherche spécialisé dans les podcasts indexés.
-
-On te fournit des analyses de plusieurs épisodes sur un même sujet.
-Rédige une synthèse structurée et comparative :
-- Compare les points de vue et informations entre épisodes
-- Identifie les convergences et divergences
-- Cite chaque épisode source entre guillemets
-- Structure ta réponse avec des sections claires
-
-Règles strictes :
-- Base-toi UNIQUEMENT sur les analyses fournies
-- Cite toujours l'épisode source
-- Réponds en français"""
-
-GROUND_SYSTEM = """\
-Tu es un vérificateur de faits pour un assistant de podcast.
-
-On te fournit :
-1. Une synthèse générée à partir d'analyses d'épisodes de podcast
-2. Les extraits source originaux
-
-Vérifie si chaque affirmation de la synthèse est soutenue par les extraits.
-
-Réponds en JSON strict :
-{{
-  "verdict": "supported" | "partial" | "unsupported",
-  "flags": ["description de chaque affirmation non soutenue (si applicable)"]
-}}
-
-- "supported" = toutes les affirmations sont vérifiables dans les extraits
-- "partial" = la plupart sont soutenues mais certaines manquent de source
-- "unsupported" = des affirmations importantes ne sont pas dans les extraits
-
-Rien d'autre que le JSON."""
+# Prompts, JSON parsing, and per-agent helpers (dedupe/group/sources) all
+# live with their owning agent under ``rag/agents/`` after the Phase 1.1a/b
+# refactor. This module is now strictly graph wiring + LangGraph adapters.
 
 # ── Graph state ──────────────────────────────────────────────────────────────
 
@@ -141,16 +83,7 @@ class ResearchState(TypedDict):
     _token_queue: Any  # queue.Queue | None — injected at invocation
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def _parse_json(raw: str) -> dict:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
-
+# ── SSE event helpers ────────────────────────────────────────────────────────
 
 def _ev(node: str, step: str, status: str, detail: str | None = None, *, tool: str | None = None) -> dict:
     """Build an SSE-compatible step event with full agent/tool metadata."""
@@ -174,33 +107,16 @@ def _agent_end(node: str) -> dict:
     return {"type": "agent_end", "agent": meta["agent"]}
 
 
-def _dedupe_chunks(all_chunks: list[dict]) -> list[dict]:
-    seen: dict[tuple, dict] = {}
-    for c in all_chunks:
-        key = (c["title"], c["chunk_index"])
-        if key not in seen or c["distance"] < seen[key]["distance"]:
-            seen[key] = c
-    return sorted(seen.values(), key=lambda c: c["distance"])
-
-
-def _group_by_episode(chunks: list[dict]) -> dict[str, list[dict]]:
-    groups: dict[str, list[dict]] = {}
-    for c in chunks:
-        groups.setdefault(c["title"], []).append(c)
-    return groups
-
-
-def _unique_sources(chunks: list[dict]) -> list[dict]:
-    seen: set[str] = set()
-    out: list[dict] = []
-    for c in chunks:
-        if c["title"] not in seen:
-            seen.add(c["title"])
-            out.append({"title": c["title"], "podcast": c["podcast"], "date": c["date"]})
-    return out
-
-
-# ── Node functions ───────────────────────────────────────────────────────────
+# ── Node functions (LangGraph adapters around rag.agents.* classes) ─────────
+#
+# Each adapter:
+#   1. Emits an ``agent_start`` + ``step running`` SSE pair
+#   2. Opens the existing Langfuse SDK span (kept for parallel observability
+#      with the new OTel ``agent <name>`` spans; dedup is a Phase-1c topic)
+#   3. Delegates the real work to the registered Agent via _run_with_span
+#   4. Updates the SDK span output and emits the closing ``step done`` /
+#      ``agent_end`` pair, plus any agent-specific result event
+#      (``plan`` / ``search_results`` / ``grounding``).
 #
 # Each node receives the full ResearchState and returns a dict of fields to
 # update.  The `events` key is always a list of new events to append.
@@ -239,7 +155,14 @@ def planner_node(state: ResearchState) -> dict:
 
 
 def search_node(state: ResearchState) -> dict:
-    """Run parallel semantic searches across all sub-queries, dedupe and rank."""
+    """LangGraph adapter around ``SearchAgent`` (Phase 1.1b).
+
+    The agent owns the parallel fan-out (ThreadPoolExecutor +
+    contextvars), dedupe, and per-episode ranking. ``copy_context`` in
+    the agent captures the adapter-opened ``research-search`` SDK span
+    AND the ``_run_with_span``-opened ``agent search`` OTel span as the
+    parent, so retrieval spans nest correctly under both.
+    """
     sub_queries = state["sub_queries"]
     model_key   = state["model_key"]
     events = [
@@ -252,31 +175,9 @@ def search_node(state: ResearchState) -> dict:
         input    = {"sub_queries": sub_queries, "top_k": CHUNKS_PER_QUERY},
         metadata = {"model_key": model_key, "n_sub_queries": len(sub_queries)},
     ) as s:
-        all_chunks: list[dict] = []
-        # Snapshot the active context (which has research-search as current span)
-        # so retrieval spans opened in worker threads nest under it. Each future
-        # gets its own copy to avoid races on shared Tokens.
-        with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
-            futures = {
-                pool.submit(
-                    contextvars.copy_context().run,
-                    semantic_search, sq,
-                    CHUNKS_PER_QUERY, model_key,
-                ): sq
-                for sq in sub_queries
-            }
-            for f in as_completed(futures):
-                all_chunks.extend(f.result())
-
-        chunks = _dedupe_chunks(all_chunks)
-        episodes_by_title = _group_by_episode(chunks)
-
-        # Rank episodes by best chunk distance, keep top N
-        scores = {t: min(c["distance"] for c in cs) for t, cs in episodes_by_title.items()}
-        top = sorted(scores, key=scores.get)[:MAX_EPISODES]
-        episodes_by_title = {t: episodes_by_title[t] for t in top}
-
-        total = sum(len(cs) for cs in episodes_by_title.values())
+        output            = _run_with_span(get_agent("search"), dict(state))
+        episodes_by_title = output["episodes_by_title"]
+        total             = sum(len(cs) for cs in episodes_by_title.values())
         s.update(output={
             "episodes_found": len(episodes_by_title),
             "total_chunks":   total,
@@ -286,39 +187,31 @@ def search_node(state: ResearchState) -> dict:
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})
     events.append(_agent_end("search"))
 
-    return {
-        "chunks": chunks,
-        "episodes_by_title": episodes_by_title,
-        "sources": _unique_sources(chunks),
-        "events": events,
-    }
+    return {**output, "events": events}
 
 
 def analyst_node(state: ResearchState) -> dict:
-    """Analyze each relevant episode's chunks with the LLM."""
-    episodes_by_title = state["episodes_by_title"]
-    query   = state["query"]
-    llm_key = state["llm_key"]
-    n       = len(episodes_by_title)
-    events  = [_agent_start("analyst"), _ev("analyst", "analyze", "running", f"0/{n} episodes", tool="generate")]
+    """LangGraph adapter around ``AnalystAgent`` (Phase 1.1b).
 
-    chat = get_chat_provider(llm_key)
-    analyses: list[dict] = []
+    Per-iteration SSE events (running ticks + ``episode_analysis``
+    content) are emitted by the agent itself via a callback we inject as
+    ``state['emit']``. This keeps the agent the source of progress
+    signals (it owns the iteration index, the title, and the notes)
+    while leaving the SSE event shape under adapter control.
+    """
+    episodes_by_title = state["episodes_by_title"]
+    n      = len(episodes_by_title)
+    events = [_agent_start("analyst"), _ev("analyst", "analyze", "running", f"0/{n} episodes", tool="generate")]
+    agent_state = {**state, "emit": events.append}
+
     with span(
         "research-analyze",
-        input    = {"query": query, "n_episodes": n},
-        metadata = {"llm_key": llm_key,
+        input    = {"query": state["query"], "n_episodes": n},
+        metadata = {"llm_key": state["llm_key"],
                     "episode_titles": list(episodes_by_title.keys())},
     ) as s:
-        for i, (title, ep_chunks) in enumerate(episodes_by_title.items()):
-            events.append(_ev("analyst", "analyze", "running", f"{i + 1}/{n} episodes", tool="generate"))
-            context = format_context(ep_chunks)
-            notes = chat.generate(
-                ANALYZE_SYSTEM,
-                f'Question de recherche : {query}\n\nÉpisode : "{title}"\n\nExtraits :\n{context}',
-            )
-            analyses.append({"episode": title, "notes": notes})
-            events.append({"type": "episode_analysis", "episode": title, "notes": notes})
+        output    = _run_with_span(get_agent("analyst"), agent_state)
+        analyses  = output["episode_analyses"]
         s.update(output={"n_analyses": len(analyses)})
 
     events.append(_ev("analyst", "analyze", "done", f"{len(analyses)} episodes analyzed", tool="generate"))
@@ -327,41 +220,30 @@ def analyst_node(state: ResearchState) -> dict:
 
 
 def synthesizer_node(state: ResearchState) -> dict:
-    """Synthesize all episode analyses into a structured answer.
+    """LangGraph adapter around ``SynthesizerAgent`` (Phase 1.1b).
 
-    Pushes token events to ``state['_token_queue']`` for real-time streaming.
-    The API layer reads from this queue concurrently with the graph execution.
+    Token streaming stays end-to-end functional: the API layer pre-seeds
+    ``state['_token_queue']``, the agent pushes chunks into it as the
+    LLM stream yields, and ``run()`` blocks until exhaustion (keeping
+    the OTel span lifetime clean — no generator subtleties).
     """
     llm_label = state["llm_label"]
-    llm_key   = state["llm_key"]
     events = [_agent_start("synthesizer"), _ev("synthesizer", "synthesize", "running", llm_label, tool="generate_stream")]
-
-    analyses_block = "\n\n---\n\n".join(
-        f'## Épisode : "{a["episode"]}"\n\n{a["notes"]}'
-        for a in state["episode_analyses"]
-    )
-    user_msg = f"Question de recherche : {state['query']}\n\nAnalyses par épisode :\n\n{analyses_block}"
 
     span_input: dict = {
         "n_analyses": len(state["episode_analyses"]),
         "query":      state["query"],
     }
     if should_log_full_prompts():
-        span_input["prompt"] = user_msg
+        span_input["prompt"] = _build_synth_user_msg(state["query"], state["episode_analyses"])
 
-    token_q: queue.Queue | None = state.get("_token_queue")
-    tokens: list[str] = []
     with span(
         "research-synthesize",
         input    = span_input,
-        metadata = {"llm_key": llm_key, "stream": True},
+        metadata = {"llm_key": state["llm_key"], "stream": True},
     ) as s:
-        for tok in get_chat_provider(llm_key).generate_stream(SYNTHESIZE_SYSTEM, user_msg):
-            tokens.append(tok)
-            if token_q is not None:
-                token_q.put({"type": "token", "text": tok})
-
-        answer = "".join(tokens)
+        output = _run_with_span(get_agent("synthesizer"), dict(state))
+        answer = output["answer"]
         s.update(output={"answer_length": len(answer)})
 
     events.append(_ev("synthesizer", "synthesize", "done", llm_label, tool="generate_stream"))
@@ -370,14 +252,15 @@ def synthesizer_node(state: ResearchState) -> dict:
 
 
 def critic_node(state: ResearchState) -> dict:
-    """Verify the synthesis is grounded in the source chunks."""
-    events = [_agent_start("critic"), _ev("critic", "ground", "running", tool="generate")]
+    """LangGraph adapter around ``CriticAgent`` (Phase 1.1b).
 
-    source_context = format_context(state["chunks"][:20])
-    user_msg = (
-        f"Synthèse à vérifier :\n{state['answer']}\n\n"
-        f"---\n\nExtraits source :\n{source_context}"
-    )
+    The critic's soft-fail (LLM error → ``verdict='unknown'``) is
+    handled INSIDE the agent on purpose: a soft-fail is not an
+    agent-level error, so the OTel ``agent critic`` span finishes
+    with status ``UNSET``. Hard-fail vs soft-fail discipline becomes
+    a sub-step 1c concern.
+    """
+    events = [_agent_start("critic"), _ev("critic", "ground", "running", tool="generate")]
 
     with span(
         "research-ground",
@@ -385,12 +268,8 @@ def critic_node(state: ResearchState) -> dict:
                     "answer_length":      len(state["answer"])},
         metadata = {"llm_key": state["llm_key"]},
     ) as s:
-        try:
-            raw = get_chat_provider(state["llm_key"]).generate(GROUND_SYSTEM, user_msg)
-            grounding = _parse_json(raw)
-        except Exception as exc:
-            log.warning("grounding check failed: %s", exc)
-            grounding = {"verdict": "unknown", "flags": [f"Grounding check failed: {exc}"]}
+        output    = _run_with_span(get_agent("critic"), dict(state))
+        grounding = output["grounding"]
         s.update(output={
             "verdict": grounding.get("verdict", "unknown"),
             "n_flags": len(grounding.get("flags", []) or []),
