@@ -25,9 +25,10 @@ Public API:
 import logging
 import operator
 import queue
-from typing import Annotated, Any, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
+from opentelemetry import trace as _ot_trace
 
 from rag.agents import AgentContext, get as get_agent
 from rag.agents.base import _run_with_span
@@ -37,6 +38,16 @@ from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
 from rag.observability import should_log_full_prompts, span, trace_context
 
 log = logging.getLogger(__name__)
+
+# ── Reflection loop ─────────────────────────────────────────────────────────
+# Cap to prevent infinite loops. ``MAX_REFLECTION_LOOPS = 2`` means the
+# planner can run at most three times (initial + 2 retries). If even after
+# 2 retries the answer cannot be grounded, ship the best attempt with the
+# final critic verdict — let the user see the uncertainty rather than spin
+# forever. New OTel namespace ``reflection.*`` is used for the routing
+# event (see ``route_after_critic``).
+
+MAX_REFLECTION_LOOPS = 2
 
 # ── Agent / node metadata ───────────────────────────────────────────────────
 
@@ -78,6 +89,17 @@ class ResearchState(TypedDict):
 
     # ── Event log (add-reducer: each node appends) ───────────────────────
     events:  Annotated[list[dict], operator.add]
+
+    # ── Reflection loop bookkeeping ──────────────────────────────────────
+    # ``grounding_history`` accumulates every critic verdict produced
+    # during the run (add-reducer). The planner reads it on re-entry to
+    # craft *different* sub-queries; the router reads it indirectly via
+    # ``len()`` to know whether this is the first attempt.
+    # ``reflection_loop_count`` is set by the planner adapter on re-entry
+    # (it's the planner that "knows" it's been called a second/third
+    # time, because grounding_history is no longer empty).
+    grounding_history:     Annotated[list[dict], operator.add]
+    reflection_loop_count: int
 
     # ── Token queue for synthesis streaming (not serialized) ─────────────
     _token_queue: Any  # queue.Queue | None — injected at invocation
@@ -135,12 +157,24 @@ def planner_node(state: ResearchState) -> dict:
     inside ``research-plan`` — parallel observability for now, will be
     deduped once every agent is on the new contract.
     """
+    # Re-entry detection: a non-empty ``grounding_history`` means the
+    # reflection router sent us back. Bumping the count here (rather
+    # than in the critic adapter) keeps a single source of truth — the
+    # planner owns the "I'm starting attempt N+1" semantics, and the
+    # router stays stateless. Count remains 0 on the first pass.
+    is_retry      = bool(state.get("grounding_history"))
+    current_count = state.get("reflection_loop_count", 0)
+    new_count     = current_count + 1 if is_retry else current_count
+
     events = [_agent_start("planner"), _ev("planner", "plan", "running", tool="generate")]
 
     with span(
         "research-plan",
-        input    = {"query": state["query"]},
-        metadata = {"llm_key": state["llm_key"]},
+        input    = {"query":         state["query"],
+                    "attempt":       new_count + 1,
+                    "is_retry":      is_retry},
+        metadata = {"llm_key":              state["llm_key"],
+                    "reflection_loop_count": new_count},
     ) as s:
         result      = _run_with_span(get_agent("planner"), dict(state), AgentContext.empty())
         sub_queries = result.data["sub_queries"]
@@ -151,7 +185,11 @@ def planner_node(state: ResearchState) -> dict:
     events.append({"type": "plan", "sub_queries": sub_queries})
     events.append(_agent_end("planner"))
 
-    return {"sub_queries": sub_queries, "events": events}
+    return {
+        "sub_queries":           sub_queries,
+        "reflection_loop_count": new_count,
+        "events":                events,
+    }
 
 
 def search_node(state: ResearchState) -> dict:
@@ -280,7 +318,64 @@ def critic_node(state: ResearchState) -> dict:
     events.append(_ev("critic", "ground", "done", grounding.get("verdict", "unknown"), tool="generate"))
     events.append({"type": "grounding", **grounding})
     events.append(_agent_end("critic"))
-    return {"grounding": grounding, "events": events}
+
+    # If the router is going to send us back to the planner, surface a
+    # reflection SSE event so the UI can announce "retrying with
+    # different sub-queries". We mirror ``route_after_critic``'s
+    # condition here — slight redundancy, but pure-logic routers don't
+    # produce state updates so they can't emit SSE events themselves.
+    verdict        = grounding.get("verdict", "unknown")
+    current_count  = state.get("reflection_loop_count", 0)
+    will_loop_back = verdict != "supported" and current_count < MAX_REFLECTION_LOOPS
+    if will_loop_back:
+        next_count = current_count + 1
+        events.append({
+            "type":       "reflection",
+            "loop_count": next_count,
+            "verdict":    verdict,
+            "reason":     f"Critic flagged answer as {verdict!r}, attempting again "
+                          f"({next_count}/{MAX_REFLECTION_LOOPS})",
+        })
+
+    return {
+        "grounding":         grounding,
+        "grounding_history": [grounding],  # add-reducer concatenates
+        "events":            events,
+    }
+
+
+# ── Reflection router ───────────────────────────────────────────────────────
+
+
+def route_after_critic(state: ResearchState) -> Literal["planner", "__end__"]:
+    """Decide whether to loop back to the planner or finish the run.
+
+    Pure logic — no LLM, no SSE, no state mutation. Trivially
+    unit-testable in isolation. Side effect (intentional): if we're
+    looping, drop a ``reflection.loop_triggered`` event on whatever
+    span is currently active (the Langfuse-SDK research-request span
+    when running through the API). This lives in the *global* OTel
+    tracer's context, NOT the private side-track tracer in
+    ``rag/otel.py`` — the goal is for the event to land in Langfuse
+    via the SDK pipeline, alongside the existing research-* spans.
+    """
+    verdict = (state.get("grounding") or {}).get("verdict", "unknown")
+    count   = state.get("reflection_loop_count", 0)
+
+    if verdict == "supported":
+        return END
+    if count >= MAX_REFLECTION_LOOPS:
+        return END
+
+    _ot_trace.get_current_span().add_event(
+        "reflection.loop_triggered",
+        attributes={
+            "reflection.loop_count": count + 1,
+            "reflection.verdict":    verdict,
+            "reflection.cap":        MAX_REFLECTION_LOOPS,
+        },
+    )
+    return "planner"
 
 
 # ── Graph construction ───────────────────────────────────────────────────────
@@ -292,11 +387,17 @@ def build_graph() -> StateGraph:
     The compiled graph is reusable and thread-safe — build it once at module
     level or on first use.
 
-    Topology:
-      START → planner → search → analyst → synthesizer → critic → END
+    Topology (Phase 1.1c.2):
+      START → planner → search → analyst → synthesizer → critic → {planner | END}
+
+    The critic → planner edge is the reflection loop: when the critic
+    flags the synthesized answer as not ``supported`` AND the reflection
+    counter is below ``MAX_REFLECTION_LOOPS``, ``route_after_critic``
+    sends control back to the planner with the previous verdict folded
+    into ``state['grounding_history']``. The planner uses that history
+    to produce different sub-queries on the retry.
 
     Future extensions:
-      - add_conditional_edges("critic", route_fn) to loop back on low grounding
       - interrupt_before=["synthesizer"] for human approval of the plan
       - checkpointer=SqliteSaver for resumable long-running research
     """
@@ -308,12 +409,16 @@ def build_graph() -> StateGraph:
     graph.add_node("synthesizer", synthesizer_node)
     graph.add_node("critic",      critic_node)
 
-    graph.add_edge(START,          "planner")
+    graph.add_edge(START,         "planner")
     graph.add_edge("planner",     "search")
     graph.add_edge("search",      "analyst")
     graph.add_edge("analyst",     "synthesizer")
     graph.add_edge("synthesizer", "critic")
-    graph.add_edge("critic",      END)
+    graph.add_conditional_edges(
+        "critic",
+        route_after_critic,
+        {"planner": "planner", END: END},
+    )
 
     return graph.compile()
 
@@ -345,19 +450,21 @@ def research_graph_stream(
     llm_label = LLM_REGISTRY.get(resolved_key, LLM_REGISTRY[DEFAULT_LLM_KEY]).label
 
     initial_state: dict = {
-        "query":             query,
-        "model_key":         model_key,
-        "llm_key":           resolved_key,
-        "llm_label":         llm_label,
-        "sub_queries":       [],
-        "chunks":            [],
-        "episodes_by_title": {},
-        "episode_analyses":  [],
-        "answer":            "",
-        "grounding":         {},
-        "sources":           [],
-        "events":            [{"type": "agent_start", "agent": "orchestrator", "label": "Research Orchestrator (LangGraph)"}],
-        "_token_queue":      token_queue,
+        "query":                 query,
+        "model_key":             model_key,
+        "llm_key":               resolved_key,
+        "llm_label":             llm_label,
+        "sub_queries":           [],
+        "chunks":                [],
+        "episodes_by_title":     {},
+        "episode_analyses":      [],
+        "answer":                "",
+        "grounding":             {},
+        "sources":               [],
+        "grounding_history":     [],
+        "reflection_loop_count": 0,
+        "events":                [{"type": "agent_start", "agent": "orchestrator", "label": "Research Orchestrator (LangGraph)"}],
+        "_token_queue":          token_queue,
     }
 
     events_yielded = 0

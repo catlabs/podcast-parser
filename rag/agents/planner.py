@@ -13,6 +13,18 @@ see ``rag/research_graph.py``).
 Input  (``state['query']``, ``state['llm_key']``):
     Free-text user question; LLM key from the registry.
 
+    Optional ``state['grounding_history']`` (1c.2): when non-empty,
+    indicates the reflection router sent us back. The agent then
+    augments its prompt with the last critic verdict + flags and asks
+    the LLM to produce *different* sub-queries — otherwise the
+    re-attempt would repeat the same plan and the loop would be
+    infinite-by-counter rather than corrected-by-feedback.
+
+    Note: ``grounding_history`` is intentionally NOT in
+    ``CapabilityCard.reads`` — it's an optional field the agent
+    handles gracefully when absent. The Phase-1 contract has no formal
+    declaration for "may read" vs "must read"; flagged as a follow-up.
+
 Output (``{'sub_queries': [...]}``):
     A list of at most ``MAX_SUB_QUERIES`` sub-queries, falling back to
     the original query when the model returns an empty plan.
@@ -54,6 +66,26 @@ Règles :
 - Rien d'autre que le JSON."""
 
 
+def _augment_with_feedback(query: str, history: list[dict]) -> str:
+    """If we're being re-invoked after a critic flag, fold the previous
+    verdict + flags into the user message so the LLM produces *different*
+    sub-queries instead of repeating itself.
+
+    First-attempt callers pass ``history=[]`` and get the unmodified query.
+    """
+    if not history:
+        return query
+    last = history[-1]
+    return (
+        f"{query}\n\n"
+        f"## Précédent essai à corriger\n"
+        f"Verdict du critique : {last.get('verdict', 'unknown')}\n"
+        f"Points à corriger : {last.get('flags', [])}\n"
+        f"Produis des sous-requêtes DIFFÉRENTES cette fois — explore "
+        f"des angles que les sous-requêtes précédentes ont manqué."
+    )
+
+
 def _parse_json(raw: str) -> dict:
     text = raw.strip()
     if text.startswith("```"):
@@ -79,10 +111,12 @@ class PlannerAgent:
     def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         query   = state["query"]
         llm_key = state["llm_key"]
+        history = state.get("grounding_history") or []
 
         episode_list = list_episodes_text()
         prompt       = PLAN_SYSTEM.format(episode_list=episode_list)
-        raw          = get_chat_provider(llm_key).generate(prompt, query)
+        user_msg     = _augment_with_feedback(query, history)
+        raw          = get_chat_provider(llm_key).generate(prompt, user_msg)
         plan         = _parse_json(raw)
         sub_queries  = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [query]
 
