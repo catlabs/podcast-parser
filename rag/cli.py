@@ -69,6 +69,20 @@ def ask(
 
 
 @app.command()
+def summarize(
+    episode_id: int = typer.Argument(
+        ...,
+        help="Episode ID — find via `sqlite3 rag/data/metadata.db "
+             "'SELECT id, title FROM episodes'`.",
+    ),
+    llm_key:    str = typer.Option(DEFAULT_LLM_KEY, "--llm",
+                                   help="Chat LLM key from LLM_REGISTRY."),
+):
+    """One-shot: load episode, stream summary, exit."""
+    _run_summarize(episode_id, llm_key=llm_key, session_id=None)
+
+
+@app.command()
 def repl(
     llm_key:   str = typer.Option(DEFAULT_LLM_KEY,   "--llm",   help="Chat LLM key from LLM_REGISTRY."),
     model_key: str = typer.Option(DEFAULT_MODEL_KEY, "--embed", help="Embedding model key for retrieval."),
@@ -249,6 +263,169 @@ def _render_sources(result: dict) -> None:
     console.print()
     console.print(f"[dim]intent={intent}  sources={len(sources)}  chunks={n_chunks}  "
                   f"model={result.get('model_key', '?')}[/dim]")
+
+
+# ── Summarize verb (Phase 1.1g) ─────────────────────────────────────────────
+
+
+def _run_summarize(episode_id: int, *, llm_key: str, session_id: str | None) -> None:
+    """Resolve episode → open ``cli-request`` SDK span → drive ``_summarize_stream``.
+
+    Episode resolution happens BEFORE the trace span: an invalid ID
+    fails fast without polluting Langfuse with an empty trace.
+    """
+    episode = _fetch_episode_or_die(episode_id)
+
+    user_id = LANGFUSE_DEFAULT_USER_ID
+    with span(
+        "cli-request",
+        input    = {"episode_id": episode_id},
+        metadata = {"llm_key":    llm_key,
+                    "session_id": session_id or "",
+                    "surface":    "cli",
+                    "verb":       "summarize"},
+    ) as req, trace_context(
+        user_id    = user_id,
+        session_id = session_id,
+        feature    = "summarize-cli",
+    ):
+        stream = _summarize_stream(episode, llm_key=llm_key)
+        result = _render_stream(stream)
+        req.update(output={
+            "episode_id":     episode["id"],
+            "summary_length": len(((result or {}).get("summary") or "")),
+        })
+        if result is not None:
+            _render_summary(result, llm_key=llm_key)
+
+
+def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
+    """Yield ``agent_start`` / ``step`` / ``token`` / ``result`` / ``agent_end`` events.
+
+    Mirrors the SSE event shape produced by
+    ``rag.research_graph.research_graph_stream`` so the existing
+    ``_render_stream`` consumer handles tokens / result / warnings
+    without knowing this is the summarize path.
+    """
+    import queue
+    import threading
+
+    from rag.agents import AgentContext, get as get_agent
+    from rag.agents.base import _run_with_span
+    from rag.agents.summarizer import MAX_TRANSCRIPT_CHARS
+    from rag.providers import get_object_store
+
+    yield {"type": "agent_start", "agent": "summarizer", "label": "Episode Summarizer"}
+
+    # Load transcript through the storage abstraction so this code path
+    # remains agnostic of LocalObjectStore vs. AzureBlobObjectStore.
+    store = get_object_store()
+    with store.local_view(episode["file_path"]) as path:
+        transcript = path.read_text()
+
+    truncated = False
+    if len(transcript) > MAX_TRANSCRIPT_CHARS:
+        truncated = True
+        yield {
+            "type":   "step",
+            "step":   "truncate",
+            "status": "warn",
+            "agent":  "summarizer",
+            "detail": f"transcript {len(transcript)} chars > "
+                      f"{MAX_TRANSCRIPT_CHARS}; truncating tail",
+        }
+        transcript = transcript[:MAX_TRANSCRIPT_CHARS]
+
+    state = {
+        "episode":    episode,
+        "transcript": transcript,
+        "llm_key":    llm_key,
+    }
+    transcript_chars = len(transcript)
+
+    token_q: "queue.Queue[dict | None]" = queue.Queue()
+    holder: dict = {}
+
+    def _worker() -> None:
+        try:
+            holder["result"] = _run_with_span(
+                get_agent("summarizer"),
+                state,
+                AgentContext(token_queue=token_q),
+                input_attrs = {
+                    "episode.id":               episode["id"],
+                    "episode.title":            episode["title"],
+                    "episode.podcast":          episode.get("podcast") or "",
+                    "episode.date":             episode.get("date") or "",
+                    "episode.transcript_chars": transcript_chars,
+                    "summarize.llm_key":        llm_key,
+                    "summarize.stream":         True,
+                    "summarize.truncated":      truncated,
+                },
+                output_attrs_fn = lambda r: {
+                    "summarize.summary_length": len(r.data.get("summary") or ""),
+                },
+            )
+        except Exception as exc:
+            holder["error"] = exc
+        finally:
+            token_q.put(None)  # sentinel — drain loop on the main thread exits
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+
+    while True:
+        item = token_q.get()
+        if item is None:
+            break
+        yield item
+
+    thread.join()
+
+    if "error" in holder:
+        yield {"type": "error", "detail": str(holder["error"])}
+        return
+
+    summary = holder["result"].data["summary"]
+    yield {
+        "type":             "result",
+        "summary":          summary,
+        "episode":          episode,
+        "truncated":        truncated,
+        "transcript_chars": transcript_chars,
+    }
+    yield {"type": "agent_end", "agent": "summarizer"}
+
+
+def _fetch_episode_or_die(episode_id: int) -> dict:
+    """Return the episode row as a dict, or exit with a friendly message."""
+    from rag.database import get_connection
+
+    conn = get_connection()
+    row  = conn.execute(
+        "SELECT id, podcast, title, date, file_path FROM episodes WHERE id = ?",
+        (episode_id,),
+    ).fetchone()
+    conn.close()
+    if row is None:
+        console.print(f"[red]No episode found with id={episode_id}.[/red]")
+        console.print("[dim]Try: sqlite3 rag/data/metadata.db "
+                      "'SELECT id, title FROM episodes ORDER BY id'[/dim]")
+        raise typer.Exit(code=1)
+    return dict(row)
+
+
+def _render_summary(result: dict, *, llm_key: str) -> None:
+    """Footer line under the streamed summary."""
+    episode = result.get("episode") or {}
+    title   = episode.get("title") or "?"
+    podcast = episode.get("podcast") or "?"
+    date    = f" — {episode['date']}" if episode.get("date") else ""
+    chars   = result.get("transcript_chars") or 0
+    trunc   = " (truncated)" if result.get("truncated") else ""
+    console.print()
+    console.print(f"[dim]episode={title!r}  podcast={podcast}{date}  "
+                  f"transcript_chars={chars}{trunc}  llm={llm_key}[/dim]")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────

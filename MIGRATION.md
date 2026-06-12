@@ -1277,3 +1277,190 @@ print(inspect.signature(_run_with_span))
   add multiple flat attributes instead.
 
 ---
+
+## Phase 1.1g — SummarizerAgent + `rag.cli summarize <episode-id>`
+
+### Context
+
+Phases 1.1a–1.1f formalized the *research-mode* pipeline as five
+``Agent`` classes (planner / search / analyst / synthesizer / critic)
+plus an OrchestratorAgent that routes CLI queries between flows. All
+six existing agents share the same shape: multi-step DAG, fan-out,
+reflection loop. 1.1g introduces the **first non-research-mode
+agent** on the same contract — a single-input, single-LLM-call,
+single-output ``SummarizerAgent`` driven by a new ``summarize``
+typer verb. The pedagogical goal is to prove the
+``Agent`` / ``AgentContext`` / ``AgentResult`` contract isn't
+research-shaped — it generalizes to a workflow with no fan-out, no
+critic, no reflection loop.
+
+User decisions baked into this sub-step:
+
+- **No caching.** Every CLI invocation hits the LLM fresh so the
+  agent's work is visible in Langfuse on every run (Phase 1
+  pedagogical visibility).
+- **CLI-only surface.** No FastAPI endpoint. Deferred until the
+  React UI actually needs it.
+- **Bypass the OrchestratorAgent.** The ``summarize`` typer verb is
+  itself the intent declaration; classifying it through the
+  orchestrator would add a useless LLM call.
+
+### What ships in 1.1g
+
+#### New ``SummarizerAgent`` (``rag/agents/summarizer.py``)
+
+```
+CapabilityCard(
+    name               = "summarizer",
+    version            = "v1",
+    description        = "Summarize one podcast episode from its transcript",
+    reads              = ("episode", "transcript", "llm_key"),
+    writes             = ("summary",),
+    requires_llm       = True,
+    requires_retrieval = False,
+    failure_policy     = "hard",
+)
+```
+
+- Single LLM streaming call via
+  ``get_chat_provider(llm_key).generate_stream(SUMMARIZER_SYSTEM,
+  user_msg)``.
+- Tokens forwarded to ``ctx.token_queue`` when set (same idiom as
+  ``SynthesizerAgent``). When unset, the agent accumulates and
+  returns silently.
+- French system prompt asks for a structured 3–6-section summary
+  plus a "Citations notables" trailer. Constrained to the supplied
+  transcript only.
+- Module constant ``MAX_TRANSCRIPT_CHARS = 200_000`` (~50K tokens at
+  ~4 chars/token) — safe across Claude Sonnet 4.5 (200K), GPT-4o
+  (128K), qwen2.5 (32K). The agent itself does NOT truncate; the
+  CLI layer enforces the limit and stamps ``summarize.truncated``
+  on the span.
+- ``register(SummarizerAgent())`` at module bottom. Side-effect
+  import added to ``rag/agents/__init__.py``.
+
+#### New ``summarize`` verb (``rag/cli.py``)
+
+```
+summarize(episode_id: int, llm_key: str = DEFAULT_LLM_KEY)
+```
+
+- Signature: one positional integer + ``--llm``. No ``--by-title``
+  / ``--save`` / ``--no-stream`` until users actually ask.
+- ``_fetch_episode_or_die`` resolves the episode row from SQLite via
+  ``rag.database.get_connection`` BEFORE the trace span opens, so
+  an invalid ID produces a friendly red error + exit code 1 with
+  zero Langfuse pollution.
+- ``_run_summarize`` opens a ``cli-request`` SDK span (same pattern
+  as ``_run_query`` for the ``ask`` verb) with
+  ``metadata.verb="summarize"`` and ``trace_context(feature=
+  "summarize-cli")`` propagation.
+- ``_summarize_stream`` drives the agent in a worker thread,
+  draining a ``queue.Queue`` of token events on the main thread.
+  Emits SSE-shape events (``agent_start`` / optional ``step
+  warn`` for truncation / ``token`` / ``result`` / ``agent_end``)
+  so the existing ``_render_stream`` handles them unchanged — zero
+  consumer-side branching.
+- ``_render_summary`` prints the dim footer:
+  ``episode=<title>  podcast=<podcast> — <date>  transcript_chars=<N>[ (truncated)]  llm=<key>``.
+
+Transcript loading goes through ``get_object_store().local_view(
+episode["file_path"])`` so the code path works against
+``LocalObjectStore`` AND a future ``AzureBlobObjectStore`` without
+modification.
+
+#### Span attributes on the ``agent summarizer`` OTel span
+
+Wired via the Phase 1.1f ``_run_with_span(input_attrs=,
+output_attrs_fn=)`` hooks — no new SDK spans:
+
+| Attribute                       | Source                      |
+|---------------------------------|-----------------------------|
+| ``episode.id``                  | ``input_attrs`` (int)       |
+| ``episode.title``               | ``input_attrs`` (str)       |
+| ``episode.podcast``             | ``input_attrs`` (str)       |
+| ``episode.date``                | ``input_attrs`` (str)       |
+| ``episode.transcript_chars``    | ``input_attrs`` (int)       |
+| ``summarize.llm_key``           | ``input_attrs`` (str)       |
+| ``summarize.stream``            | ``input_attrs`` (bool, always True in 1.1g) |
+| ``summarize.truncated``         | ``input_attrs`` (bool)      |
+| ``summarize.summary_length``    | ``output_attrs_fn`` (int, defensive ``.get()``) |
+
+All values are OTel-primitive-compatible. No nested dicts, no JSON-
+encoded blobs. The full prompt + summary land on the auto LLM
+generation span emitted by the chat provider (langfuse.openai /
+manual Anthropic wrap) — no ``summarize.prompt`` attribute is
+needed.
+
+### What did NOT change
+
+- ``rag/tools.py::summarize_episode`` — feeds the chat path
+  (``ask_stream`` → fuzzy title match + chunk retrieval). It stays
+  exactly as-is. The new agent is a separate code path with a
+  different identification strategy (integer ID) and different
+  content strategy (full transcript). The two coexist.
+- ``rag/agents/synthesizer.py`` — research-mode synthesizer
+  (per-episode analyses → comparative answer). Not touched, not
+  inherited from. Same streaming idiom is duplicated, abstraction
+  premature.
+- ``rag/cli.py::_render_stream`` — handles the new ``step
+  warn`` / ``agent_start`` / ``token`` / ``result`` /
+  ``agent_end`` events using existing branches. Zero special-
+  casing for summarize.
+- ``OrchestratorAgent`` — the ``summarize`` verb bypasses it
+  (typer command is the intent declaration).
+- FastAPI surface — no new endpoint, no UI changes.
+- ``_run_with_span`` — the 1.1f hooks are sufficient.
+
+### Smoke test
+
+```bash
+# 1. Agent registration.
+.venv/bin/python -c "from rag.agents import get; print(get('summarizer').capabilities)"
+# expect: CapabilityCard(name='summarizer', version='v1', ...)
+
+# 2. Pick an episode ID.
+sqlite3 rag/data/metadata.db "SELECT id, title FROM episodes ORDER BY id LIMIT 5"
+
+# 3. Happy path — full streamed summary + footer.
+.venv/bin/python -m rag.cli summarize 1
+# expect: ▸ Episode Summarizer header, tokens stream incrementally
+# (no buffered dump), final dim footer with transcript_chars + llm.
+
+# 4. Negative — unknown ID exits cleanly with code 1, no trace opened.
+.venv/bin/python -m rag.cli summarize 99999
+# expect: red "No episode found with id=99999.", sqlite hint, exit 1.
+
+# 5. Regression — `ask` still works unchanged.
+.venv/bin/python -m rag.cli ask "list podcasts"
+.venv/bin/python -m rag.cli ask "Future of AI?"
+```
+
+### Hazards to watch for
+
+- **Truncation is a band-aid.** If real-world transcripts grow past
+  ``MAX_TRANSCRIPT_CHARS`` for non-trivial reasons (e.g. 4-hour
+  podcasts), the tail-drop loses content silently. Map-reduce
+  summarization (chunk → per-chunk summary → reduce) is the next
+  exercise — it'd teach a new pattern (a single agent making
+  multiple LLM calls internally, or a sub-orchestrator over chunk-
+  summary agents). Deferred to Phase 1.1h if the user requests it.
+- **State shape is more nested than research-mode.** Research-mode
+  agents flatten everything into top-level state keys
+  (``query``, ``sub_queries``, ``episodes_by_title``, …). The
+  summarizer reads ``state["episode"]`` as a sub-dict — a
+  reasonable choice for one cohesive entity, but worth watching as
+  the pattern propagates. If it recurs, consider a typed
+  ``EpisodeRef`` model.
+- **The CLI thread+queue idiom is now in two commands.** Both
+  ``_run_query`` (research path via ``research_graph_stream``) and
+  the new ``_summarize_stream`` thread the agent's streaming call
+  on a worker so the main thread can render incrementally. Tracking
+  question: if a third command needs it, lift it into a
+  ``rag/cli/_stream.py`` utility.
+
+---
+
+## Out of scope (later steps)
+
+Azure Speech, Azure AI Search — none introduced here.

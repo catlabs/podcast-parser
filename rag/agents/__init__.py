@@ -27,6 +27,7 @@ from rag.agents import (  # noqa: F401
     orchestrator,
     planner,
     search,
+    summarizer,
     synthesizer,
 )
 

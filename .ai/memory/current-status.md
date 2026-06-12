@@ -285,3 +285,60 @@ new parameters are keyword-only and default to `None`. Next sub-step
 1.1g cadrage to be opened by the ai-mentor: single-episode summarizer
 agent + `rag.cli summarize <episode-id>` verb, exercising the Agent
 contract on a non-research-mode workflow.
+
+2026-06-09 — Phase 1.1g shipped: SummarizerAgent + `rag.cli summarize
+<episode-id>` typer verb. First non-research-mode agent on the Phase 1
+contract — single input, single LLM streaming call, single output. The
+exercise proves the `Agent` / `AgentContext` / `AgentResult` contract
+generalizes beyond the multi-agent DAG it was originally designed for
+(no fan-out, no critic, no reflection loop). Concretely:
+  * `rag/agents/summarizer.py` (NEW) — `SummarizerAgent` with
+    `CapabilityCard(name="summarizer", reads=("episode", "transcript",
+    "llm_key"), writes=("summary",), failure_policy="hard")`. French
+    system prompt asks for a 3–6-section structured summary +
+    "Citations notables" trailer. Token streaming via `ctx.token_queue`
+    mirrors the `SynthesizerAgent` idiom (copy-paste rather than shared
+    base — different domain, different prompt, different state shape;
+    abstraction premature).
+  * Module constant `MAX_TRANSCRIPT_CHARS = 200_000` (~50K tokens, safe
+    across Claude Sonnet 4.5 / GPT-4o / qwen2.5). The CLI layer
+    enforces it (not the agent itself) and stamps
+    `summarize.truncated` on the OTel span.
+  * `rag/cli.py` gains a `summarize` command (positional int +
+    `--llm`), plus `_run_summarize` (opens `cli-request` SDK span with
+    `metadata.verb="summarize"` and `feature="summarize-cli"`),
+    `_summarize_stream` (thread+queue idiom, drives the agent on a
+    worker, drains tokens on the main thread, emits SSE-shape events
+    consumed unchanged by the existing `_render_stream`),
+    `_fetch_episode_or_die` (resolves the SQLite row BEFORE the trace
+    opens — invalid IDs produce a red error + exit 1 with zero
+    Langfuse pollution), and `_render_summary` (dim footer with
+    transcript_chars + llm).
+  * Transcript loading routes through
+    `get_object_store().local_view(file_path)` so the code path stays
+    portable to `AzureBlobObjectStore` without modification.
+  * Span attributes via the Phase 1.1f `_run_with_span(input_attrs=,
+    output_attrs_fn=)` hooks: entity attrs (`episode.{id, title,
+    podcast, date, transcript_chars}`) + workflow attrs
+    (`summarize.{llm_key, stream, truncated, summary_length}`). All
+    OTel-primitive-compatible; no nested dicts.
+  * `OrchestratorAgent` is deliberately bypassed — the typer verb IS
+    the intent declaration; routing through the orchestrator would add
+    a wasted LLM call.
+  * `rag/tools.py::summarize_episode` (chat-flow tool, fuzzy title +
+    chunk retrieval) is NOT touched. The two code paths coexist with
+    different identification + content strategies.
+Smoke test passed: episode 6 ("Trump's Risky Strategy to Blockade
+Iran's Blockade", 23984 chars) summarized with qwen2.5; tokens streamed
+incrementally (no buffered dump); final dim footer present; negative
+test (id=99999) exited with code 1 and no trace opened; `rag.cli ask`
+regressions clean. Truncation path unexercised in the smoke (no local
+transcript > 200K chars — max observed: 100K).
+JD competencies muscled: (1) multi-agent contract proven non-research-
+mode-shaped, (2) storage abstraction exercised end-to-end through a
+new code path, (3) Langfuse trace shape exercise on a new feature
+namespace (`summarize-cli` / `episode.*` / `summarize.*`). Open
+questions flagged for 1.1h: state-shape consistency (sub-dict vs.
+flat keys), thread+queue idiom now in two commands (extract utility?),
+truncation-as-band-aid → map-reduce pattern as next exercise if user
+expresses interest.
