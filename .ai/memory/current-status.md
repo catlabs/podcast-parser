@@ -241,3 +241,47 @@ JD competencies muscled per sub-step recorded in cadrage; sub-step 1e
 also preps MCP (Phase 5: tools-as-functions becomes tools-over-JSON-RPC)
 and Foundry deployment (Phase 6: agents already runtime-agnostic).
 Coder brief for 1a prepared next.
+
+2026-06-09 — Phase 1.1f shipped: Langfuse trace dedup on the LangGraph
+path. After 1.1e, the first real CLI run (`python -m rag.cli ask
+"Future of AI?"`) produced ~100 entries in Langfuse for a single query
+because each of the five LangGraph nodes wrapped its agent call in
+*both* a Langfuse SDK span (`research-plan` / `-search` / `-analyze` /
+`-synthesize` / `-ground`) and the OTel `agent <name>` span opened by
+`_run_with_span` — two sibling-level spans wrapping the same call. The
+tech-debt was flagged in the 1.1b code comments
+(`rag/research_graph.py:136-138`). 1.1f closes the loop:
+  * `_run_with_span` gains two purely additive keyword-only hooks
+    (`input_attrs: dict | None`, `output_attrs_fn: Callable[[AgentResult],
+    dict] | None`) that stamp domain metadata onto the same `agent
+    <name>` OTel span before/after `agent.run`. Attribute-computation
+    exceptions are silently dropped — observability must never fail
+    the request.
+  * The five LangGraph nodes (`rag/research_graph.py`) drop their
+    `with span("research-<X>", …)` wrappers and route the curated
+    metadata onto the OTel span via the new hooks, under a fresh
+    `research.*` attribute namespace (e.g. `research.attempt`,
+    `research.n_sub_queries`, `research.verdict`, `research.flags`).
+    Per-node signal table documented in `MIGRATION.md` § Phase 1.1f.
+  * `research-request` SDK span at the root of `research_graph_stream`
+    is kept — `trace_context(user_id=, session_id=,
+    feature="research-graph")` propagation still relies on it.
+  * `rag/research.py` (legacy non-LangGraph orchestrator still mounted
+    at `/chat/research`) is deliberately NOT touched — its agents
+    don't use `_run_with_span`, so stripping its SDK spans would
+    leave it with zero observability. It will be retired in a separate
+    step once the LangGraph path becomes the single orchestrator.
+  * Synthesizer `should_log_full_prompts()` debug branch dropped
+    rather than ported as a `research.prompt` attribute. Multi-KB
+    prompts in an OTel attribute are awkward; the auto LLM-generation
+    span emitted by `langfuse.openai` already carries the messages
+    verbatim. Toggle `LANGFUSE_LOG_FULL_PROMPTS=1` and inspect the
+    child generation span for the same information.
+Smoke test passed: 3-attempt reflection loop (initial + 2 retries),
+final verdict `supported`, 8 sources, 14 chunks. All callers outside
+`research_graph.py` (notably `rag/cli.py:_run_with_span(get_agent(
+"orchestrator"), …)`) keep compiling and behaving identically — the
+new parameters are keyword-only and default to `None`. Next sub-step
+1.1g cadrage to be opened by the ai-mentor: single-episode summarizer
+agent + `rag.cli summarize <episode-id>` verb, exercising the Agent
+contract on a non-research-mode workflow.

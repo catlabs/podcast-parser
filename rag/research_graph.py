@@ -33,9 +33,8 @@ from opentelemetry import trace as _ot_trace
 from rag.agents import AgentContext, get as get_agent
 from rag.agents.base import _run_with_span
 from rag.agents.search import CHUNKS_PER_QUERY
-from rag.agents.synthesizer import _build_user_message as _build_synth_user_msg
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
-from rag.observability import should_log_full_prompts, span, trace_context
+from rag.observability import span, trace_context
 
 log = logging.getLogger(__name__)
 
@@ -133,12 +132,14 @@ def _agent_end(node: str) -> dict:
 #
 # Each adapter:
 #   1. Emits an ``agent_start`` + ``step running`` SSE pair
-#   2. Opens the existing Langfuse SDK span (kept for parallel observability
-#      with the new OTel ``agent <name>`` spans; dedup is a Phase-1c topic)
-#   3. Delegates the real work to the registered Agent via _run_with_span
-#   4. Updates the SDK span output and emits the closing ``step done`` /
-#      ``agent_end`` pair, plus any agent-specific result event
-#      (``plan`` / ``search_results`` / ``grounding``).
+#   2. Delegates the real work to the registered Agent via _run_with_span,
+#      passing curated domain metadata via the wrapper's ``input_attrs`` /
+#      ``output_attrs_fn`` hooks. These attributes land on the same OTel
+#      ``agent <name>`` span — there is NO separate sibling SDK span
+#      since Phase 1.1f (trace dedup on the LangGraph path).
+#   3. Emits the closing ``step done`` / ``agent_end`` pair, plus any
+#      agent-specific result event (``plan`` / ``search_results`` /
+#      ``grounding``).
 #
 # Each node receives the full ResearchState and returns a dict of fields to
 # update.  The `events` key is always a list of new events to append.
@@ -150,12 +151,12 @@ def planner_node(state: ResearchState) -> dict:
     The agent itself (``rag/agents/planner.py``) owns the prompt, the LLM
     call, and the sub-query post-processing. This adapter just bridges
     LangGraph's TypedDict state with the agent's dict-in / dict-out
-    contract, and keeps the existing Langfuse SDK span + SSE event
-    emissions exactly where they were.
+    contract, and keeps the SSE event emissions exactly where they were.
 
-    The OTel ``agent planner`` span (opened by ``_run_with_span``) nests
-    inside ``research-plan`` — parallel observability for now, will be
-    deduped once every agent is on the new contract.
+    Phase 1.1f: domain metadata (attempt number, retry flag, llm_key, …)
+    is stamped on the wrapper-opened ``agent planner`` OTel span via the
+    new ``input_attrs`` / ``output_attrs_fn`` hooks, replacing the
+    sibling ``research-plan`` Langfuse SDK span.
     """
     # Re-entry detection: a non-empty ``grounding_history`` means the
     # reflection router sent us back. Bumping the count here (rather
@@ -168,18 +169,22 @@ def planner_node(state: ResearchState) -> dict:
 
     events = [_agent_start("planner"), _ev("planner", "plan", "running", tool="generate")]
 
-    with span(
-        "research-plan",
-        input    = {"query":         state["query"],
-                    "attempt":       new_count + 1,
-                    "is_retry":      is_retry},
-        metadata = {"llm_key":              state["llm_key"],
-                    "reflection_loop_count": new_count},
-    ) as s:
-        result      = _run_with_span(get_agent("planner"), dict(state), AgentContext.empty())
-        sub_queries = result.data["sub_queries"]
-        s.update(output={"n_sub_queries": len(sub_queries),
-                         "sub_queries":   sub_queries})
+    result = _run_with_span(
+        get_agent("planner"),
+        dict(state),
+        AgentContext.empty(),
+        input_attrs = {
+            "research.attempt":               new_count + 1,
+            "research.is_retry":              is_retry,
+            "research.reflection_loop_count": new_count,
+            "research.llm_key":               state["llm_key"],
+        },
+        output_attrs_fn = lambda r: {
+            "research.n_sub_queries": len(r.data["sub_queries"]),
+            "research.sub_queries":   list(r.data["sub_queries"]),
+        },
+    )
+    sub_queries = result.data["sub_queries"]
 
     events.append(_ev("planner", "plan", "done", f"{len(sub_queries)} sub-queries", tool="generate"))
     events.append({"type": "plan", "sub_queries": sub_queries})
@@ -196,10 +201,9 @@ def search_node(state: ResearchState) -> dict:
     """LangGraph adapter around ``SearchAgent`` (Phase 1.1b).
 
     The agent owns the parallel fan-out (ThreadPoolExecutor +
-    contextvars), dedupe, and per-episode ranking. ``copy_context`` in
-    the agent captures the adapter-opened ``research-search`` SDK span
-    AND the ``_run_with_span``-opened ``agent search`` OTel span as the
-    parent, so retrieval spans nest correctly under both.
+    contextvars), dedupe, and per-episode ranking. The ``copy_context``
+    inside the agent captures the wrapper-opened ``agent search`` OTel
+    span as the parent so retrieval spans nest correctly.
     """
     sub_queries = state["sub_queries"]
     model_key   = state["model_key"]
@@ -208,18 +212,24 @@ def search_node(state: ResearchState) -> dict:
         _ev("search", "search", "running", f"{len(sub_queries)} sub-queries", tool="semantic_search"),
     ]
 
-    with span(
-        "research-search",
-        input    = {"sub_queries": sub_queries, "top_k": CHUNKS_PER_QUERY},
-        metadata = {"model_key": model_key, "n_sub_queries": len(sub_queries)},
-    ) as s:
-        result            = _run_with_span(get_agent("search"), dict(state), AgentContext.empty())
-        episodes_by_title = result.data["episodes_by_title"]
-        total             = sum(len(cs) for cs in episodes_by_title.values())
-        s.update(output={
-            "episodes_found": len(episodes_by_title),
-            "total_chunks":   total,
-        })
+    result = _run_with_span(
+        get_agent("search"),
+        dict(state),
+        AgentContext.empty(),
+        input_attrs = {
+            "research.n_sub_queries": len(sub_queries),
+            "research.top_k":         CHUNKS_PER_QUERY,
+            "research.model_key":     model_key,
+        },
+        output_attrs_fn = lambda r: {
+            "research.n_episodes_found": len(r.data["episodes_by_title"]),
+            "research.total_chunks":     sum(
+                len(cs) for cs in r.data["episodes_by_title"].values()
+            ),
+        },
+    )
+    episodes_by_title = result.data["episodes_by_title"]
+    total             = sum(len(cs) for cs in episodes_by_title.values())
 
     events.append(_ev("search", "search", "done", f"{total} chunks from {len(episodes_by_title)} episodes", tool="semantic_search"))
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})
@@ -242,15 +252,19 @@ def analyst_node(state: ResearchState) -> dict:
     events = [_agent_start("analyst"), _ev("analyst", "analyze", "running", f"0/{n} episodes", tool="generate")]
     ctx    = AgentContext(emit=events.append)
 
-    with span(
-        "research-analyze",
-        input    = {"query": state["query"], "n_episodes": n},
-        metadata = {"llm_key": state["llm_key"],
-                    "episode_titles": list(episodes_by_title.keys())},
-    ) as s:
-        result    = _run_with_span(get_agent("analyst"), dict(state), ctx)
-        analyses  = result.data["episode_analyses"]
-        s.update(output={"n_analyses": len(analyses)})
+    result = _run_with_span(
+        get_agent("analyst"),
+        dict(state),
+        ctx,
+        input_attrs = {
+            "research.n_episodes": n,
+            "research.llm_key":    state["llm_key"],
+        },
+        output_attrs_fn = lambda r: {
+            "research.n_analyses": len(r.data["episode_analyses"]),
+        },
+    )
+    analyses = result.data["episode_analyses"]
 
     events.append(_ev("analyst", "analyze", "done", f"{len(analyses)} episodes analyzed", tool="generate"))
     events.append(_agent_end("analyst"))
@@ -264,26 +278,34 @@ def synthesizer_node(state: ResearchState) -> dict:
     ``state['_token_queue']``, the agent pushes chunks into it as the
     LLM stream yields, and ``run()`` blocks until exhaustion (keeping
     the OTel span lifetime clean — no generator subtleties).
+
+    Phase 1.1f note: the previous ``research-synthesize`` SDK span had a
+    debug-only branch (``should_log_full_prompts()``) that attached the
+    full system+context prompt as ``input.prompt``. It is intentionally
+    NOT carried over as a ``research.prompt`` span attribute — multi-KB
+    prompt text in an OTel span attribute is awkward to read, and the
+    auto LLM generation span emitted by ``langfuse.openai`` already
+    carries the messages verbatim. Flip ``LANGFUSE_LOG_FULL_PROMPTS=1``
+    and inspect the child generation span for the same information.
     """
     llm_label = state["llm_label"]
     events = [_agent_start("synthesizer"), _ev("synthesizer", "synthesize", "running", llm_label, tool="generate_stream")]
 
-    span_input: dict = {
-        "n_analyses": len(state["episode_analyses"]),
-        "query":      state["query"],
-    }
-    if should_log_full_prompts():
-        span_input["prompt"] = _build_synth_user_msg(state["query"], state["episode_analyses"])
-
-    with span(
-        "research-synthesize",
-        input    = span_input,
-        metadata = {"llm_key": state["llm_key"], "stream": True},
-    ) as s:
-        ctx    = AgentContext(token_queue=state.get("_token_queue"))
-        result = _run_with_span(get_agent("synthesizer"), dict(state), ctx)
-        answer = result.data["answer"]
-        s.update(output={"answer_length": len(answer)})
+    ctx = AgentContext(token_queue=state.get("_token_queue"))
+    result = _run_with_span(
+        get_agent("synthesizer"),
+        dict(state),
+        ctx,
+        input_attrs = {
+            "research.n_analyses": len(state["episode_analyses"]),
+            "research.llm_key":    state["llm_key"],
+            "research.stream":     True,
+        },
+        output_attrs_fn = lambda r: {
+            "research.answer_length": len(r.data["answer"]),
+        },
+    )
+    answer = result.data["answer"]
 
     events.append(_ev("synthesizer", "synthesize", "done", llm_label, tool="generate_stream"))
     events.append(_agent_end("synthesizer"))
@@ -301,19 +323,29 @@ def critic_node(state: ResearchState) -> dict:
     """
     events = [_agent_start("critic"), _ev("critic", "ground", "running", tool="generate")]
 
-    with span(
-        "research-ground",
-        input    = {"n_chunks_inspected": min(len(state["chunks"]), 20),
-                    "answer_length":      len(state["answer"])},
-        metadata = {"llm_key": state["llm_key"]},
-    ) as s:
-        result    = _run_with_span(get_agent("critic"), dict(state), AgentContext.empty())
-        grounding = result.data.get("grounding") or {"verdict": "unknown", "flags": list(result.errors)}
-        s.update(output={
-            "verdict": grounding.get("verdict", "unknown"),
-            "n_flags": len(grounding.get("flags", []) or []),
-            "flags":   grounding.get("flags", []),
-        })
+    # Snapshot pre-call counts that ``output_attrs_fn`` doesn't have access
+    # to (state is mutated inside the agent only via the returned data
+    # dict; reading ``state`` here is safe and matches the old SDK-span
+    # ``input`` payload).
+    n_chunks_inspected = min(len(state["chunks"]), 20)
+    answer_length      = len(state["answer"])
+
+    result = _run_with_span(
+        get_agent("critic"),
+        dict(state),
+        AgentContext.empty(),
+        input_attrs = {
+            "research.n_chunks_inspected": n_chunks_inspected,
+            "research.answer_length":      answer_length,
+            "research.llm_key":            state["llm_key"],
+        },
+        output_attrs_fn = lambda r: {
+            "research.verdict": (r.data.get("grounding") or {}).get("verdict", "unknown"),
+            "research.n_flags": len(((r.data.get("grounding") or {}).get("flags") or [])),
+            "research.flags":   list(((r.data.get("grounding") or {}).get("flags") or [])),
+        },
+    )
+    grounding = result.data.get("grounding") or {"verdict": "unknown", "flags": list(result.errors)}
 
     events.append(_ev("critic", "ground", "done", grounding.get("verdict", "unknown"), tool="generate"))
     events.append({"type": "grounding", **grounding})

@@ -1140,6 +1140,140 @@ account, neither of which the agent can or should provision.
 
 ---
 
-## Out of scope (later steps)
+## Phase 1.1f — Langfuse trace dedup on the LangGraph path
 
-Azure Speech, Azure AI Search — none introduced here.
+### Context
+
+Phase 1.1e shipped the CLI front door + ``OrchestratorAgent``. Running
+``.venv/bin/python -m rag.cli ask "Future of AI?"`` produced ~100
+entries in Langfuse for a single query: each of the five LangGraph
+nodes wrapped its agent call in *both* a Langfuse SDK span
+(``research-plan`` / ``research-search`` / ``research-analyze`` /
+``research-synthesize`` / ``research-ground``) and the OTel ``agent
+<name>`` span opened by ``_run_with_span`` — two sibling-level spans
+wrapping the same call. Across a 3-attempt reflection loop that comes
+out to 5 agents × 3 attempts × 1 redundant span = ~15 extra entries
+plus the resulting LLM-generation duplications that get pulled into
+two parents. The tech debt was flagged in the 1.1b code comments
+(``rag/research_graph.py:136-138`` — "dedup is a Phase-1c topic").
+Phase 1.1f closes it.
+
+### What ships in 1.1f
+
+#### Extended ``_run_with_span`` (``rag/agents/base.py``)
+
+Two new keyword-only parameters on the per-agent OTel-span wrapper:
+
+```python
+def _run_with_span(
+    agent:           Agent,
+    state:           dict,
+    ctx:             AgentContext,
+    *,
+    input_attrs:     dict | None                            = None,
+    output_attrs_fn: Callable[[AgentResult], dict] | None   = None,
+) -> AgentResult:
+```
+
+- ``input_attrs``    is stamped on the ``agent <name>`` span BEFORE
+  ``agent.run``. Adapters use it to push domain pre-call metadata
+  (the kind the sibling SDK span used to carry as ``input`` /
+  ``metadata``) onto the same OTel span.
+- ``output_attrs_fn`` is called with the resulting ``AgentResult``
+  AFTER the generic ``agent.status`` / ``agent.output_keys`` stamping.
+  Its returned dict is stamped on the span the same way.
+- Both hooks are purely additive — every existing caller (notably
+  ``rag/cli.py`` for the orchestrator span) keeps the exact pre-1.1f
+  behaviour.
+- Any exception raised while computing or stamping domain attributes
+  is silently dropped. Observability MUST NEVER fail the request.
+
+The exception path on ``agent.run`` itself (hard / soft policy
+bookkeeping, ``record_exception``, ``set_status``, ``add_event``,
+re-raise) is unchanged.
+
+#### Slim LangGraph adapters (``rag/research_graph.py``)
+
+The five node functions (``planner_node``, ``search_node``,
+``analyst_node``, ``synthesizer_node``, ``critic_node``) lose their
+``with span("research-<X>", …) as s:`` wrapper. The metadata that
+was on the SDK span moves to the OTel ``agent <name>`` span via the
+new wrapper hooks, under a new ``research.*`` attribute namespace:
+
+| Node          | ``input_attrs`` (pre-call)                                                                                | ``output_attrs_fn`` (post-call)                                                  |
+|---------------|-----------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| ``planner``   | ``research.attempt``, ``research.is_retry``, ``research.reflection_loop_count``, ``research.llm_key``     | ``research.n_sub_queries``, ``research.sub_queries`` (sequence of str)           |
+| ``search``    | ``research.n_sub_queries``, ``research.top_k``, ``research.model_key``                                    | ``research.n_episodes_found``, ``research.total_chunks``                         |
+| ``analyst``   | ``research.n_episodes``, ``research.llm_key``                                                             | ``research.n_analyses``                                                          |
+| ``synthesizer`` | ``research.n_analyses``, ``research.llm_key``, ``research.stream``                                      | ``research.answer_length``                                                       |
+| ``critic``    | ``research.n_chunks_inspected``, ``research.answer_length``, ``research.llm_key``                         | ``research.verdict``, ``research.n_flags``, ``research.flags`` (sequence of str) |
+
+The root ``research-request`` SDK span (``rag/research_graph.py``,
+opened in ``research_graph_stream``) is **kept**: ``trace_context(
+user_id=…, session_id=…, feature="research-graph")`` propagation
+relies on it, and the `span` import survives for that exact use.
+
+#### What did NOT change
+
+- ``rag/research.py`` — the legacy custom-orchestrator
+  ``research_stream`` (still mounted at ``/chat/research`` in
+  ``rag/api.py``) keeps its ``research-plan`` / ``research-search``
+  / etc. SDK spans. Its agents are NOT on ``_run_with_span``, so
+  removing the SDK spans would leave it with zero observability. It
+  will be retired in a separate step once the LangGraph path becomes
+  the single orchestrator.
+- ``rag/research.py`` and ``rag/chat.py`` ``chat-request`` /
+  ``router-classify`` SDK spans — separate span tree, separate
+  concern.
+- SSE event shape and ordering — the React UI and the new CLI both
+  consume these unchanged.
+- The reflection-loop semantics (``MAX_REFLECTION_LOOPS = 2``,
+  ``route_after_critic``, the ``reflection.loop_triggered`` span
+  event) — Phase 1.1c.2 surface, untouched.
+- The synthesizer's debug branch ``should_log_full_prompts()`` is
+  intentionally **dropped** rather than ported as a ``research.prompt``
+  span attribute. Multi-KB prompt text in an OTel attribute is
+  awkward to consume, and the auto LLM-generation span emitted by
+  ``langfuse.openai`` already carries the messages verbatim. Flip
+  ``LANGFUSE_LOG_FULL_PROMPTS=1`` and inspect the child generation
+  span for the same information.
+
+### Smoke test
+
+```bash
+# 1. Backend boots clean.
+.venv/bin/python -m uvicorn rag.api:app --reload
+curl -s http://localhost:8000/config | head -c 200    # expect HTTP 200
+
+# 2. End-to-end CLI run.
+.venv/bin/python -m rag.cli ask "Future of AI?"
+# expect: planner / search / analyst / synthesizer / critic events
+# in order; reflection-loop retries when critic verdict ≠ 'supported';
+# final sources + intent=research; no traceback.
+
+# 3. Wrapper signature.
+.venv/bin/python -c "
+from rag.agents.base import _run_with_span
+import inspect
+print(inspect.signature(_run_with_span))
+"
+# expect: (agent, state, ctx, *, input_attrs=None, output_attrs_fn=None)
+```
+
+### Hazards to watch for
+
+- **Soft-fail attribute stamping on partial data.** The critic's
+  ``output_attrs_fn`` reads ``r.data.get("grounding")``. On a critic
+  soft-fail the agent returns ``grounding={"verdict":"unknown",
+  "flags":[err_msg]}`` so the dict is always present. Future
+  soft-failing agents that return ``data={}`` would hit a ``None``
+  inside the lambda — the wrapper swallows the exception, but the
+  attribute simply won't appear on the span. Acceptable; document
+  per-agent expectations as the pattern propagates.
+- **OTel primitive-type discipline.** ``research.sub_queries`` and
+  ``research.flags`` are stored as sequences of strings — fine for
+  OTel. Avoid the temptation to JSON-encode dicts into a string
+  attribute; if a future agent has structured output worth showing,
+  add multiple flat attributes instead.
+
+---

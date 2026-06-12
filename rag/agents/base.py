@@ -162,13 +162,45 @@ def all_capabilities() -> list[CapabilityCard]:
 # ── Per-agent OTel span wrapper ─────────────────────────────────────────────
 
 
-def _run_with_span(agent: Agent, state: dict, ctx: AgentContext) -> AgentResult:
+def _run_with_span(
+    agent:           Agent,
+    state:           dict,
+    ctx:             AgentContext,
+    *,
+    input_attrs:     dict | None                                 = None,
+    output_attrs_fn: Callable[["AgentResult"], dict] | None      = None,
+) -> AgentResult:
     """Execute ``agent.run(state, ctx)`` inside an OTel ``agent <name>`` span.
 
     Always returns an ``AgentResult``. May re-raise if the agent's
     failure_policy is ``"hard"`` and an exception escapes; under a
     ``"soft"`` policy, exceptions are swallowed into a ``HARD_FAIL``
     result so the orchestrator can decide what to do.
+
+    Domain attribute stamping (Phase 1.1f)
+    --------------------------------------
+    The wrapper accepts two optional keyword-only hooks that let adapters
+    push *domain* metadata (the kind that used to live on the sibling
+    Langfuse SDK span) onto the same ``agent <name>`` OTel span — so a
+    single span carries both the generic ``agent.*`` plumbing and the
+    workflow-specific ``research.*`` (or future) signal, instead of two
+    sibling spans wrapping the same call.
+
+    * ``input_attrs``    — stamped on the span BEFORE ``agent.run``. Keys
+                           SHOULD be namespaced (``research.*``). Values
+                           MUST be OTel-primitive-compatible (``str``,
+                           ``int``, ``float``, ``bool``, or a sequence of
+                           those).
+    * ``output_attrs_fn`` — called with the ``AgentResult`` AFTER the
+                           generic ``agent.status`` / ``agent.output_keys``
+                           stamping. Its returned dict is stamped on the
+                           span the same way. Exceptions raised while
+                           computing or stamping output attrs are silently
+                           dropped — observability MUST NEVER fail the
+                           request.
+
+    Both hooks are purely additive; callers that don't pass them keep the
+    exact pre-1.1f behaviour.
     """
     tracer = _get_otel_tracer()
     cap    = agent.capabilities
@@ -186,6 +218,14 @@ def _run_with_span(agent: Agent, state: dict, ctx: AgentContext) -> AgentResult:
         span.set_attribute("agent.requires_llm",       cap.requires_llm)
         span.set_attribute("agent.requires_retrieval", cap.requires_retrieval)
         span.set_attribute("agent.failure_policy",     cap.failure_policy)
+        if input_attrs:
+            # Stamp domain pre-call attrs. Wrap defensively — a buggy
+            # adapter must never crash the agent invocation.
+            try:
+                for k, v in input_attrs.items():
+                    span.set_attribute(k, v)
+            except Exception:
+                pass
         try:
             result = agent.run(state, ctx)
         except Exception as exc:
@@ -206,6 +246,18 @@ def _run_with_span(agent: Agent, state: dict, ctx: AgentContext) -> AgentResult:
 
         span.set_attribute("agent.status",       result.status.value)
         span.set_attribute("agent.output_keys",  ",".join(result.data.keys()))
+        if output_attrs_fn is not None:
+            # Output-attribute computation runs on the agent's actual
+            # result — it can index into ``result.data``, call ``len()``
+            # on lists, etc. Any error here (KeyError on a soft-fail
+            # with partial data, TypeError on a None value, OTel
+            # rejecting a bad attribute type, …) is swallowed. The
+            # observability layer must NEVER fail the request.
+            try:
+                for k, v in output_attrs_fn(result).items():
+                    span.set_attribute(k, v)
+            except Exception:
+                pass
         if result.status == AgentStatus.SOFT_FAIL:
             span.add_event(
                 "agent.soft_fail",
