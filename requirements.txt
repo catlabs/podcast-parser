@@ -47,3 +47,8 @@ opentelemetry-exporter-otlp-proto-http
 # no account keys in any env file.
 azure-storage-blob
 azure-identity
+
+# ── MCP (Phase 1.MCP) ────────────────────────────────────────────────────────
+# Exposes ``rag.mcp_server`` over stdio for Claude Desktop. Major pinned —
+# the MCP Python SDK is young and may break shape across majors.
+mcp>=1.0,<2.0

@@ -1461,6 +1461,283 @@ sqlite3 rag/data/metadata.db "SELECT id, title FROM episodes ORDER BY id LIMIT 5
 
 ---
 
+## Phase 1.MCP — `SearchAgent` exposed as MCP stdio server
+
+### Context
+
+Phases 1.1a–1.1g formalized the in-process multi-agent architecture
+(six agents on a typed contract, OTel + Langfuse trace shape, CLI
+front door, summarizer agent as a non-research-mode proof point). The
+JD-driven pivot (2026-06-06 in ``current-status.md``) names **MCP**
+("Model Context Protocol or equivalent mechanisms") as a target
+competency. Phase 1.MCP is the first sub-step that crosses a process
+boundary: expose ONE existing agent over MCP and drive it from
+Claude Desktop. The pedagogical point is to prove the Phase-1
+``Agent`` / ``AgentContext`` / ``AgentResult`` contract — and the
+``_run_with_span`` observability harness — transport cleanly across a
+JSON-RPC stdio link, not to design the optimal MCP tool surface for
+the entire podcast app.
+
+The SearchAgent's ``sub_queries: list[str]`` input would feel awkward
+exposed verbatim as a Claude-Desktop-callable tool, so the MCP tool
+surface accepts a single ``query: str`` and the server passes
+``sub_queries=[query]`` to the agent — a single-query mode that still
+exercises the SearchAgent's normal code path (dedupe + per-episode
+rank).
+
+### What ships in 1.MCP
+
+#### New `rag/mcp_server.py`
+
+stdio MCP server (no HTTP, no SSE). Exposes ONE tool,
+``search_episodes(query: str, top_k: int | None = None, model_key:
+str | None = None) -> list[dict]``, that wraps the existing
+``SearchAgent``. Defaults: ``top_k = CHUNKS_PER_QUERY = 6`` (from
+``rag/agents/search.py``), ``model_key = DEFAULT_MODEL_KEY = "minilm"``
+(from ``rag/config.py``). The synchronous agent call is offloaded to a
+worker thread via ``asyncio.to_thread`` so the MCP stdio event loop
+stays responsive; the agent's internal ``ThreadPoolExecutor`` fan-out
+captures the parent OTel span via ``contextvars.copy_context()`` the
+same way as in Phase 1.1b.
+
+Tool input schema (JSON Schema as actually shipped):
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "query":     {"type": "string",  "description": "Natural-language search query."},
+    "top_k":     {"type": "integer", "description": "Chunks per query (default 6).",
+                  "minimum": 1, "maximum": 20},
+    "model_key": {"type": "string",  "description": "Embedding key from EMBED_REGISTRY (default 'minilm')."}
+  },
+  "required": ["query"]
+}
+```
+
+The tool response is a single ``TextContent`` carrying a JSON-shaped
+payload: ``{"query": str, "n_episodes": int, "n_chunks": int,
+"chunks": [...]}``. JSON over hand-rolled markdown so the structure
+stays machine-readable — the MCP host LLM does the human-facing
+synthesis.
+
+#### Trace shape
+
+Each tool call opens a Langfuse SDK span ``mcp-request`` as the trace
+root (input: ``{"query": query}``; metadata:
+``{"tool":"search_episodes","model_key":...,"top_k":...}``) and tags
+the trace with ``feature=mcp-search`` via ``trace_context(user_id=
+LANGFUSE_DEFAULT_USER_ID, session_id=None, feature="mcp-search")``.
+Inside, ``_run_with_span(get_agent("search"), ...)`` opens the
+``agent search`` OTel span as a child, and the existing retrieval /
+embedding spans produced by ``semantic_search`` nest under that.
+
+This is the **same trace-root pattern as ``cli-request`` from
+Phase 1.1e** — copy-paste rather than abstract over both surfaces.
+The two carry different metadata and different feature tags; a shared
+``OneOfTwo``-style abstraction would be premature.
+
+#### `mcp.*` span attributes (via Phase 1.1f hooks)
+
+No sibling Langfuse SDK span wraps the agent call — domain attributes
+are stamped on the ``agent search`` OTel span via the Phase 1.1f
+``_run_with_span(input_attrs=, output_attrs_fn=)`` hooks, under a
+fresh ``mcp.*`` namespace:
+
+| Attribute            | Source                | Notes                                                 |
+|----------------------|-----------------------|-------------------------------------------------------|
+| ``mcp.tool``         | ``input_attrs`` (str) | Always ``"search_episodes"`` in 1.MCP.                |
+| ``mcp.query``        | ``input_attrs`` (str) | Truncated to ``MCP_QUERY_MAX_ATTR_CHARS = 500``.      |
+| ``mcp.top_k``        | ``input_attrs`` (int) | Informational — SearchAgent uses its own constant.    |
+| ``mcp.model_key``    | ``input_attrs`` (str) | Embedding key actually used.                          |
+| ``mcp.n_chunks``     | ``output_attrs_fn`` (int) | Defensive ``r.data.get("chunks") or []``.          |
+| ``mcp.n_episodes``   | ``output_attrs_fn`` (int) | Defensive ``r.data.get("episodes_by_title") or {}``. |
+
+All values are OTel-primitive-compatible. ``mcp.query`` truncation is
+span hygiene only — the full query still ships in the MCP request
+payload and on the ``mcp-request`` SDK span's ``input`` field.
+
+#### stdout/stderr discipline
+
+The MCP server uses stdout for JSON-RPC framing — any stray
+``print(...)`` from anywhere in the import or call graph corrupts the
+protocol. The codebase has two known stdout-leakers reachable from
+``SearchAgent``: ``rag/embed.py`` prints ``"Loading embedding model
+..."`` / ``"Model ... ready."`` on first model load, and
+``sentence-transformers`` / ``safetensors`` print a ``BertModel LOAD
+REPORT`` table plus a tqdm weight-loading progress bar on stdout.
+
+Fix lives entirely in ``main()`` of ``rag/mcp_server.py``: grab the
+real ``sys.stdout.buffer`` first, rebind ``sys.stdout`` to
+``sys.stderr`` for the rest of the process, hand the captured buffer
+to ``stdio_server(stdout=...)`` explicitly (wrapped in a UTF-8
+``TextIOWrapper`` then ``anyio.wrap_file``, same pattern
+``stdio_server`` uses internally). The MCP framing layer gets the
+only legitimate stdout writer; everyone else writing to stdout ends
+up on stderr where it's safe.
+
+Implemented at the server entry point rather than patched into
+``rag/embed.py`` so the embedding provider stays untouched — per the
+1.MCP brief's "do NOT modify SearchAgent or any other agent" scope
+rule, broadened to retrieval support modules.
+
+#### Single new dependency
+
+``requirements.txt`` gains one line:
+
+```
+mcp>=1.0,<2.0
+```
+
+Smoke-tested against the Python SDK at version **1.27.2** (installed
+2026-06-12). All import paths the brief specified
+(``from mcp.server import Server``, ``from mcp.server.stdio import
+stdio_server``, ``from mcp.types import Tool, TextContent``,
+``server.list_tools()``, ``server.call_tool()``,
+``server.create_initialization_options()``) match the installed SDK
+shape; no symbol divergence to document.
+
+#### `claude_desktop_config.json` snippet
+
+Macos path:
+``~/Library/Application Support/Claude/claude_desktop_config.json``.
+
+```json
+{
+  "mcpServers": {
+    "podcast-parser": {
+      "command": "/Users/julien/dev/podcast-parser/.venv/bin/python",
+      "args":    ["-m", "rag.mcp_server"],
+      "env": {
+        "PYTHONUNBUFFERED":    "1",
+        "OTEL_ENABLED":        "true",
+        "LANGFUSE_HOST":       "https://cloud.langfuse.com",
+        "LANGFUSE_PUBLIC_KEY": "<paste from your local secret store>",
+        "LANGFUSE_SECRET_KEY": "<paste from your local secret store>"
+      }
+    }
+  }
+}
+```
+
+If the file already has other ``mcpServers``, merge the
+``"podcast-parser"`` key into the existing dict — don't overwrite.
+Restart Claude Desktop (Cmd+Q, reopen) after editing. Do **NOT**
+write real Langfuse keys into any committed file — the snippet uses
+``<paste …>`` placeholders deliberately.
+
+### What did NOT change
+
+- ``rag/agents/search.py`` — the SearchAgent's contract and internal
+  fan-out are preserved. The whole point of 1.MCP is that the existing
+  agent transports unchanged across a process boundary.
+- Any other agent file — no new agent registers, no
+  ``rag/agents/__init__.py`` edit.
+- ``rag/cli.py``, ``rag/api.py``, ``rag/research_graph.py``,
+  ``rag/research.py`` — none touched.
+- ``_run_with_span`` — the Phase 1.1f hooks suffice.
+- No new env vars. Existing observability env vars
+  (``LANGFUSE_*``, ``OTEL_ENABLED``) are forwarded into the MCP
+  subprocess by the user via Claude Desktop's ``env`` field.
+- No HTTP / SSE transport. Stdio is what Claude Desktop drives.
+  HTTP is the Azure-deploy sub-step's surface.
+- No MCP ``Resource`` or ``Prompt`` endpoints. Tools-only for v1.
+- No auth, no server-side caching, no CLI flags on the entry point.
+
+### Smoke test
+
+```bash
+# 1. Install the dep.
+.venv/bin/pip install 'mcp>=1.0,<2.0'
+
+# 2. Import-smoke.
+.venv/bin/python -c "import rag.mcp_server; print('ok')"
+# expect: ok
+
+# 3. Boot-smoke: tools/list via raw JSON-RPC over stdin.
+.venv/bin/python -m rag.mcp_server <<'EOF'
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke","version":"0"}}}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+EOF
+# expect: two JSON responses on stdout; the second's result.tools[0]
+# is the search_episodes definition. No stderr noise.
+
+# 4. End-to-end via the MCP client SDK (mirrors what Claude Desktop does).
+.venv/bin/python - <<'PY'
+import asyncio, json
+from mcp import ClientSession
+from mcp.client.stdio import StdioServerParameters, stdio_client
+
+async def main():
+    params = StdioServerParameters(
+        command=".venv/bin/python", args=["-m", "rag.mcp_server"],
+    )
+    async with stdio_client(params) as (r, w):
+        async with ClientSession(r, w) as session:
+            await session.initialize()
+            result = await session.call_tool("search_episodes", {"query": "Trump Iran"})
+            print(json.loads(result.content[0].text)["n_chunks"])
+
+asyncio.run(main())
+PY
+# expect: an integer > 0 (number of chunks returned for the query).
+
+# 5. End-to-end via Claude Desktop (manual mentor step).
+# Paste the claude_desktop_config.json snippet above. Restart Claude
+# Desktop. In a new chat, click the tool/MCP indicator; confirm
+# "podcast-parser" is listed and "search_episodes" is exposed. Prompt:
+# "Use the search_episodes tool to find content about Trump and Iran.
+# Then list the top 3 episode titles." Confirm tool call fires, JSON
+# payload comes back, Claude Desktop synthesizes a 3-bullet answer
+# using the chunk metadata.
+
+# 6. Regressions (existing flows untouched).
+.venv/bin/python -m rag.cli ask "list podcasts"      # orchestrator → list
+.venv/bin/python -m rag.cli ask "Future of AI?"      # orchestrator → research
+.venv/bin/python -m rag.cli summarize 1              # 1.1g summarize verb
+.venv/bin/python -m uvicorn rag.api:app --reload     # boot + curl /config
+
+# 7. Local-mode (observability off) still works.
+env -u OTEL_ENABLED LANGFUSE_ENABLED=false .venv/bin/python -m rag.mcp_server <<EOF
+... same JSON-RPC as step 3 ...
+EOF
+# expect: identical tools/list response; tools/call still returns chunks.
+```
+
+### Hazards to watch for
+
+- **stdout discipline as a class-of-bug.** Today's leakers
+  (``rag/embed.py`` + sentence-transformers) are caught by the
+  ``sys.stdout = sys.stderr`` rebind at server entry. New libraries
+  pulled in transitively could print to stdout on first use; the
+  rebind catches them too as long as it stays in place. Watch for any
+  future refactor of ``rag/mcp_server.py`` that moves the rebind
+  later than necessary.
+- **The agent ignores ``top_k``.** ``SearchAgent`` uses
+  ``CHUNKS_PER_QUERY`` (a compile-time constant) internally. The
+  tool surface accepts ``top_k`` and stamps it as ``mcp.top_k`` on
+  the span so the contract is stable when ``CHUNKS_PER_QUERY``
+  becomes runtime-configurable, but today it's informational only —
+  documented in the docstring of ``_run_search``.
+- **Single-query mode awkwardness.** SearchAgent was designed for
+  fan-out across planner-generated sub-queries. Wrapping a single
+  user query as ``sub_queries=[query]`` works (dedupe still runs, per-
+  episode ranking still runs), but the agent's fan-out branch
+  collapses to a no-op. A future sub-step that exposes
+  ``SummarizerAgent`` over MCP would land a cleaner shape (one
+  episode_id → one summary, no list-flattening). Flagged as an open
+  question in ``current-status.md``.
+- **MCP error semantics undefined.** A hard-fail in ``SearchAgent``
+  raises through ``_run_with_span``; that exception propagates up to
+  ``call_tool`` and the MCP server surfaces it to the host as a
+  protocol-level error. Today's only realistic hard-fail is
+  retrieval-backend unavailability. Worth a dedicated sub-step on
+  error mapping (which MCP error codes for which failure classes;
+  partial-results vs. fail-fast) when MCP usage stabilizes.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.

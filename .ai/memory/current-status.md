@@ -342,3 +342,82 @@ questions flagged for 1.1h: state-shape consistency (sub-dict vs.
 flat keys), thread+queue idiom now in two commands (extract utility?),
 truncation-as-band-aid → map-reduce pattern as next exercise if user
 expresses interest.
+
+2026-06-12 — Phase 1.MCP shipped: `SearchAgent` exposed as an MCP
+stdio server (`rag/mcp_server.py`), driven by Claude Desktop. First
+sub-step in which a Phase-1 agent crosses a process boundary —
+proves the typed `Agent` / `AgentContext` / `AgentResult` contract +
+the `_run_with_span` observability harness transport cleanly over
+JSON-RPC without changes to the agent itself. Concretely:
+  * `rag/mcp_server.py` (NEW) — stdio MCP server using
+    `mcp.server.Server` + `mcp.server.stdio.stdio_server`. ONE tool
+    `search_episodes(query, top_k?, model_key?)`. Wraps
+    `SearchAgent` via `_run_with_span` on a worker thread (offloaded
+    with `asyncio.to_thread` so the stdio event loop stays
+    responsive). Returns a JSON-shaped `TextContent`
+    (`{query, n_episodes, n_chunks, chunks}`).
+  * Trace shape: copies the Phase 1.1e `cli-request` pattern. Each
+    tool call opens a Langfuse SDK span `mcp-request` as the trace
+    root with `feature=mcp-search` tag via `trace_context(...)`.
+    The existing `agent search` OTel span nests under it; retrieval /
+    embedding spans inside `semantic_search` nest under that. NO
+    sibling SDK span wrapping the agent call — domain attributes
+    ride on the OTel span via the Phase 1.1f `_run_with_span(
+    input_attrs=, output_attrs_fn=)` hooks under a new `mcp.*`
+    namespace (`mcp.tool`, `mcp.query` truncated to 500 chars,
+    `mcp.top_k`, `mcp.model_key`, `mcp.n_chunks`, `mcp.n_episodes`).
+  * stdout/stderr discipline: MCP uses stdout for JSON-RPC framing —
+    any stray `print(...)` corrupts the protocol. Two leakers exist
+    on the SearchAgent path (`rag/embed.py` "Loading embedding
+    model..." and sentence-transformers' BertModel report + tqdm
+    progress bars). Fix lives entirely in `main()` of
+    `rag/mcp_server.py`: grab `sys.stdout.buffer` first, rebind
+    `sys.stdout` to `sys.stderr`, hand the captured buffer to
+    `stdio_server(stdout=...)` explicitly. Implemented at the entry
+    point rather than patched into `rag/embed.py` so the embedding
+    provider stays untouched (1.MCP brief's "do NOT modify
+    SearchAgent or any other agent" scope rule, broadened to
+    retrieval support modules).
+  * `requirements.txt` gains one line: `mcp>=1.0,<2.0`. Smoke-tested
+    against the installed Python SDK at **mcp 1.27.2**; all import
+    paths in the 1.MCP brief match the installed shape (no symbol
+    divergence to document).
+  * `MIGRATION.md` Phase 1.MCP section appended: tool schema, trace
+    shape, `mcp.*` attribute table, the verbatim
+    `claude_desktop_config.json` snippet (with placeholder Langfuse
+    keys — never commit real keys).
+  * SearchAgent itself: untouched. CLI flows: untouched. FastAPI
+    surface: untouched. `_run_with_span`: untouched. Single new dep
+    (`mcp`), single new module (`rag/mcp_server.py`).
+Smoke tests passed: import smoke OK; raw JSON-RPC `tools/list` OK
+(two clean JSON responses on stdout, zero stderr noise); end-to-end
+via the MCP client SDK OK (3 chunks across 1 episode for "Trump
+Iran"); local-mode (no Langfuse, no OTel) end-to-end OK; CLI
+regressions OK (`ask "list podcasts"`, `ask "Future of AI?"`,
+`summarize 1`); FastAPI `/config` returns 200. Claude Desktop end-
+to-end (UI tool indicator + tool call + answer synthesis) needs
+**manual mentor verification** — the coder agent can't drive Claude
+Desktop's UI. Langfuse spot-check (trace tree shape on real Cloud
+infrastructure) likewise needs the mentor's eyeballs — wiring is
+verified code-wise but trace shape on the Langfuse UI is the
+mentor's call.
+JD competencies muscled: (1) **MCP transport proven** — the
+Phase-1 agent contract crosses a process boundary unchanged, the
+trace shape (`feature=mcp-search`, `mcp-request` SDK root, `agent
+search` OTel child, `mcp.*` attributes) survives JSON-RPC framing;
+(2) **multi-surface fan-out**: the same agent is now driven by three
+distinct surfaces (HTTP via `rag/api.py`, CLI via `rag/cli.py`,
+JSON-RPC stdio via `rag/mcp_server.py`) — the contract holds across
+all three; (3) **observability discipline**: the Phase 1.1f
+attribute-stamping hooks generalize from one orchestration
+(LangGraph nodes) to a different one (MCP stdio dispatch) with no
+new wrapper extension. Open questions flagged for the next MCP
+sub-step: (a) does the stdio transport break OTel context propagation
+across the process boundary in any way that would matter when this
+server moves to HTTP (Azure deploy)? — specifically would a
+`traceparent` header from the MCP client be picked up by the server's
+tracer; (b) was the `sub_queries=[query]` single-query mode awkward
+enough that exposing `SummarizerAgent` (cleaner shape: one
+episode_id → one summary) would have been a better v1?; (c) MCP
+error semantics — what does a hard-fail in `SearchAgent` look like
+to Claude Desktop?
