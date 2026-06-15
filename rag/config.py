@@ -32,7 +32,10 @@ BASE_DIR = Path(__file__).parent.parent   # podcast-parser/
 
 def _path_from_env(var: str, default: Path) -> Path:
     raw = os.environ.get(var)
-    return Path(raw).expanduser() if raw else default
+    if not raw:
+        return default
+    p = Path(raw).expanduser()
+    return p if p.is_absolute() else (BASE_DIR / p).resolve()
 
 OUTPUT_DIR = _path_from_env("OUTPUT_DIR", BASE_DIR / "output")
 DATA_DIR   = _path_from_env("DATA_DIR",   BASE_DIR / "rag" / "data")

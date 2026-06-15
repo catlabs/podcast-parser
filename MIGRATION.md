@@ -1738,6 +1738,66 @@ EOF
 
 ---
 
+### Phase 1.MCP.1 — hotfix: portable data paths + observability exception hygiene
+
+Two independent bugs stacked to produce an inscrutable error when Claude Desktop
+spawned the MCP subprocess with `cwd=/`: an `OSError` from `embed.py:40` (trying
+to `mkdir` the relative path `rag/data/chroma` under `/`, a read-only root on
+macOS) was swallowed by a double-yield bug in `trace_context`, which surfaced as
+`RuntimeError("generator didn't stop after throw()")`. The real cause was hidden.
+
+Diagnostic chain: Claude Desktop reports `generator didn't stop after throw()` →
+headless reproduction with `cwd=/` → direct `_run_search` invocation (bypassing
+MCP) → real `OSError` from `embed.py:40` surfaces → masking bug in
+`trace_context` identified.
+
+**Bug A fix — `rag/config.py` `_path_from_env` (lines 33–38):**
+
+```diff
+-def _path_from_env(var: str, default: Path) -> Path:
+-    raw = os.environ.get(var)
+-    return Path(raw).expanduser() if raw else default
++def _path_from_env(var: str, default: Path) -> Path:
++    raw = os.environ.get(var)
++    if not raw:
++        return default
++    p = Path(raw).expanduser()
++    return p if p.is_absolute() else (BASE_DIR / p).resolve()
+```
+
+Relative env-var values (e.g. `.env.agent-safe`'s `./rag/data`) now resolve
+against `BASE_DIR` (module-anchored) instead of `cwd`. Absolute overrides and
+defaults: unchanged. `.env.agent-safe` itself stays untouched.
+
+**Bug B fix — `rag/observability.py` `trace_context` (lines 210–220):**
+
+```diff
+-    try:
+-        with propagate_attributes(**kwargs):
+-            yield
+-    except Exception:
+-        # Fall back to an unwrapped body — never let observability fail the request.
+-        yield
++    try:
++        cm = propagate_attributes(**kwargs)
++    except Exception:
++        yield
++        return
++    with cm:
++        yield
+```
+
+Only the *setup* of `propagate_attributes` is guarded. A `@contextmanager` MUST
+yield exactly once; catching an exception thrown back into `yield` and yielding
+again is the double-yield anti-pattern. Exceptions in the body now propagate with
+their original type and message.
+
+This fix also de-risks Phase 4 (extracting an agent as a container service): the
+same `cwd` assumption would have broken any containerised deploy whose working
+directory doesn't match the project root.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.

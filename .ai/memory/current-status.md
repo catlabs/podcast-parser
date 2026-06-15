@@ -421,3 +421,14 @@ enough that exposing `SummarizerAgent` (cleaner shape: one
 episode_id → one summary) would have been a better v1?; (c) MCP
 error semantics — what does a hard-fail in `SearchAgent` look like
 to Claude Desktop?
+
+---
+
+2026-06-15 — Phase 1.MCP.1 hotfix: portable data paths + observability exception hygiene.
+Fixed two stacked bugs that prevented Claude Desktop from calling `search_episodes`: (1)
+`_path_from_env` in `rag/config.py` now anchors relative env-var paths to `BASE_DIR`
+instead of `cwd`; (2) the double-yield anti-pattern in `trace_context` (observability.py)
+was masking the real `OSError` with a `RuntimeError("generator didn't stop after throw()")`.
+All four smoke tests pass, including end-to-end MCP client from `cwd=/`. No other
+`@contextmanager` in `rag/` shares the double-yield pattern.
+commit: <fill-in-after-commit>

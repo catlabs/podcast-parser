@@ -207,9 +207,15 @@ def trace_context(
     except Exception:
         yield
         return
+    # Only the SETUP of propagate_attributes is wrapped in try/except — never
+    # the yield. A @contextmanager generator MUST yield exactly once; catching
+    # an exception raised back into ``yield`` and yielding again triggers a
+    # RuntimeError("generator didn't stop after throw()") that masks the
+    # original cause.
     try:
-        with propagate_attributes(**kwargs):
-            yield
+        cm = propagate_attributes(**kwargs)
     except Exception:
-        # Fall back to an unwrapped body — never let observability fail the request.
+        yield
+        return
+    with cm:
         yield
