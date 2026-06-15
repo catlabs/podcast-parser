@@ -431,4 +431,4 @@ instead of `cwd`; (2) the double-yield anti-pattern in `trace_context` (observab
 was masking the real `OSError` with a `RuntimeError("generator didn't stop after throw()")`.
 All four smoke tests pass, including end-to-end MCP client from `cwd=/`. No other
 `@contextmanager` in `rag/` shares the double-yield pattern.
-commit: <fill-in-after-commit>
+commit: e2a5016
