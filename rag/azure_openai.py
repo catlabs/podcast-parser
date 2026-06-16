@@ -47,6 +47,14 @@ from rag.otel import get_tracer as _get_otel_tracer
 
 log = logging.getLogger(__name__)
 
+# Reasoning models (o1-*, gpt-5.x) consume tokens from this cap
+# for internal reasoning AS WELL AS visible output. 16K leaves
+# comfortable headroom for a structured synthesis (~3-4K
+# output) on top of ~8K reasoning. Bump higher if reduce-phase
+# truncation reappears in traces (look for
+# output_reasoning_tokens > 0 with output == 0).
+AZURE_OPENAI_MAX_COMPLETION_TOKENS = 16384
+
 # Canonical OTel GenAI semantic-convention identifier for Azure OpenAI.
 # Used as the `gen_ai.system` attribute — the OTel registry distinguishes
 # `az.ai.openai` (Azure OpenAI Service) from `az.ai.inference` (Azure AI
@@ -197,10 +205,10 @@ class AzureOpenAIChatProvider:
                     response = client.chat.completions.create(
                         model                 = AZURE_OPENAI_DEPLOYMENT,
                         messages              = messages,
-                        max_completion_tokens = 1024,
+                        max_completion_tokens = AZURE_OPENAI_MAX_COMPLETION_TOKENS,
                     )
                 except BadRequestError as exc:
-                    _log_azure_bad_request(exc, messages=messages, max_completion_tokens=1024)
+                    _log_azure_bad_request(exc, messages=messages, max_completion_tokens=AZURE_OPENAI_MAX_COMPLETION_TOKENS)
                     raise
                 _otel_set_azure_usage(response)
                 return response.choices[0].message.content or ""
@@ -245,12 +253,12 @@ class AzureOpenAIChatProvider:
                         stream = client.chat.completions.create(
                             model                 = AZURE_OPENAI_DEPLOYMENT,
                             messages              = messages,
-                            max_completion_tokens = 1024,
+                            max_completion_tokens = AZURE_OPENAI_MAX_COMPLETION_TOKENS,
                             stream                = True,
                         )
                     except BadRequestError as exc:
                         _log_azure_bad_request(exc, messages=messages,
-                                               max_completion_tokens=1024, stream=True)
+                                               max_completion_tokens=AZURE_OPENAI_MAX_COMPLETION_TOKENS, stream=True)
                         raise
                     for chunk in stream:
                         if not chunk.choices:
