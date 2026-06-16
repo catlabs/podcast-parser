@@ -1914,6 +1914,76 @@ directory doesn't match the project root.
 
 ---
 
+### Phase 1.1f.2 — unify trace topology across SDK and OTel paths
+
+**Problem.** Two parallel observability pipelines coexisted in this process:
+`rag/observability.py` drove the Langfuse Python SDK (which registers its own
+`TracerProvider` as the global one and attaches a `LangfuseSpanProcessor`), and
+`rag/otel.py` maintained its OWN private `TracerProvider` with a separate
+`BatchSpanProcessor` exporting to the same Langfuse OTel ingest endpoint. The
+private TP was originally introduced to avoid double-export — a real concern,
+since both processors share the same destination. The cost was architectural:
+two TracerProviders meant the `agent <name>` OTel spans lived in a sibling
+pipeline from the `cli-request` / `mcp-request` Langfuse-SDK spans, even though
+OTel context (parent / trace_id) is provider-agnostic and propagates fine
+through `contextvars`. Reading a Langfuse trace required mentally splicing two
+roots together.
+
+**Fix (shape A — refined).** Drop `rag/otel.py`'s private `TracerProvider` and
+issue spans on the GLOBAL TP (Langfuse's). To preserve the no-double-export
+invariant, install ONE extra `BatchSpanProcessor` on the global TP — class
+`_AgentScopeOnlyBatchProcessor` — that filters spans by TWO joint predicates:
+`instrumentation_scope.name == "rag.gen_ai"` AND no `gen_ai.*` attribute keys.
+That is exactly the `agent <name>` wrapper-span set produced by
+`_run_with_span` — and it's the complement of what `LangfuseSpanProcessor`
+already forwards (Langfuse-SDK-scoped spans + any span carrying `gen_ai.*`
+attrs + a curated LLM-instrumentation allowlist). Disjoint sets, single export
+per span. The `chat <model>` / `embeddings <model>` spans (scope `rag.gen_ai`,
+WITH `gen_ai.*` attrs) flow through Langfuse's processor only — same end
+destination, same backend visibility, no duplicates.
+
+**Generalization of Phase 1.1f.** Phase 1.1f deduplicated sibling Langfuse-SDK
+spans wrapping LangGraph-node agent calls — those were the explicit, visible
+duplicates. Phase 1.1f.2 dissolves the IMPLICIT duplication: two providers
+flowing to one ingest with no defined partition. The `_run_with_span` contract
+(input_attrs / output_attrs_fn) is unchanged; the CLI / MCP / LangGraph call
+sites are unchanged; only the wiring underneath shifted.
+
+**EDA lens.** Same root cause as a microservice handoff where two services use
+different OTel SDKs without sharing a `traceparent` — context propagation
+breaks at the library boundary, and the consumer sees two disconnected trace
+roots instead of one tree. In our single-process microcosm the boundary was
+between two TracerProviders inside one process; the fix is structurally
+identical to "agree on one tracer-provider" in a distributed setting.
+
+**Bundled CLI thread-context fix.** Investigation surfaced a SECOND,
+orthogonal cause of the summarize-path trace split: `rag/cli.py:_summarize_stream`
+spawned its agent worker via `threading.Thread(target=_worker, ...)` without
+copying the OTel context (`contextvars` are NOT inherited across plain
+threads). The worker opened `agent summarizer` in an empty context → fresh
+root span → new trace_id, defeating the topology unification above on the
+summarize path. The MCP path was already clean (it uses `asyncio.to_thread`,
+which copies context); the synchronous `ask` / orchestrator path was never
+affected. The brief originally scoped this out to a Phase 1.1f.3 follow-up,
+but without it the 1.1f.2 invariant ("every `cli-request` is the parent of
+its `agent <name>` spans") doesn't hold for `summarize`, so the fix is
+bundled here. The patch is one line at the thread-spawn site:
+`ctx = contextvars.copy_context(); thread = threading.Thread(target=ctx.run,
+args=(_worker,), daemon=True)` — same idiom used by
+`rag/agents/search.py` and `rag/research.py` for their `ThreadPoolExecutor`
+fan-out.
+
+Files touched: `rag/otel.py`, `rag/cli.py`. Smoke tests (in-memory
+`SimpleSpanProcessor` + `InMemorySpanExporter` on the global TP):
+summarize fast-path captures 4 spans in one trace
+(`cli-request` → `agent summarizer` → `chat <model>` + `OpenAI-generation`);
+slow-path captures 24 spans = 1 `cli-request` + 1 `agent summarizer`
++ 11 `chat <model>` + 11 `OpenAI-generation`, single trace_id, correct
+parent linkage. Local mode (`OTEL_ENABLED` unset / no `LANGFUSE_*`)
+unaffected — no-op tracer + `contextvars.copy_context()` is stdlib.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.

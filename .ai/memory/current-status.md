@@ -457,3 +457,16 @@ phase (fan-out / fan-in) — that's where async + backpressure + retry
 discipline become the explicit exercise. 1.1h.3 reserved for hierarchical
 reduce + token-based sizing.
 commit: <fill-in-after-commit>
+
+2026-06-16 — Phase 1.1f.2 shipped: trace topology unified AND CLI
+thread-context loss fixed (bundled). `rag/otel.py` drops its private
+`TracerProvider` and attaches one scope-filtered `BatchSpanProcessor` to the
+GLOBAL TP (Langfuse SDK owns it); filter `scope=="rag.gen_ai"` AND no
+`gen_ai.*` attrs — disjoint from `LangfuseSpanProcessor`'s set, no double
+export, Phase 1.1f dedup invariant preserved. `rag/cli.py:_summarize_stream`
+now wraps the worker thread with `contextvars.copy_context().run(_worker)`
+(same idiom as `rag.research` / `rag.agents.search`), so `agent summarizer`
+inherits `cli-request`'s OTel context instead of opening a fresh root.
+In-memory span-exporter harness verified single-trace topology for
+summarize fast & slow path (4 / 24 spans, parent linkage correct).
+commit: <fill-in-after-commit>

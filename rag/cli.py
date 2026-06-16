@@ -307,6 +307,7 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
     ``_render_stream`` consumer handles tokens / result / warnings
     without knowing this is the summarize path.
     """
+    import contextvars
     import queue
     import threading
 
@@ -363,7 +364,13 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
         finally:
             token_q.put(None)  # sentinel — drain loop on the main thread exits
 
-    thread = threading.Thread(target=_worker, daemon=True)
+    # Copy the current context so OTel's contextvar-backed active span
+    # propagates into the worker — without this, ``agent summarizer``
+    # opens in empty context and becomes a fresh root span (split trace).
+    # Same idiom as ``rag.research`` / ``rag.agents.search`` for their
+    # ThreadPoolExecutor fan-out (Phase 1.1f.2).
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_worker,), daemon=True)
     thread.start()
 
     while True:
