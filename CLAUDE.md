@@ -16,6 +16,28 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
   migration Steps 9–12. Step 9 (Azure AI Search) is deferred — not abandoned,
   but the JD ("LLM-focused AI Engineer") names multi-agent + orchestration +
   MCP, not RAG/AI Search. Time is better spent on Phase 1 first.
+- **2026-06-15 dual-lens framing**: Phase 1 remains the priority spine, but
+  two parallel lenses now apply to every brief and architectural discussion,
+  reflecting the production enterprise AI engineering posture this project
+  trains for:
+  1. **Event-driven architecture + microservices vocabulary lens** —
+     when a sub-step naturally surfaces sync/async, fan-out/fan-in,
+     orchestration/choreography, eventual consistency, idempotency,
+     dead-letter queues, or distributed tracing across process
+     boundaries, name the pattern explicitly. The lens is woven into
+     existing roadmap touchpoints (Phase 1.MCP, Steps 9/11, Phases 4/7);
+     it is not a separate track.
+  2. **Azure ecosystem opportunistic exposure lens** — when a design
+     choice has comparable learning value either way, default to the
+     Azure-native option. Named services to favor: Azure OpenAI
+     (already shipped), Application Insights / Azure Monitor (OTel
+     dual-export opportunity), Azure AI Search (re-frame as MCP tool
+     variant rather than RAG plumbing), Azure AI Foundry tracing,
+     `DefaultAzureCredential` as the universal auth pattern. Foundry's
+     **agent service** stays out of scope until Phase 6.
+  Both lenses are operational details documented in the user's private
+  agent memory; this file only states the priority order. Neither lens
+  is allowed to halt or pre-empt the active Phase 1 sub-step in flight.
 
 ## Long-term architecture target
 
