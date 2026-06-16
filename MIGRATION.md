@@ -1461,6 +1461,122 @@ sqlite3 rag/data/metadata.db "SELECT id, title FROM episodes ORDER BY id LIMIT 5
 
 ---
 
+## Phase 1.1h — map-reduce summarization in `SummarizerAgent`
+
+### Context
+
+Phase 1.1g shipped ``SummarizerAgent`` with a single-call shape and a
+``MAX_TRANSCRIPT_CHARS = 200_000`` band-aid at the CLI layer: long
+transcripts were silently truncated tail-side before the agent ever saw
+them. 1.1h replaces that band-aid with a proper **sequential
+map-reduce** pipeline inside the agent. The public contract is unchanged
+(``reads = ("episode", "transcript", "llm_key")``, ``writes = ("summary",)``)
+— the chunking, mapping, and reducing all live behind ``run()``.
+
+### What ships in 1.1h
+
+- **Three new constants** (top of ``rag/agents/summarizer.py``):
+  - ``MAP_REDUCE_THRESHOLD_CHARS = 120_000`` — below this, the agent
+    takes the **fast-path** (one streaming LLM call, Phase 1.1g
+    behavior preserved verbatim). Above, it takes the **slow-path**.
+  - ``MAP_CHUNK_CHARS = 12_000`` — size of each map-phase window
+    (~3K tokens at 4 chars/token).
+  - ``MAP_CHUNK_OVERLAP_CHARS = 1_000`` — overlap between consecutive
+    windows, mitigates the "important fact straddles a boundary"
+    failure mode.
+- **A new ``MAP_SYSTEM`` prompt** — terser than ``SUMMARIZER_SYSTEM``,
+  asks for 4-8 factual bullets per segment. The original
+  ``SUMMARIZER_SYSTEM`` is now used only for the reduce phase, where
+  its structured-summary shape is what we want for the user-facing
+  output.
+- **Pure helper ``_chunk_transcript``** — same input always yields the
+  same chunks. That idempotency is the property that would make a
+  future parallel/async variant safe.
+- **``SummarizerAgent.run`` branches on transcript length**, dispatching
+  to either ``_summarize_one_shot`` (Phase 1.1g body, lifted unchanged
+  into its own method) or ``_summarize_map_reduce``. The map phase is
+  **sequential** and **non-streaming**; per-chunk progress travels
+  through ``ctx.token_queue`` as ``{"type": "step", ...}`` events
+  (``map_chunk start`` / ``map_chunk ok`` / ``reduce start``) consumed
+  unchanged by the existing generic step-renderer in
+  ``rag/cli.py::_render_stream``. Tokens stream ONLY during reduce.
+- **CLI cleanup** (``rag/cli.py::_summarize_stream``): the truncation
+  block (~lines 326–337) and the ``MAX_TRANSCRIPT_CHARS`` import are
+  gone. The agent now receives the full transcript. The
+  ``summarize.truncated`` input attr is removed; a new
+  ``summarize.n_chunks`` output attr (defensive
+  ``int(... or 1)``, defaulting to 1 on the fast-path) is added via
+  the Phase 1.1f ``output_attrs_fn`` hook. The footer prints
+  ``n_chunks=N`` only when map-reduce actually ran (``N > 1``) so
+  fast-path output stays visually identical to Phase 1.1g.
+
+### Fan-out / fan-in: this is the sequential v1
+
+The map-reduce shape is the canonical **fan-out / fan-in** primitive
+that AI engineering and event-driven architecture share. Sequential v1
+(this sub-step) is debuggable in the inspector and traceable in
+Langfuse as a clean serial sequence of ``gen_ai.*`` spans under the
+single ``agent summarizer`` OTel span. Phase 1.1h.2 will introduce
+**bounded parallelism** in the map phase (asyncio.gather or a thread
+pool with a concurrency cap) and that's where the async + EDA
+trade-offs (idempotency-driven retry, backpressure, partial-failure
+handling) become the explicit exercise. Resisted in 1.1h.1 on purpose.
+
+### Truncation removal
+
+``MAX_TRANSCRIPT_CHARS`` is gone from the codebase. ``grep -rn
+"MAX_TRANSCRIPT_CHARS" rag/`` returns zero hits. The ``truncate``
+step event and the ``truncated`` field on the ``result`` event are
+also gone — no consumer downstream of ``_render_stream`` reads them.
+
+### Smoke test
+
+```bash
+# 1. Regression — existing flows unchanged.
+.venv/bin/python -m rag.cli ask "list podcasts"
+.venv/bin/python -m rag.cli ask "Future of AI?"
+.venv/bin/python -m uvicorn rag.api:app --reload  # boot, curl /config, Ctrl+C
+
+# 2. Fast-path — short transcript still one-shot, no map_chunk/reduce events.
+.venv/bin/python -m rag.cli summarize 6      # 23984 chars → fast-path
+
+# 3. Slow-path — long transcript triggers sequential map-reduce.
+# (Fabricate via INSERT/DELETE on a concatenated transcript if no
+# naturally-long episode exists; do NOT commit the artifact.)
+.venv/bin/python -m rag.cli summarize <LONG_ID>
+# expect: N pairs of map_chunk start/ok events, one reduce start, then
+# streaming tokens. Footer shows n_chunks=N.
+
+# 4. Truncation removed.
+grep -rn "truncating tail\|MAX_TRANSCRIPT_CHARS" rag/    # zero hits
+
+# 5. Chunking is pure.
+.venv/bin/python -c "from rag.agents.summarizer import _chunk_transcript; \
+  assert _chunk_transcript('a'*50000) == _chunk_transcript('a'*50000); print('OK')"
+```
+
+### Hazards to watch for
+
+- **Hierarchical reduce not implemented.** If a transcript is so long
+  that the concatenated partial summaries themselves exceed the
+  provider context window, the reduce call will fail. v1 hard-fails;
+  recursive reduce (groups → super-summaries → final) is a 1.1h.3
+  refinement.
+- **No retry on map-phase failures.** A single failing chunk fails the
+  whole agent run (``failure_policy = "hard"``). Per-chunk retry +
+  partial-results recovery is 1.1h.2 territory — that's where the
+  async/EDA discipline (idempotency keys, dead-letter handling) is the
+  point of the exercise.
+- **Char-based sizing, not token-based.** ``MAP_CHUNK_CHARS`` uses the
+  4 chars/token rule of thumb. A provider-specific tokenizer
+  (``tiktoken``, ``anthropic.tokenizers``) would let us pack chunks
+  closer to the actual context limit. Deferred to 1.1h.3 to keep this
+  sub-step dependency-free.
+- **Same ``llm_key`` for both phases.** No cheap-for-map /
+  smart-for-reduce split. Cost-optimization exercise for later.
+
+---
+
 ## Phase 1.MCP — `SearchAgent` exposed as MCP stdio server
 
 ### Context

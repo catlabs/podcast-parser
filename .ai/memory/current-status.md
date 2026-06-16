@@ -432,3 +432,28 @@ was masking the real `OSError` with a `RuntimeError("generator didn't stop after
 All four smoke tests pass, including end-to-end MCP client from `cwd=/`. No other
 `@contextmanager` in `rag/` shares the double-yield pattern.
 commit: e2a5016
+
+2026-06-16 — Phase 1.1h shipped: sequential map-reduce in `SummarizerAgent`.
+Replaces the 1.1g `MAX_TRANSCRIPT_CHARS = 200_000` band-aid (silent tail-drop
+at the CLI layer) with proper handling of long transcripts inside the agent.
+Public contract unchanged. `run()` branches on transcript length: fast-path
+(≤ 120_000 chars) keeps the 1.1g single-streaming-call behavior verbatim;
+slow-path chunks via pure `_chunk_transcript` (12K char windows, 1K overlap),
+runs sequential non-streaming map calls with a terser `MAP_SYSTEM` prompt,
+then reduces via one streaming `SUMMARIZER_SYSTEM` call over the
+concatenated partials. Tokens stream ONLY during reduce; per-chunk progress
+travels as `{"type": "step", ...}` events through `ctx.token_queue` and is
+rendered unchanged by the existing generic step-renderer in `_render_stream`.
+CLI cleanup: truncation block + `MAX_TRANSCRIPT_CHARS` import + `summarize.truncated`
+attr removed; `summarize.n_chunks` output attr added via the 1.1f
+`output_attrs_fn` hook (defaults to 1 on the fast-path). Footer shows
+`n_chunks=N` only when map-reduce ran. Five smoke tests pass: regressions
+(`ask "list podcasts"`, `ask "Future of AI?"`, `uvicorn`), fast-path
+(episode 6, 23984 chars, zero map_chunk events), slow-path (fabricated
+143972-char episode → 14 chunks, all map_chunk/reduce events fired, summary
+covers begin AND end), `grep -rn MAX_TRANSCRIPT_CHARS rag/` empty, chunking
+idempotency. 1.1h.2 will introduce **bounded parallelism** in the map
+phase (fan-out / fan-in) — that's where async + backpressure + retry
+discipline become the explicit exercise. 1.1h.3 reserved for hierarchical
+reduce + token-based sizing.
+commit: <fill-in-after-commit>

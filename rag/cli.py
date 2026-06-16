@@ -312,7 +312,6 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
 
     from rag.agents import AgentContext, get as get_agent
     from rag.agents.base import _run_with_span
-    from rag.agents.summarizer import MAX_TRANSCRIPT_CHARS
     from rag.providers import get_object_store
 
     yield {"type": "agent_start", "agent": "summarizer", "label": "Episode Summarizer"}
@@ -323,25 +322,15 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
     with store.local_view(episode["file_path"]) as path:
         transcript = path.read_text()
 
-    truncated = False
-    if len(transcript) > MAX_TRANSCRIPT_CHARS:
-        truncated = True
-        yield {
-            "type":   "step",
-            "step":   "truncate",
-            "status": "warn",
-            "agent":  "summarizer",
-            "detail": f"transcript {len(transcript)} chars > "
-                      f"{MAX_TRANSCRIPT_CHARS}; truncating tail",
-        }
-        transcript = transcript[:MAX_TRANSCRIPT_CHARS]
+    # Phase 1.1h: no CLI-level truncation. The agent handles long
+    # transcripts internally via sequential map-reduce.
+    transcript_chars = len(transcript)
 
     state = {
         "episode":    episode,
         "transcript": transcript,
         "llm_key":    llm_key,
     }
-    transcript_chars = len(transcript)
 
     token_q: "queue.Queue[dict | None]" = queue.Queue()
     holder: dict = {}
@@ -360,10 +349,13 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
                     "episode.transcript_chars": transcript_chars,
                     "summarize.llm_key":        llm_key,
                     "summarize.stream":         True,
-                    "summarize.truncated":      truncated,
                 },
+                # ``map_reduce.n_chunks`` is informational, only present
+                # in ``result.data`` when the slow-path ran — defensive
+                # ``.get()`` keeps the fast-path unaffected.
                 output_attrs_fn = lambda r: {
                     "summarize.summary_length": len(r.data.get("summary") or ""),
+                    "summarize.n_chunks":       int(r.data.get("map_reduce.n_chunks") or 1),
                 },
             )
         except Exception as exc:
@@ -387,12 +379,13 @@ def _summarize_stream(episode: dict, *, llm_key: str) -> Iterator[dict]:
         return
 
     summary = holder["result"].data["summary"]
+    n_chunks = int(holder["result"].data.get("map_reduce.n_chunks") or 1)
     yield {
         "type":             "result",
         "summary":          summary,
         "episode":          episode,
-        "truncated":        truncated,
         "transcript_chars": transcript_chars,
+        "n_chunks":         n_chunks,
     }
     yield {"type": "agent_end", "agent": "summarizer"}
 
@@ -417,15 +410,18 @@ def _fetch_episode_or_die(episode_id: int) -> dict:
 
 def _render_summary(result: dict, *, llm_key: str) -> None:
     """Footer line under the streamed summary."""
-    episode = result.get("episode") or {}
-    title   = episode.get("title") or "?"
-    podcast = episode.get("podcast") or "?"
-    date    = f" — {episode['date']}" if episode.get("date") else ""
-    chars   = result.get("transcript_chars") or 0
-    trunc   = " (truncated)" if result.get("truncated") else ""
+    episode  = result.get("episode") or {}
+    title    = episode.get("title") or "?"
+    podcast  = episode.get("podcast") or "?"
+    date     = f" — {episode['date']}" if episode.get("date") else ""
+    chars    = result.get("transcript_chars") or 0
+    n_chunks = result.get("n_chunks") or 1
+    # Show ``n_chunks=N`` only when map-reduce actually ran (n>1) — the
+    # fast-path stays visually identical to Phase 1.1g.
+    mr_part  = f"  n_chunks={n_chunks}" if n_chunks > 1 else ""
     console.print()
     console.print(f"[dim]episode={title!r}  podcast={podcast}{date}  "
-                  f"transcript_chars={chars}{trunc}  llm={llm_key}[/dim]")
+                  f"transcript_chars={chars}{mr_part}  llm={llm_key}[/dim]")
 
 
 # ── Entry point ─────────────────────────────────────────────────────────────
