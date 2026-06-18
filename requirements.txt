@@ -37,8 +37,20 @@ langfuse
 # Pure-OTel side track (warm-up step A): one call site instrumented with
 # canonical gen_ai.* attributes, shipped via OTLP HTTP to Langfuse's OTel
 # endpoint. Activated by OTEL_ENABLED=true; otherwise the bootstrap no-ops.
-opentelemetry-sdk
-opentelemetry-exporter-otlp-proto-http
+# Pinned to 1.40.x because azure-monitor-opentelemetry-exporter
+# (Phase 1.OBS.1) hard-pins opentelemetry-{api,sdk}==1.40 in its latest
+# beta (1.0.0b53). The OTLP HTTP exporter is pinned to the same minor so
+# both backends can attach to the same TracerProvider without ABI drift.
+# Bump all three together when a future App Insights exporter release
+# relaxes the pin.
+opentelemetry-sdk~=1.40.0
+opentelemetry-exporter-otlp-proto-http~=1.40.0
+# Phase 1.OBS.1 — optional Application Insights / Azure Monitor exporter.
+# Opt-in via APPLICATIONINSIGHTS_CONNECTION_STRING; auth uses
+# DefaultAzureCredential (Step 8b mirror). Bare exporter only — NOT the
+# `azure-monitor-opentelemetry` distro, which would auto-configure a
+# competing TracerProvider and break the Phase 1.1f.2 unified topology.
+azure-monitor-opentelemetry-exporter
 
 # ── Storage providers ────────────────────────────────────────────────────────
 # Opt-in: AzureBlobObjectStore loads only when AZURE_STORAGE_ACCOUNT +

@@ -65,8 +65,16 @@ Activation:
   - `LANGFUSE_SECRET_KEY`          — used to build Basic auth header
   - `LANGFUSE_HOST`                — defaults to https://cloud.langfuse.com
 
-  If any of the above is missing, `get_tracer()` returns an OTel
-  no-op tracer so call sites stay branch-free.
+  Optional Phase 1.OBS.1 second exporter (Application Insights):
+
+  - `APPLICATIONINSIGHTS_CONNECTION_STRING` — when set, ``get_tracer()``
+    additionally attaches an ``AzureMonitorTraceExporter`` as a second
+    ``BatchSpanProcessor`` on the same shared ``TracerProvider``. Auth is
+    ``DefaultAzureCredential`` (NOT the embedded instrumentation key).
+    Same spans, two backends — see ``rag/azure_monitor.py`` for details.
+
+  If any of the Langfuse vars above is missing, `get_tracer()` returns
+  an OTel no-op tracer so call sites stay branch-free.
 
 This file intentionally never raises: a failure to initialise OTel
 must never bring the app down.
@@ -220,6 +228,27 @@ def get_tracer():
             atexit.register(processor.shutdown)
             _processor = processor
             _tracer    = global_tp.get_tracer(_TRACER_NAME)
+
+            # Phase 1.OBS.1 — optional SECOND processor: Application
+            # Insights / Azure Monitor. Same shared TracerProvider,
+            # different destination. Spans are recorded once and fan
+            # out to both backends (Langfuse + App Insights). Opt-in
+            # via APPLICATIONINSIGHTS_CONNECTION_STRING; auth is
+            # DefaultAzureCredential (Step 8b pattern), NOT the
+            # instrumentation key embedded in the connection string.
+            #
+            # The Phase 1.1f.2 unified topology is preserved across
+            # both backends because both processors see the same
+            # in-process spans on the same TracerProvider.
+            try:
+                from rag.azure_monitor import build_processor as _ai_build
+                ai_proc = _ai_build()
+                if ai_proc is not None:
+                    global_tp.add_span_processor(ai_proc)
+                    atexit.register(ai_proc.shutdown)
+            except Exception:
+                # Belt-and-suspenders — observability must never fail the app.
+                pass
         else:
             _tracer = _build_noop_tracer()
     except Exception:

@@ -1984,6 +1984,74 @@ unaffected — no-op tracer + `contextvars.copy_context()` is stdlib.
 
 ---
 
+### Phase 1.OBS.1 — Application Insights dual-export
+
+**Shape.** A SECOND `BatchSpanProcessor` is attached to the same shared
+`TracerProvider` already used by Langfuse SDK + the Phase 1.1f.2
+`_AgentScopeOnlyBatchProcessor`. The new processor wraps an
+`AzureMonitorTraceExporter` and ships identical spans to Application
+Insights. Both backends therefore receive the SAME unified topology
+produced in-process — `cli-request` / `mcp-request` parent, `agent
+<name>` children, `chat <model>` + `OpenAI-generation` leaves — because
+both processors observe the same TracerProvider's spans. No
+re-instrumentation, no sampling divergence: spans are recorded once and
+fan out.
+
+**Auth.** `DefaultAzureCredential` only — same pattern as Step 8b
+`AzureBlobObjectStore`. The instrumentation key embedded in
+`APPLICATIONINSIGHTS_CONNECTION_STRING` is consulted for endpoint
+discovery (workspace ID + ingestion endpoint URL) but is NOT used as a
+credential; `azure-monitor-opentelemetry-exporter`'s `credential=`
+parameter accepts a token credential and, when supplied, routes auth
+through Entra ID. No instrumentation-key auth, no SAS, no connection-
+string credentials.
+
+**Env vars.** One new var, opt-in:
+
+| Var | Purpose |
+|---|---|
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | Endpoint discovery for the App Insights resource. Non-sensitive (workspace identifier). When unset, the second processor is not attached — behaviour identical to pre-1.OBS.1. |
+
+`OTEL_ENABLED` (Phase 1.OBS warm-up) remains the master switch; App
+Insights inherits it implicitly because the second processor is wired
+inside `get_tracer()` only when the Langfuse path succeeded.
+
+**EDA-lens lesson.** Same workflow, two observability surfaces —
+Langfuse for developer flow (prompts, completions, generation metadata),
+Application Insights for operator flow (transaction search, dependency
+map, KQL against the workspace). Identical span tree in both places.
+This is the canonical "multi-surface observability" pattern any Azure-
+native team standardises on; dual-export keeps the developer experience
+unchanged while opening the operator playbook (KQL, alerting, dashboards
+in Azure Monitor) on the same trace data.
+
+**Files touched.**
+
+| File | Change |
+|---|---|
+| `rag/azure_monitor.py` (NEW) | `is_enabled()` + `build_processor()` returning a `BatchSpanProcessor` or `None`. Mirror of `rag/azure_blob.py` defensive shape. |
+| `rag/otel.py` | After the Langfuse `_AgentScopeOnlyBatchProcessor` is attached, optionally attach the App Insights processor on the same global TP. Both processors share the TracerProvider; failure to wire the second one degrades silently. |
+| `requirements.txt` | +1 line: `azure-monitor-opentelemetry-exporter` (bare exporter, NOT the `azure-monitor-opentelemetry` distro — the distro auto-configures a competing `TracerProvider` and would break Phase 1.1f.2). |
+| `.env.example`, `.env.agent-safe` | Document `APPLICATIONINSIGHTS_CONNECTION_STRING` with the shape comment. Stays empty in the committed agent-safe file. |
+
+**Smoke test.**
+
+```bash
+# Dual-export end-to-end: one workflow, two backends.
+.venv/bin/python -m rag.cli summarize 6 --llm azure-openai
+# → Langfuse Cloud: latest `feature=summarize-cli` trace, unified
+#                   topology preserved (Phase 1.1f.2 invariant).
+# → Azure Portal → Application Insights → Transaction search:
+#                   `cli-request` operation with the same hierarchy
+#                   (`cli-request → agent summarizer → chat <model>`).
+```
+
+Local mode (`OTEL_ENABLED` unset, no `LANGFUSE_*`, no
+`APPLICATIONINSIGHTS_CONNECTION_STRING`) is unaffected — the master
+switch short-circuits before either processor is built.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.

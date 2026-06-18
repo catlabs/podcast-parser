@@ -470,3 +470,20 @@ inherits `cli-request`'s OTel context instead of opening a fresh root.
 In-memory span-exporter harness verified single-trace topology for
 summarize fast & slow path (4 / 24 spans, parent linkage correct).
 commit: <fill-in-after-commit>
+
+2026-06-17 — Phase 1.OBS.1 shipped: Application Insights as a SECOND OTel
+exporter (dual-export). New `rag/azure_monitor.py` (`is_enabled()` +
+`build_processor()`); `rag/otel.py` attaches the second
+`BatchSpanProcessor` on the same shared `TracerProvider` (Langfuse SDK's
+global TP) when `APPLICATIONINSIGHTS_CONNECTION_STRING` is set. Auth is
+`DefaultAzureCredential` only — Step 8b mirror, no instrumentation-key
+auth, no SAS, no connection-string credentials. One new dep
+(`azure-monitor-opentelemetry-exporter`, bare exporter NOT the distro —
+the distro auto-configures a competing TP and would break Phase 1.1f.2).
+One new env var, documented in `.env.example` + `.env.agent-safe` (kept
+empty in agent-safe). Same in-process spans fan out to BOTH backends;
+unified topology preserved on both surfaces. Local mode and Langfuse-only
+mode unaffected — Smokes 1, 2, 5 green. Smokes 3 + 4 (end-to-end Azure
+Portal validation + topology parity) need mentor follow-up — prerequisite
+Azure resource + role grant on mentor side.
+commit: <fill-in-after-commit>
