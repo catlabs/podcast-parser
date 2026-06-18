@@ -456,7 +456,7 @@ idempotency. 1.1h.2 will introduce **bounded parallelism** in the map
 phase (fan-out / fan-in) — that's where async + backpressure + retry
 discipline become the explicit exercise. 1.1h.3 reserved for hierarchical
 reduce + token-based sizing.
-commit: <fill-in-after-commit>
+commit: 1ed6aa8
 
 2026-06-16 — Phase 1.1f.2 shipped: trace topology unified AND CLI
 thread-context loss fixed (bundled). `rag/otel.py` drops its private
@@ -469,7 +469,7 @@ now wraps the worker thread with `contextvars.copy_context().run(_worker)`
 inherits `cli-request`'s OTel context instead of opening a fresh root.
 In-memory span-exporter harness verified single-trace topology for
 summarize fast & slow path (4 / 24 spans, parent linkage correct).
-commit: <fill-in-after-commit>
+commit: 3019eaa
 
 2026-06-17 — Phase 1.OBS.1 shipped: Application Insights as a SECOND OTel
 exporter (dual-export). New `rag/azure_monitor.py` (`is_enabled()` +
