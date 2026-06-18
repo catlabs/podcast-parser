@@ -486,4 +486,4 @@ unified topology preserved on both surfaces. Local mode and Langfuse-only
 mode unaffected — Smokes 1, 2, 5 green. Smokes 3 + 4 (end-to-end Azure
 Portal validation + topology parity) need mentor follow-up — prerequisite
 Azure resource + role grant on mentor side.
-commit: <fill-in-after-commit>
+commit: a6cf4b7
