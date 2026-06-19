@@ -122,6 +122,13 @@ class ResearchState(TypedDict):
     # reads both to decide re-plan (compensate) vs. proceed degraded.
     search_status:      str
     search_retry_count: int
+    # ``search_recovery_history`` (1.1i.1) records each zero-result attempt
+    # as ``{attempt, sub_queries, results_count}``. The planner reads it on
+    # a recovery re-entry to broaden the plan (replan-with-feedback) — the
+    # search-recovery analogue of ``grounding_history`` for reflection. Not
+    # an add-reducer: ``search_node`` owns the append + full overwrite so the
+    # attempt index stays consistent.
+    search_recovery_history: list[dict]
 
     # ── Token queue for synthesis streaming (not serialized) ─────────────
     _token_queue: Any  # queue.Queue | None — injected at invocation
@@ -206,7 +213,11 @@ def planner_node(state: ResearchState) -> dict:
         "research.llm_key":               state["llm_key"],
     }
     if state.get("search_status") == AgentStatus.SOFT_FAIL.value:
-        planner_input_attrs["research.recovery_reason"] = "no_results"
+        planner_input_attrs["research.recovery_reason"]         = "no_results"
+        # 1.1i.1: explicit boolean so App Insights can isolate replans that
+        # actually fold the no-result feedback into the prompt, separate
+        # from the routing-level recovery_reason marker.
+        planner_input_attrs["research.replan_after_no_results"] = True
 
     result = _run_with_span(
         get_agent("planner"),
@@ -291,6 +302,19 @@ def search_node(state: ResearchState) -> dict:
     # re-plan budget is exhausted.
     retry_count = state.get("search_retry_count", 0) + (1 if soft else 0)
 
+    # Replan-with-feedback (1.1i.1): on a zero-result attempt, record the
+    # failed sub-queries so the planner can broaden on the recovery re-entry
+    # instead of regenerating the same plan (which would make the bounded
+    # loop a no-op). Full overwrite, not an add-reducer — this node owns the
+    # append so the attempt index stays consistent across re-entries.
+    recovery_history = list(state.get("search_recovery_history") or [])
+    if soft:
+        recovery_history.append({
+            "attempt":       attempt,        # 1-based, computed above
+            "sub_queries":   sub_queries,    # the queries that returned nothing
+            "results_count": 0,
+        })
+
     if soft:
         # Degraded outcome — mirror the success "done" step shape but mark
         # it ``error`` so the UI can surface "no matches, re-planning".
@@ -302,9 +326,10 @@ def search_node(state: ResearchState) -> dict:
 
     return {
         **result.data,
-        "search_status":      result.status.value,
-        "search_retry_count": retry_count,
-        "events":             events,
+        "search_status":           result.status.value,
+        "search_retry_count":      retry_count,
+        "search_recovery_history": recovery_history,
+        "events":                  events,
     }
 
 
@@ -619,6 +644,7 @@ def research_graph_stream(
         "reflection_loop_count": 0,
         "search_status":         "",
         "search_retry_count":    0,
+        "search_recovery_history": [],
         "events":                [{"type": "agent_start", "agent": "orchestrator", "label": "Research Orchestrator (LangGraph)"}],
         "_token_queue":          token_queue,
     }

@@ -20,8 +20,16 @@ Input  (``state['query']``, ``state['llm_key']``):
     re-attempt would repeat the same plan and the loop would be
     infinite-by-counter rather than corrected-by-feedback.
 
-    Note: ``grounding_history`` is intentionally NOT in
-    ``CapabilityCard.reads`` — it's an optional field the agent
+    Optional ``state['search_recovery_history']`` (1.1i.1): when
+    non-empty, the search-recovery router (``route_after_search``) sent
+    us back after a zero-result search. The agent folds the previous
+    failed sub-queries into the prompt and asks the LLM to broaden —
+    without this, the recovery re-plan would regenerate the same
+    sub-queries and the bounded loop would be a no-op. Composes with
+    ``grounding_history`` (a run can both reflect and search-recover).
+
+    Note: neither ``grounding_history`` nor ``search_recovery_history``
+    is in ``CapabilityCard.reads`` — both are optional fields the agent
     handles gracefully when absent. The Phase-1 contract has no formal
     declaration for "may read" vs "must read"; flagged as a follow-up.
 
@@ -66,24 +74,50 @@ Règles :
 - Rien d'autre que le JSON."""
 
 
-def _augment_with_feedback(query: str, history: list[dict]) -> str:
-    """If we're being re-invoked after a critic flag, fold the previous
-    verdict + flags into the user message so the LLM produces *different*
-    sub-queries instead of repeating itself.
+def _augment_with_feedback(
+    query: str,
+    history: list[dict],
+    search_recovery_history: list[dict] | None = None,
+) -> str:
+    """Fold any available feedback into the user message so the LLM
+    produces *different* sub-queries instead of repeating itself.
 
-    First-attempt callers pass ``history=[]`` and get the unmodified query.
+    Two independent feedback kinds, which **compose** (a single run can
+    both reflect after a critic flag *and* recover after a no-result
+    search):
+
+    * ``history`` (``grounding_history``) — the reflection path (1c.2):
+      the last critic verdict + flags are folded in.
+    * ``search_recovery_history`` — the search-recovery path (1.1i.1):
+      the previous zero-result sub-queries are folded in with an
+      instruction to broaden.
+
+    First-attempt callers pass empty histories and get the unmodified
+    query unchanged.
     """
-    if not history:
-        return query
-    last = history[-1]
-    return (
-        f"{query}\n\n"
-        f"## Précédent essai à corriger\n"
-        f"Verdict du critique : {last.get('verdict', 'unknown')}\n"
-        f"Points à corriger : {last.get('flags', [])}\n"
-        f"Produis des sous-requêtes DIFFÉRENTES cette fois — explore "
-        f"des angles que les sous-requêtes précédentes ont manqué."
-    )
+    search_recovery_history = search_recovery_history or []
+    blocks = [query]
+    if history:                                 # reflection path (unchanged)
+        last = history[-1]
+        blocks.append(
+            "## Précédent essai à corriger\n"
+            f"Verdict du critique : {last.get('verdict', 'unknown')}\n"
+            f"Points à corriger : {last.get('flags', [])}\n"
+            "Produis des sous-requêtes DIFFÉRENTES cette fois — explore "
+            "des angles que les sous-requêtes précédentes ont manqué."
+        )
+    if search_recovery_history:                 # search-recovery path (1.1i.1)
+        last = search_recovery_history[-1]
+        blocks.append(
+            "## Recherche précédente sans résultat\n"
+            f"Ces sous-requêtes n'ont retourné AUCUN résultat : "
+            f"{last.get('sub_queries', [])}\n"
+            "Génère des sous-requêtes DIFFÉRENTES et plus LARGES — abandonne "
+            "les termes trop spécifiques, élargis le vocabulaire, et explore "
+            "des angles connexes effectivement présents dans la liste "
+            "d'épisodes ci-dessus."
+        )
+    return "\n\n".join(blocks) if len(blocks) > 1 else query
 
 
 def _parse_json(raw: str) -> dict:
@@ -112,10 +146,11 @@ class PlannerAgent:
         query   = state["query"]
         llm_key = state["llm_key"]
         history = state.get("grounding_history") or []
+        search_recovery_history = state.get("search_recovery_history") or []
 
         episode_list = list_episodes_text()
         prompt       = PLAN_SYSTEM.format(episode_list=episode_list)
-        user_msg     = _augment_with_feedback(query, history)
+        user_msg     = _augment_with_feedback(query, history, search_recovery_history)
         raw          = get_chat_provider(llm_key).generate(prompt, user_msg)
         plan         = _parse_json(raw)
         sub_queries  = plan.get("sub_queries", [])[:MAX_SUB_QUERIES] or [query]
