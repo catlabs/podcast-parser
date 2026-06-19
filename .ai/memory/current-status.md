@@ -517,3 +517,40 @@ non-code track: whiteboard-narration drills of agentic architectures
 5-minute tradeoff narration, to fix the architecture-discussion failure
 mode directly. CLAUDE.md dual-lens section updated with the same verdict.
 Next concrete action: draft the 1.1h orchestration coder brief, EDA-narrated.
+
+2026-06-19 — Phase 1.1h.2 shipped: concurrent map-reduce (fan-out / fan-in)
+in `SummarizerAgent`. The sequential map loop from 1.1h became a bounded
+concurrent fan-out: a `ThreadPoolExecutor(max_workers=MAP_MAX_CONCURRENCY=4)`
+spawns N idempotent map tasks, joined by index into the reduce. This is the
+project's first explicit event-driven / distributed-systems exercise (EDA
+lens at full strength), and the vocabulary is named inline in code + commit:
+  - fan-out / fan-in — N map tasks, re-joined by index (not by arrival).
+  - bounded concurrency = backpressure — pool size IS the semaphore; caps
+    in-flight LLM calls so a long transcript can't open dozens of connections.
+  - ordering preservation — `partials[i]` always maps to `chunks[i]`
+    regardless of completion order (pre-sized list, index write).
+  - partial-failure recovery — each map call retries `MAP_MAX_RETRIES` (1)
+    then degrades to a placeholder; the agent HARD_FAILs only if EVERY
+    segment degraded (one survivor is enough to reduce). Retry is safe
+    because the map step is idempotent (pure chunk + deterministic generate).
+  - OTel context propagation across the thread boundary — `_map_one`
+    re-attaches the parent context captured before fan-out, so each map
+    span hangs under `agent summarizer` (Phase 1.1f.2 topology preserved).
+ThreadPoolExecutor over asyncio is deliberate: `provider.generate` is
+blocking/sync with no async API; asyncio would only wrap the same calls in
+`to_thread`. One file touched (`rag/agents/summarizer.py`); no new env vars,
+no new deps. Fast-path + reduce phase byte-for-byte unchanged from 1.1h.
+LIVE verification (mentor, both backends green): forced the slow-path on
+episode 10 (~100K chars → 10 chunks) with the real exporters. Langfuse trace
+showed `cli-request → agent summarizer → 10× summarizer.map i/10 → chat →
+anthropic-chat`, plus the reduce generation directly under the parent —
+10 map siblings, 0 floaters. App Insights KQL on the same `operation_Id`
+returned fanout=10 and correctly_parented=10/10, which also confirmed the
+parked Q3 (operation_Id == OTel trace_id == Langfuse trace_id parity).
+Open questions seeded for the next orchestration sub-step (routing/branching
+/recovery): (1) degraded-but-SUCCESS is invisible to a router — needs a
+SOFT_FAIL or `degraded_segments` count for partial-success signalling;
+(2) retry authority — in-agent retry vs supervisor-hoisted saga/compensation
+(avoid double-retry); (3) per-agent pool vs a shared orchestrator-level
+concurrency budget when multiple agents fan out at once.
+commit: a33c936 (coder session) — strategy recalibration in 66a0770 (mentor)
