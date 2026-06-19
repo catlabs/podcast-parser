@@ -30,6 +30,7 @@ from rag.agents.base import (
     Agent,
     AgentContext,
     AgentResult,
+    AgentStatus,
     CapabilityCard,
     register,
 )
@@ -78,6 +79,12 @@ class SearchAgent:
         writes             = ("chunks", "episodes_by_title", "sources"),
         requires_llm       = False,
         requires_retrieval = True,
+        # Zero matches is a *recoverable* outcome, not an exception: the
+        # orchestrator can compensate by re-planning (Phase 1.1i). Declaring
+        # the policy soft is what authorizes ``_run_with_span`` to contain
+        # the blast radius and lets ``route_after_search`` branch on
+        # ``AgentResult.status`` (outcome-based routing).
+        failure_policy     = "soft",
     )
 
     def run(self, state: dict, ctx: AgentContext) -> AgentResult:
@@ -110,6 +117,17 @@ class SearchAgent:
 
         chunks            = _dedupe_chunks(all_chunks)
         episodes_by_title = _group_by_episode(chunks)
+
+        if not episodes_by_title:
+            # Soft-fail, not an exception: zero matches is a recoverable
+            # outcome the orchestrator can compensate for (re-plan, Phase
+            # 1.1i). Return empty-but-present keys so downstream nodes that
+            # index ``result.data`` never KeyError on the degraded path.
+            return AgentResult(
+                status = AgentStatus.SOFT_FAIL,
+                data   = {"chunks": [], "episodes_by_title": {}, "sources": []},
+                errors = ("no episodes matched the sub-queries",),
+            )
 
         # Rank episodes by best chunk distance, keep top N
         scores = {t: min(c["distance"] for c in cs) for t, cs in episodes_by_title.items()}

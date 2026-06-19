@@ -15,6 +15,9 @@ Why LangGraph?
 
 Graph:
   planner → search → analyst → synthesizer → critic → END
+  with two conditional edges:
+    - search  → {planner | analyst}  (outcome-based search recovery, 1.1i)
+    - critic  → {planner | END}      (domain-level reflection loop)
 
 Public API:
   build_graph()   → compiled LangGraph (reusable, thread-safe)
@@ -31,7 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from opentelemetry import trace as _ot_trace
 
 from rag.agents import AgentContext, get as get_agent
-from rag.agents.base import _run_with_span
+from rag.agents.base import AgentStatus, _run_with_span
 from rag.agents.search import CHUNKS_PER_QUERY
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
 from rag.observability import span, trace_context
@@ -47,6 +50,17 @@ log = logging.getLogger(__name__)
 # event (see ``route_after_critic``).
 
 MAX_REFLECTION_LOOPS = 2
+
+# ── Search recovery loop ─────────────────────────────────────────────────────
+# Bounded compensation for a soft-failed search (zero episodes matched).
+# ``MAX_SEARCH_RETRIES = 1`` means at most one re-plan+re-search cycle before
+# the graph proceeds to the analyst on a degraded (empty) episode set. This is
+# the orchestrator-owned recovery counterpart to ``SummarizerAgent``'s
+# in-agent retry (Phase 1.1h.2): retry authority lives in the supervisor here
+# (saga-style compensation), inside the agent there. New OTel event namespace
+# ``search.*`` is used by ``route_after_search`` (mirrors ``reflection.*``).
+
+MAX_SEARCH_RETRIES = 1
 
 # ── Agent / node metadata ───────────────────────────────────────────────────
 
@@ -99,6 +113,15 @@ class ResearchState(TypedDict):
     # time, because grounding_history is no longer empty).
     grounding_history:     Annotated[list[dict], operator.add]
     reflection_loop_count: int
+
+    # ── Search recovery bookkeeping (Phase 1.1i) ─────────────────────────
+    # ``search_status`` carries the contract-level ``AgentResult.status`` of
+    # the last search (a message-envelope outcome, distinct from the
+    # domain-level grounding verdict). ``search_retry_count`` is bumped by
+    # ``search_node`` each time search soft-fails; ``route_after_search``
+    # reads both to decide re-plan (compensate) vs. proceed degraded.
+    search_status:      str
+    search_retry_count: int
 
     # ── Token queue for synthesis streaming (not serialized) ─────────────
     _token_queue: Any  # queue.Queue | None — injected at invocation
@@ -169,16 +192,27 @@ def planner_node(state: ResearchState) -> dict:
 
     events = [_agent_start("planner"), _ev("planner", "plan", "running", tool="generate")]
 
+    # Attribute a planner re-run: was it a search-recovery re-entry or a
+    # reflection loop? ``research.recovery_reason`` is stamped only when the
+    # previous search soft-failed (Phase 1.1i) — making the re-run queryable
+    # in App Insights without conflating it with the domain-level reflection
+    # loop (carried by ``research.is_retry`` / ``reflection_loop_count``).
+    # The two signals are independent: a reflection re-entry leaves
+    # ``search_status`` at its last value ("success"), so this stays unset.
+    planner_input_attrs = {
+        "research.attempt":               new_count + 1,
+        "research.is_retry":              is_retry,
+        "research.reflection_loop_count": new_count,
+        "research.llm_key":               state["llm_key"],
+    }
+    if state.get("search_status") == AgentStatus.SOFT_FAIL.value:
+        planner_input_attrs["research.recovery_reason"] = "no_results"
+
     result = _run_with_span(
         get_agent("planner"),
         dict(state),
         AgentContext.empty(),
-        input_attrs = {
-            "research.attempt":               new_count + 1,
-            "research.is_retry":              is_retry,
-            "research.reflection_loop_count": new_count,
-            "research.llm_key":               state["llm_key"],
-        },
+        input_attrs = planner_input_attrs,
         output_attrs_fn = lambda r: {
             "research.n_sub_queries": len(r.data["sub_queries"]),
             "research.sub_queries":   list(r.data["sub_queries"]),
@@ -212,6 +246,11 @@ def search_node(state: ResearchState) -> dict:
         _ev("search", "search", "running", f"{len(sub_queries)} sub-queries", tool="semantic_search"),
     ]
 
+    # 1-based attempt index for this search (1 on the first try, 2 after one
+    # recovery hop, …). Stamped on the `agent search` span so App Insights
+    # customDimensions can correlate soft-fail rate with attempt number.
+    attempt = state.get("search_retry_count", 0) + 1
+
     result = _run_with_span(
         get_agent("search"),
         dict(state),
@@ -221,21 +260,52 @@ def search_node(state: ResearchState) -> dict:
             "research.top_k":         CHUNKS_PER_QUERY,
             "research.model_key":     model_key,
         },
+        # Observability is a first-class deliverable (Phase 1.1i): stamp the
+        # queryable recovery signals on the `agent search` span. Attributes
+        # land in App Insights customDimensions — the authoritative source
+        # for aggregating soft-fail / recovery rate — and render inline in
+        # Langfuse's span metadata. ``search.status`` / ``search.results_count``
+        # / ``research.attempt`` are the canonical keys; the ``research.*``
+        # count attrs below predate 1.1i and are kept for existing dashboards.
         output_attrs_fn = lambda r: {
-            "research.n_episodes_found": len(r.data["episodes_by_title"]),
+            "search.status":             r.status.value,                          # success | soft_fail
+            "search.results_count":      len(r.data.get("episodes_by_title", {})),
+            "research.attempt":          attempt,
+            "research.n_episodes_found": len(r.data.get("episodes_by_title", {})),
             "research.total_chunks":     sum(
-                len(cs) for cs in r.data["episodes_by_title"].values()
+                len(cs) for cs in r.data.get("episodes_by_title", {}).values()
             ),
         },
     )
-    episodes_by_title = result.data["episodes_by_title"]
+
+    # Outcome-based routing groundwork: read ``result.status``, not just
+    # ``result.data``. Index defensively — on a SOFT_FAIL the agent returns
+    # empty-but-present keys, so ``.get(...)`` never KeyErrors on the
+    # degraded path.
+    episodes_by_title = result.data.get("episodes_by_title", {})
     total             = sum(len(cs) for cs in episodes_by_title.values())
 
-    events.append(_ev("search", "search", "done", f"{total} chunks from {len(episodes_by_title)} episodes", tool="semantic_search"))
+    soft = result.status == AgentStatus.SOFT_FAIL
+    # Bounded compensation: bump the recovery counter only when search
+    # soft-fails. ``route_after_search`` reads this to decide whether the
+    # re-plan budget is exhausted.
+    retry_count = state.get("search_retry_count", 0) + (1 if soft else 0)
+
+    if soft:
+        # Degraded outcome — mirror the success "done" step shape but mark
+        # it ``error`` so the UI can surface "no matches, re-planning".
+        events.append(_ev("search", "search", "error", "no episodes matched — re-planning", tool="semantic_search"))
+    else:
+        events.append(_ev("search", "search", "done", f"{total} chunks from {len(episodes_by_title)} episodes", tool="semantic_search"))
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})
     events.append(_agent_end("search"))
 
-    return {**result.data, "events": events}
+    return {
+        **result.data,
+        "search_status":      result.status.value,
+        "search_retry_count": retry_count,
+        "events":             events,
+    }
 
 
 def analyst_node(state: ResearchState) -> dict:
@@ -376,6 +446,41 @@ def critic_node(state: ResearchState) -> dict:
     }
 
 
+# ── Search recovery router ───────────────────────────────────────────────────
+
+
+def route_after_search(state: ResearchState) -> Literal["planner", "analyst"]:
+    """Outcome-based recovery router — mirrors ``route_after_critic``.
+
+    Branches on the contract-level ``AgentResult.status`` (a
+    message-envelope outcome) rather than a domain value: a soft-failed
+    search with re-plan budget remaining routes back to the planner — a
+    *compensating* action — while anything else proceeds forward. The loop
+    is bounded by ``MAX_SEARCH_RETRIES`` so there is no infinite
+    re-delivery; re-entry is safe because each agent step is idempotent
+    over its inputs.
+
+    Pure logic — no LLM, no SSE, no state mutation. Side effect
+    (intentional): when compensating, drop a ``search.recovery_triggered``
+    event on the currently-active span (the Langfuse-SDK research-request
+    span on the API path), mirroring ``reflection.loop_triggered``.
+    """
+    if state.get("search_status") == AgentStatus.SOFT_FAIL.value \
+       and state.get("search_retry_count", 0) <= MAX_SEARCH_RETRIES:
+        _ot_trace.get_current_span().add_event(
+            "search.recovery_triggered",
+            attributes={
+                "recovery.triggered": True,
+                "recovery.reason":    "no_results",
+                "recovery.target":    "planner",
+                "search.retry_count": state.get("search_retry_count", 0),
+                "search.cap":         MAX_SEARCH_RETRIES,
+            },
+        )
+        return "planner"
+    return "analyst"
+
+
 # ── Reflection router ───────────────────────────────────────────────────────
 
 
@@ -419,8 +524,17 @@ def build_graph() -> StateGraph:
     The compiled graph is reusable and thread-safe — build it once at module
     level or on first use.
 
-    Topology (Phase 1.1c.2):
-      START → planner → search → analyst → synthesizer → critic → {planner | END}
+    Topology (Phase 1.1i):
+      START → planner → search → {planner | analyst}
+                        analyst → synthesizer → critic → {planner | END}
+
+    The search → planner edge is the outcome-based recovery loop (Phase
+    1.1i): when ``SearchAgent`` soft-fails (zero episodes matched) and the
+    re-plan budget (``MAX_SEARCH_RETRIES``) is not exhausted,
+    ``route_after_search`` compensates by re-planning; otherwise the graph
+    proceeds to the analyst on a degraded (empty) episode set. This branches
+    on the contract-level ``AgentResult.status``, distinct from the
+    domain-level critic reflection loop below.
 
     The critic → planner edge is the reflection loop: when the critic
     flags the synthesized answer as not ``supported`` AND the reflection
@@ -443,7 +557,15 @@ def build_graph() -> StateGraph:
 
     graph.add_edge(START,         "planner")
     graph.add_edge("planner",     "search")
-    graph.add_edge("search",      "analyst")
+    # Outcome-based recovery edge (Phase 1.1i): a soft-failed search
+    # (zero episodes) routes back to the planner to re-plan, bounded by
+    # MAX_SEARCH_RETRIES; otherwise it proceeds to the analyst. This is
+    # distinct from the domain-level reflection loop on the critic.
+    graph.add_conditional_edges(
+        "search",
+        route_after_search,
+        {"planner": "planner", "analyst": "analyst"},
+    )
     graph.add_edge("analyst",     "synthesizer")
     graph.add_edge("synthesizer", "critic")
     graph.add_conditional_edges(
@@ -495,6 +617,8 @@ def research_graph_stream(
         "sources":               [],
         "grounding_history":     [],
         "reflection_loop_count": 0,
+        "search_status":         "",
+        "search_retry_count":    0,
         "events":                [{"type": "agent_start", "agent": "orchestrator", "label": "Research Orchestrator (LangGraph)"}],
         "_token_queue":          token_queue,
     }
