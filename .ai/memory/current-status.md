@@ -487,3 +487,33 @@ mode unaffected — Smokes 1, 2, 5 green. Smokes 3 + 4 (end-to-end Azure
 Portal validation + topology parity) need mentor follow-up — prerequisite
 Azure resource + role grant on mentor side.
 commit: a6cf4b7
+
+2026-06-19 — JD cross-check recalibration (mentor session, no code). The
+target-role description was read back against the full roadmap to optimize
+for first-30-90-day readiness over long-term platform mastery. Outcome:
+NO phase reorder. The agent-platform spine is JD-validated — agentic
+architecture with explicit role/interaction boundaries, orchestration
+(routing / branching / planning / reflection / recovery), MCP for shared
+secure context, LLMOps/AgentOps (deploy / eval / monitor / rollback), and
+governance all map to named responsibilities. The earlier instinct to
+freeze the agent track and pivot to a dominating event-driven phase was
+walked back: the dual-lens design in CLAUDE.md (EDA woven *inline*, not a
+separate track) was the correct call. Two emphasis shifts adopted:
+  1. The EDA/microservices lens runs at FULL strength inside the next
+     orchestration sub-step (1.1h.x): agent interaction boundaries =
+     service contracts; recovery = retry / compensation / saga;
+     routing/branching = message routing; choreography vs orchestration
+     named explicitly. Rationale: the user's 20-yr architecture instinct
+     is strong but recent distributed-systems vocabulary is the live gap
+     (surfaced in an interview); narrating agent work in this vocabulary
+     turns the gap into a differentiator most LLM-focused engineers lack.
+  2. MCP is NOT deferrable — it is a named responsibility. Keep Phase 5
+     where it is, but maintain fluency + a small spike meanwhile.
+Endorsed secondary (does NOT displace the active orchestration sub-step):
+one small REAL async slice (Step 11-lite — queue → worker → DLQ) for an
+out-of-process distributed-systems reference / war story. Parallel,
+non-code track: whiteboard-narration drills of agentic architectures
+(role boundaries + recovery + MCP-shared context + async integration),
+5-minute tradeoff narration, to fix the architecture-discussion failure
+mode directly. CLAUDE.md dual-lens section updated with the same verdict.
+Next concrete action: draft the 1.1h orchestration coder brief, EDA-narrated.

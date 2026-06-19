@@ -38,6 +38,23 @@ Progressively migrate this local-first podcast RAG application toward Azure serv
   Both lenses are operational details documented in the user's private
   agent memory; this file only states the priority order. Neither lens
   is allowed to halt or pre-empt the active Phase 1 sub-step in flight.
+- **2026-06-19 JD cross-check recalibration** (mentor session, see
+  `.ai/memory/current-status.md`): the target-role description was read
+  back against this roadmap. Verdict — the agent-platform spine (agentic
+  architecture with explicit role/interaction boundaries, orchestration
+  with routing/branching/planning/reflection/recovery, MCP for shared
+  secure context, LLMOps/AgentOps, governance) is **confirmed correct**;
+  almost every roadmap item maps to a named responsibility. No phase
+  reorder. Two emphasis shifts only: (1) the **EDA/microservices lens
+  runs at full strength *inside* the next orchestration sub-step** —
+  agent interaction boundaries narrated as service contracts, recovery
+  as retry/compensation/saga, routing as message routing — because that
+  is where the user's distributed-systems strength becomes a
+  differentiator rather than a gap; (2) **MCP is not deferrable** —
+  literacy plus a small spike, not skipped. One small *real* async slice
+  (Step 11-lite: queue → worker → DLQ) is endorsed as a secondary
+  exercise for an out-of-process distributed-systems reference, but it
+  does not displace the active orchestration sub-step.
 
 ## Long-term architecture target
 
