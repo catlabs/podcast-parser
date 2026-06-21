@@ -36,7 +36,11 @@ from pydantic import BaseModel
 
 from rag.chat import ask, ask_stream, compare
 from rag.research import research_stream
-from rag.research_graph import research_graph_stream
+from rag.research_graph import (
+    DEFAULT_RESEARCH_MODE,
+    RESEARCH_MODES,
+    research_graph_stream,
+)
 from rag.config import (
     ANTHROPIC_API_KEY,
     AZURE_OPENAI_API_KEY,
@@ -145,6 +149,11 @@ class ResearchRequest(BaseModel):
     llm_key:    str = DEFAULT_LLM_KEY
     session_id: str | None = None
     user_id:    str | None = None
+    # Phase 1.1j: execution-depth selector. Defaults to ``full-research`` so
+    # existing UI traffic (which omits the field) is byte-for-byte identical
+    # to the pre-1.1j behaviour. Web UI is NOT changed; ``mode`` is an API-
+    # and CLI-only control for learning/observability sessions.
+    mode:       str = DEFAULT_RESEARCH_MODE
 
 
 class DetectRequest(BaseModel):
@@ -401,12 +410,29 @@ async def research_graph_endpoint(body: ResearchRequest):
     A background thread runs the graph and feeds all events (step events
     from the graph + token events from the queue) into a single
     asyncio.Queue that the SSE generator reads from.
+
+    Phase 1.1j: the ``mode`` field on the request body selects the execution
+    depth (``search-only`` / ``research-no-critic`` / ``full-research``). An
+    unknown mode returns HTTP 422 with the list of valid modes — same guard
+    pattern as the ``model_key`` check above. Existing UI traffic omits the
+    field and defaults to ``full-research``.
     """
     _require_llm(body.llm_key)
     if body.model_key not in MODEL_KEYS:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown model_key {body.model_key!r}. Valid: {MODEL_KEYS}",
+        )
+    # Phase 1.1j: validate mode before any trace is opened — mirrors the
+    # ``model_key`` check pattern above. Returns 422 (Unprocessable Entity)
+    # with a human-readable message listing valid modes.
+    if body.mode not in RESEARCH_MODES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown research mode {body.mode!r}. "
+                f"Valid modes: {list(RESEARCH_MODES)}"
+            ),
         )
 
     import queue as stdlib_queue
@@ -437,6 +463,7 @@ async def research_graph_endpoint(body: ResearchRequest):
                 body.query, body.top_k, body.model_key, body.llm_key, token_q,
                 session_id = body.session_id,
                 user_id    = user_id,
+                mode       = body.mode,
             ):
                 # Don't duplicate token events (they come via the drain thread)
                 if event.get("type") != "token":

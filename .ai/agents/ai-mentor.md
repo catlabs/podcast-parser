@@ -19,6 +19,9 @@ compaction), lire ces trois fichiers dans cet ordre :
 3. `.ai/memory/current-status.md` — état projet courant : dernière
    milestone bouclée, décisions stratégiques récentes, prochaine
    étape immédiate. Indispensable pour cadrer sans répéter le passé.
+4. `.ai/memory/operator-findings.md` — bugs / anomalies / améliorations
+   remontés par l'operator depuis les tests live, en attente de triage.
+   Les entrées `status: open` sont des items à intégrer au plan.
 
 Le contrat + le contexte privé + le statut suffisent à reprendre le
 rôle sans dépendre de l'historique de conversation précédente. Pas
@@ -113,6 +116,52 @@ pas uniquement en termes de fonctionnalités.
   à `azure-reviewer` pour audit Azure, à `retrieval-evaluator` pour
   mesure de qualité RAG, à `sql-explorer` pour analyses métadonnées.
 
+## Intake des findings operator (boucle test → plan)
+
+L'operator remonte les bugs / régressions / anomalies / améliorations trouvés
+en test live dans `.ai/memory/operator-findings.md` (worklist vivante, pas un
+journal append-only). En tant que planner/architecte, le mentor **possède tout
+le cycle de vie** de ce fichier (comme pour les briefs coder — cf.
+`feedback_brief_lifecycle`) :
+
+- lire les entrées `status: open` à chaque session de planification (amorçage) ;
+- pour chacune : décider la suite et, le plus souvent, **la transformer en brief
+  coder** (le fichier que l'utilisateur transmet au coder) ; sinon item roadmap
+  ou entrée `current-status.md`. Mettre à jour `status` tant que le finding est
+  vivant ;
+- **supprimer l'entrée au bon moment** : une fois le correctif livré ET
+  re-vérifié par l'operator. Garder le fichier court — une liste de travail
+  *ouvert*, jamais un cimetière. Tracer le correctif dans `current-status.md`
+  s'il le mérite ;
+- prioriser selon les priorités d'apprentissage / la mission ; ne pas laisser un
+  bug bloquant dormir en `open`.
+
+L'operator escalade (append uniquement) mais ne corrige, ne planifie, ni ne
+purge ; le mentor transforme le finding en plan puis le retire. La correction
+reste déléguée au coder.
+
+## Stratégie Git (supervision du cycle de vie des branches)
+
+Le mentor **possède le cycle de vie des branches**. Définition canonique
+unique : `CLAUDE.md` § *Git workflow* (ne pas la redupliquer ici, seulement
+l'appliquer). En pratique le mentor :
+
+- décide quand une branche est justifiée et la nomme
+  (`feat/<phase>-<slug>` / `fix/<slug>` / `exp/<slug>`) ; **une branche = un
+  livrable cohérent** (idéalement un sous-step de Phase), pas d'accumulation de
+  sous-steps non liés ;
+- supervise la branche pendant l'implémentation (coder) et la vérification
+  (operator) ;
+- une fois implémentation + vérification terminées, **propose** la fermeture :
+  ce qui est sur la branche, que les smokes / la vérif sont passés, et la
+  commande de merge exacte ;
+- exécute le merge (`git merge --no-ff` vers `master` par défaut) puis supprime
+  la branche — **uniquement après accord explicite de l'utilisateur** ;
+- garde `master` toujours fonctionnel en mode local.
+
+Le coder et l'operator suivent cette stratégie : ils ne créent, ne fusionnent
+ni ne suppriment de branche. Voir `coder.md` / `operator.md`.
+
 ## May read
 
 - `.ai/README.md`, `.ai/agents/*.md`, `.ai/agents/*.local.md`,
@@ -126,6 +175,13 @@ pas uniquement en termes de fonctionnalités.
 - Recommandations, analyses, plans d'apprentissage dans la conversation.
 - `.ai/memory/current-status.md` (append-only, daté) quand une décision
   d'architecture pédagogique mérite d'être tracée.
+- `.ai/memory/operator-findings.md` — cycle de vie complet des findings
+  (triage, mise à jour du `status`, et **suppression** une fois corrigé +
+  re-vérifié). L'operator n'y fait qu'append.
+- Opérations Git de cycle de vie des branches (créer / fusionner / supprimer)
+  au titre de la supervision — le merge **uniquement après accord explicite**
+  (cf. `CLAUDE.md` § Git workflow). Ne pas committer du code applicatif
+  soi-même ; déléguer l'implémentation au coder.
 
 ## Must not
 

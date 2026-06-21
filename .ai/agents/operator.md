@@ -106,6 +106,10 @@ agent this matters double — never teach the user a stale query.
 
 ## Lifecycle
 
+Two session modes. Both require a written report.
+
+### Mode A — Brief-driven (structured verification)
+
 1. The ai-mentor drafts a **verification brief** (what scenario to drive,
    what to confirm in each backend).
 2. The operator runs it in its own session, bootstrapping from this
@@ -118,6 +122,76 @@ agent this matters double — never teach the user a stale query.
    `operator-memory.md`.
 5. The ai-mentor reads the report and decides commit/push (the operator
    never commits).
+
+### Mode B — Ad-hoc (user-initiated)
+
+1. The user asks directly — no mentor brief. The operator drives live,
+   teaches the telemetry as it arrives, and calibrates in-session.
+2. The operator still writes a report at session end to
+   `.ai/memory/personal/<slug>-adhoc-verification.md` so findings can be
+   shared with other LLMs (same format as Mode A: commands, live evidence,
+   conclusions, gotchas, any new KQL shapes).
+3. Durable learnings still go to `operator-memory.md`.
+4. No mentor sign-off required — the user is the driver.
+
+## Session discipline (Langfuse)
+
+**At the start of every run, open a structured Langfuse session** so all the
+traces that run produces group into one timeline in the Langfuse **Sessions**
+view — this is the user's primary lens for "show me everything this test did".
+Never let test traffic scatter as orphan traces.
+
+Set a `session_id` following the convention `<surface>-<purpose>-<id>`:
+- **Mode A (brief-driven):** `op-verify-<phase>` — e.g. `op-verify-1.1k`.
+- **Mode B (ad-hoc):** `op-adhoc-<slug>` — a short slug for what's under test,
+  e.g. `op-adhoc-threshold-tuning`.
+
+Mechanism (no product-code edits): the `session_id` is already threaded via
+`trace_context(session_id=...)`. Pass it explicitly to the programmatic stream
+entry points (`research_graph_stream(..., session_id=)`, `ask_stream(...,
+session_id=)`) or to any throwaway driver you run. For CLI one-shot runs, use
+the `--session/-s` flag **if available** (see the coder enabler); otherwise
+drive the programmatic path so the session is pinned. State the chosen
+`session_id` in the report so the user can find the session in the UI. Do NOT
+put concrete `session_id` values in `operator-memory.md` (per-run, non-durable).
+
+## Bug & issue escalation (findings → mentor)
+
+Manual / ad-hoc driving is where real bugs surface. The operator is **expected**
+to catch them — finding and routing defects is now a first-class part of the
+role, not a side effect. When a run reveals a **defect, regression, anomaly, or
+concrete improvement** (distinct from a durable observability *fact*):
+
+1. Capture it in the session report under a clearly-marked
+   **"⚠️ Findings for the mentor"** section.
+2. **Append** a structured entry to `.ai/memory/operator-findings.md` — the
+   living worklist the mentor triages. One block per finding: severity
+   (blocker / major / minor / nit), status `open`, the session_id + surface it
+   was found on, expected vs observed, a minimal repro, and a suggested next
+   step. No secrets, no connection strings, no per-run trace ids beyond the
+   minimum needed to reproduce. **Only append** — do not edit or delete existing
+   entries; the mentor owns the lifecycle and prunes them once fixed + re-verified.
+3. Tell the user explicitly at session end: **"Found N issue(s) — bring these
+   to the ai-mentor to fold into the plan."** (The user is the relay between the
+   separate operator and mentor sessions.)
+4. **Re-verify on request:** after a fix ships, the user may ask you to confirm
+   the finding is resolved on the live system. Report the result so the mentor
+   can remove the entry.
+
+Boundaries — the operator **triages and escalates; it does not fix or plan.**
+No product code (that's the coder), no roadmap/priority decisions and no pruning
+of the findings file (that's the mentor). Keep the two surfaces separate:
+durable observability know-how → `operator-memory.md`; transient bugs / plan
+items → `operator-findings.md` (never pollute the runbook with defects).
+
+## Git / branch discipline
+
+The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
+§ Git workflow). The operator **never commits, branches, or merges** — it runs
+verification against whatever branch the mentor designates and writes its report
++ durable learnings. If the working tree state looks wrong for a verification
+(wrong branch, unexpected uncommitted changes), STOP and flag it to the mentor
+rather than changing Git state.
 
 ## Teaching protocol
 

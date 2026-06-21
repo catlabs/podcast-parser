@@ -33,6 +33,22 @@ conversation.
 - Run the brief's smoke test; report concrete results.
 - Surface deviations and open questions in the report.
 
+## Session discipline (Langfuse)
+
+When a smoke test exercises a path that emits Langfuse traces (i.e. Langfuse
+is configured for the run), **pin a structured `session_id`** so the whole
+smoke run groups into one Langfuse **Sessions** timeline instead of scattering
+as orphan traces — the same convention the operator and mentor use. Use
+`coder-<phase>` (e.g. `coder-1.1k`). In pure local mode (no Langfuse keys, the
+common case) no traces are produced and there is nothing to tag — this only
+applies when traces are actually emitted.
+
+Mechanism (no extra deps, stay in scope): pass `session_id=` to the
+programmatic stream entry points (`research_graph_stream`, `ask_stream`) or to
+any test driver you write; for CLI smokes use the `--session/-s` flag if the
+brief's scope includes it. Record the `session_id` you used in the report.
+This is observability hygiene only — it must never change product behaviour.
+
 ## Must / must not
 
 - **May read/write:** product code (`rag/`, `ui/src/`, `transcribe.py`,
@@ -59,3 +75,13 @@ Never commit automatically. When the user explicitly asks, commit the
 work this session produced (provenance: the agent whose session produced
 the changes commits them), with a conventional-commit message and the
 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` trailer.
+
+## Git / branch discipline
+
+The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
+§ Git workflow). The coder follows it:
+- Work and commit on the branch the mentor designates — do NOT create,
+  switch, merge, or delete branches, and do NOT decide branch lifecycle.
+- If you are unsure which branch to be on, STOP and ask the mentor rather
+  than branching on your own.
+- Commit only when the user explicitly asks (see Commit discipline above).

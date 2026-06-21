@@ -138,7 +138,15 @@ class LocalVectorStore:
             n_results        = top_k,
         )
         return [
-            {"text": doc, "metadata": meta, "distance": dist}
+            {
+                "text":     doc,
+                "metadata": meta,
+                "distance": dist,
+                # Derived cosine-similarity score ∈ [0, 1] for unit-normalised
+                # embeddings (sentence-transformers, text-embedding-3-*).
+                # Chroma uses squared-L2 by default: score = 1 − d/2.
+                "score":    round(1 - dist / 2, 4),
+            }
             for doc, meta, dist in zip(
                 raw["documents"][0],
                 raw["metadatas"][0],

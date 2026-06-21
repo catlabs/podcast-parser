@@ -84,6 +84,20 @@ CHUNK_OVERLAP = 30    # words of overlap between consecutive chunks
 
 TOP_K = 5   # default number of results to retrieve
 
+# Retrieval relevance threshold (Phase 1.1k) — opt-in, default None (disabled).
+# When set, chunks whose derived cosine-similarity score (score = 1 − distance/2,
+# valid for unit-normalized embeddings such as sentence-transformers and
+# text-embedding-3-*) fall below this value are dropped after retrieval.
+# With None the behaviour is byte-for-byte identical to the pre-1.1k baseline.
+# A per-model override could live inside EmbedConfig / EMBED_REGISTRY later (v2 knob).
+RETRIEVAL_MIN_SCORE: float | None = None
+_raw_min_score = os.environ.get("RETRIEVAL_MIN_SCORE", "").strip()
+if _raw_min_score:
+    try:
+        RETRIEVAL_MIN_SCORE = float(_raw_min_score)
+    except ValueError:
+        pass  # malformed value → threshold stays disabled
+
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

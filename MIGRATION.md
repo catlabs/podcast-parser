@@ -2052,6 +2052,274 @@ switch short-circuits before either processor is built.
 
 ---
 
+## Phase 1.1j — research execution modes (`research.mode`)
+
+### Context
+
+The LangGraph research pipeline had a single fixed topology — planner → search
+→ analyst → synthesizer → critic → {planner | END}. Running it at full depth
+for a learning or observability session incurred unnecessary cost, latency, and
+trace noise. Phase 1.1j introduces three explicit execution modes so a session
+can target one stage of the pipeline without paying for the rest.
+
+### Topology per mode
+
+| Mode | Node sequence | LLM stages |
+|---|---|---|
+| `search-only` | planner → search → END | 1 planner + search |
+| `research-no-critic` | planner → search → analyst → synthesizer → END | 3 |
+| `full-research` | planner → search → analyst → synthesizer → critic → {planner\|END} | 4 + reflection retries |
+
+`full-research` is the **default** — byte-for-byte identical to the pre-1.1j
+behaviour. This is a purely additive, backward-compatible change.
+
+### Search recovery in all modes
+
+The Phase 1.1i search-recovery loop (`route_after_search` → planner re-entry,
+bounded by `MAX_SEARCH_RETRIES = 1`) is **ON in every mode, including
+`search-only`**. `search-only` is the cheapest venue to study bounded recovery.
+The router `route_after_search` returns stable literals (`"planner"` /
+`"proceed"`) and each mode's `add_conditional_edges` mapping decides where
+`"proceed"` goes (`END` for `search-only`, `"analyst"` for the two multi-stage
+modes) — keeping the router mode-agnostic.
+
+### Observability (`research.mode`)
+
+Two canonical attributes are added for the execution mode:
+
+1. **Langfuse trace root** — the `research-request` span `metadata` gains a
+   `research_mode` key (distinct from the pre-existing `mode="research-graph"`
+   key, which identifies the orchestrator *family* and must not be overloaded).
+2. **App Insights / per-span** — every node's `input_attrs` dict carries
+   `"research.mode": mode` via the existing Phase 1.1f `_run_with_span` hook.
+   This lands `research.mode` in `customDimensions` on every `agent *` span,
+   enabling KQL aggregation: `summarize count() by research.mode`.
+
+### What ships in 1.1j
+
+#### `rag/research_graph.py`
+
+- `RESEARCH_MODES = ("search-only", "research-no-critic", "full-research")` and
+  `DEFAULT_RESEARCH_MODE = "full-research"` constants (promoted to module-level
+  public symbols for import by CLI and API).
+- `ResearchState.mode: str` field — injected at invocation, forwarded to every
+  node's `input_attrs` so `research.mode` lands on all `agent *` OTel spans.
+- `build_graph(mode=DEFAULT_RESEARCH_MODE)` — refactored from the previous
+  no-argument `build_graph()`. Constructs only the nodes/edges the mode needs.
+- `_GRAPHS: dict[str, object]` — replaces the old `_graph`. All three graphs
+  built eagerly at module import; request-time path is purely a dict lookup.
+- `research_graph_stream(..., *, mode=DEFAULT_RESEARCH_MODE)` — new keyword-only
+  `mode` parameter. Validates before opening any trace; selects `_GRAPHS[mode]`;
+  injects `mode` into `initial_state`; adds `research_mode` to Langfuse span
+  metadata.
+
+#### `rag/cli.py`
+
+- `ask` and `repl` gain `--mode/-m` option (default `DEFAULT_RESEARCH_MODE`).
+  Validation happens before the trace span opens (fail-fast, zero Langfuse
+  pollution on a bad flag). `mode` is forwarded to `research_graph_stream` when
+  the intent is `research`; for `chat`/`list` intents it is unused.
+
+#### `rag/api.py`
+
+- `ResearchRequest.mode: str = DEFAULT_RESEARCH_MODE` field added.
+- `research_graph_endpoint` validates `mode` before any trace is opened (HTTP 422
+  with valid-modes message when unknown), then passes `mode=body.mode` into
+  `research_graph_stream`.
+
+### What did NOT change
+
+- `rag/research.py` — legacy orchestrator (`/chat/research` endpoint), unchanged.
+- Any agent class under `rag/agents/` — mode lives in graph wiring only.
+- `MAX_SEARCH_RETRIES`, `MAX_REFLECTION_LOOPS`.
+- UI frontend — web UI omits the `mode` field and defaults to `full-research`.
+- SSE event shape, `_run_with_span` contract, agent contracts.
+
+### Smoke test
+
+```bash
+# 1. Regression — full pipeline unchanged (default mode)
+.venv/bin/python -m rag.cli ask "Future of AI?"
+# expect: planner → search → analyst → synthesizer → critic events, grounding verdict
+
+# 2. search-only
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode search-only
+# expect: planner + search events only; NO analyst/synthesizer/critic
+
+# 3. research-no-critic
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode research-no-critic
+# expect: planner + search + analyst + synthesizer; NO critic/grounding event
+
+# 4. Bad mode — clean error, exit 1, no trace
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode bogus
+# expect: error message listing valid modes, exit code 1
+
+# 5. API bad mode — HTTP 422 with valid-modes message
+curl -s -X POST localhost:8000/chat/research-graph \
+  -H "Content-Type: application/json" \
+  -d '{"query": "test", "mode": "bogus"}' | jq .
+# expect: {"detail": "Unknown research mode 'bogus'. Valid modes: [...]}
+
+# 6. API regression — no mode field → full-research (HTTP 200)
+curl -s -o /dev/null -w "%{http_code}" -X POST localhost:8000/chat/research-graph \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Future of AI?"}' --max-time 3
+# expect: 200
+
+# 7. Topology assertion
+.venv/bin/python -c "
+from rag.research_graph import _GRAPHS, RESEARCH_MODES
+for m, g in _GRAPHS.items():
+    nodes = sorted(set(g.nodes.keys()) - {'__start__'})
+    print(m, nodes)
+"
+# expect:
+#   search-only      ['planner', 'search']
+#   research-no-critic ['analyst', 'planner', 'search', 'synthesizer']
+#   full-research    ['analyst', 'critic', 'planner', 'search', 'synthesizer']
+```
+
+---
+
+## Phase 1.1k — retrieval relevance threshold → natural SOFT_FAIL
+
+### Context
+
+Chroma always returns the nearest neighbours, even for completely off-topic
+queries. Before 1.1k, `SearchAgent` almost never SOFT_FAILed naturally — the
+1.1i/1.1i.1 recovery path could only be exercised by monkeypatching. Phase 1.1k
+introduces a **configurable relevance threshold** so irrelevant chunks are dropped
+post-retrieval; when everything is dropped the existing SOFT_FAIL → replan
+recovery fires **naturally** without any test scaffolding. This is the
+enterprise-RAG posture: returning irrelevant context is worse than returning none.
+
+### Distance metric correction
+
+The `podcasts` (minilm) collection uses **squared-L2** (`l2` space) — Chroma's
+default, because it was created with bare `get_or_create_collection(name)` and
+NO `metadata={"hnsw:space": ...}`. Earlier docstrings in `rag/search.py` and
+`rag/embed.py` said "cosine distance" — that was WRONG and is now corrected.
+
+For unit-normalized embeddings (sentence-transformers produces unit vectors;
+`text-embedding-3-*` from Azure OpenAI is also unit-normalized), the relation
+between squared-L2 distance `d` and cosine similarity is:
+
+```
+cosine_sim = 1 − d / 2
+```
+
+Each result dict now carries a **`score`** field (derived cosine similarity ∈
+[0, 1]) alongside the existing `distance` field. No re-indexing or collection
+recreation is required.
+
+Measured spread (minilm, top-1):
+
+| Query type   | distance (approx) | score (approx) |
+|---|---|---|
+| on-topic     | 0.86              | 0.57           |
+| off-topic    | 1.09              | 0.45           |
+| gibberish    | 1.48              | 0.26           |
+
+### What ships in 1.1k
+
+#### `rag/config.py`
+
+New `RETRIEVAL_MIN_SCORE: float | None` (default `None`, read from
+`RETRIEVAL_MIN_SCORE` env var). When `None` (unset / empty) behaviour is
+byte-for-byte identical to pre-1.1k for every caller.
+
+#### `rag/search.py`
+
+- **Docstrings corrected**: module-level and `_do_search` now say "squared-L2"
+  instead of the previous incorrect "cosine distance".
+- **`_do_search`**: each result dict gains `"score": round(1 - dist/2, 4)`.
+  The existing `"distance"` field is preserved unchanged.
+- **`_retrieval_output`**: adds `"score"` alongside `"distance"` per result so
+  Langfuse and App Insights show both metrics per chunk. `"text"` is still
+  excluded (privacy rule unchanged).
+- **`semantic_search`** gains keyword-only `min_score: float | None = None`.
+  When set, chunks with `score < min_score` are dropped after retrieval (retrieve
+  `top_k` from Chroma first, then filter in Python). When `None` — the default
+  — no filtering; all callers (chat RAG via `rag/chat.py`, compare, eval,
+  `rag/research.py` legacy path, MCP) are unaffected.
+- **Langfuse `retrieval` span** gains retrieval stats in `metadata`:
+  `min_score`, `n_returned` (pre-filter), `n_kept` (post-filter), `n_dropped`,
+  `top_score`, `min_kept_score`.
+- **OTel retrieval span** receives the same stats as attributes (`retrieval.*`)
+  so they land in App Insights `customDimensions`.
+
+#### `rag/embed.py`
+
+`LocalVectorStore.query` adds `"score": round(1 - dist/2, 4)` per result for
+symmetry with `_do_search`. The `VectorStore` protocol's dict return is open;
+existing consumers are unaffected.
+
+#### `rag/agents/search.py`
+
+- Imports `RETRIEVAL_MIN_SCORE` from config.
+- `SearchAgent.run` reads `min_score = RETRIEVAL_MIN_SCORE` once and passes it
+  to each `semantic_search` call via a local `_search_one` helper (captures
+  `model_key` and `min_score` from enclosing scope; passed to
+  `contextvars.copy_context().run` so OTel context still propagates correctly).
+- **Two SOFT_FAIL flavours** (Phase 1.1k addition):
+  - `soft_fail_reason = "below_threshold"` + `errors = ("all results below relevance threshold",)` — threshold was active and chunks were dropped to zero.
+  - `soft_fail_reason = "no_match"` + `errors = ("no episodes matched the sub-queries",)` — no threshold or Chroma returned nothing.
+  `soft_fail_reason` is stored in `result.data` so it propagates to the
+  orchestrator.
+
+#### `rag/research_graph.py`
+
+- Imports `RETRIEVAL_MIN_SCORE` from config.
+- `search_node`'s `output_attrs_fn` adds two conditional attributes:
+  - `search.min_score` — present only when threshold is enabled (avoids
+    polluting dashboards with a null key when threshold is off).
+  - `search.soft_fail_reason` (`"below_threshold"` | `"no_match"`) — present
+    only on soft-fail; makes the cause queryable in KQL without text-scanning
+    `errors`.
+- SSE `"error"` step event's `detail` now surfaces the actual reason string
+  (`result.errors[0]`) rather than the hard-coded `"no episodes matched"`.
+
+### Recovery path — unchanged, fires naturally
+
+No graph edits. `route_after_search` (1.1i) already routes SOFT_FAIL → planner;
+the 1.1i.1 broaden-feedback replan already handles the re-plan. After 1.1k, an
+off-topic or gibberish query produces a **real** SOFT_FAIL and the recovery loop
+runs end-to-end without monkeypatching.
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `RETRIEVAL_MIN_SCORE` | unset (disabled) | Minimum cosine-similarity score to keep a chunk. Unset → threshold off, pre-1.1k behaviour preserved. |
+
+Documented in both `.env.example` and `.env.agent-safe` (commented out / unset by default).
+
+### Observability keys
+
+| Layer | Key | Values |
+|---|---|---|
+| Langfuse `retrieval` span metadata | `min_score` | float or null |
+| Langfuse `retrieval` span metadata | `n_returned` | int (pre-filter) |
+| Langfuse `retrieval` span metadata | `n_kept` | int (post-filter) |
+| Langfuse `retrieval` span metadata | `n_dropped` | int |
+| Langfuse `retrieval` span metadata | `top_score` | float or null |
+| Langfuse `retrieval` span metadata | `min_kept_score` | float or null |
+| OTel `retrieval` span attrs | `retrieval.*` | same keys, stamped via `get_current_span().set_attribute()` |
+| OTel `agent search` span attrs | `search.min_score` | float (omitted when disabled) |
+| OTel `agent search` span attrs | `search.soft_fail_reason` | `"below_threshold"` \| `"no_match"` (omitted on success) |
+| Langfuse result per chunk | `score` | float ∈ [0, 1] |
+
+### What did NOT change in 1.1k
+
+- Graph topology (`route_after_search`, `MAX_SEARCH_RETRIES`, any edge) — unchanged.
+- Chat RAG (`rag/chat.py`) and compare mode — `semantic_search` default `min_score=None` applies; no threshold.
+- Legacy orchestrator (`rag/research.py`) — same.
+- `rag/eval.py`, `rag/mcp_server.py` — same.
+- Existing `"distance"` field, chunk rankings, `MAX_EPISODES`, `CHUNKS_PER_QUERY`.
+- Phase 1.1f trace-dedup invariant and 1.1f.2 unified topology.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.
