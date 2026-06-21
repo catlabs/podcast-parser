@@ -134,6 +134,27 @@ Two session modes. Both require a written report.
 3. Durable learnings still go to `operator-memory.md`.
 4. No mentor sign-off required — the user is the driver.
 
+## Session discipline (Langfuse)
+
+**At the start of every run, open a structured Langfuse session** so all the
+traces that run produces group into one timeline in the Langfuse **Sessions**
+view — this is the user's primary lens for "show me everything this test did".
+Never let test traffic scatter as orphan traces.
+
+Set a `session_id` following the convention `<surface>-<purpose>-<id>`:
+- **Mode A (brief-driven):** `op-verify-<phase>` — e.g. `op-verify-1.1k`.
+- **Mode B (ad-hoc):** `op-adhoc-<slug>` — a short slug for what's under test,
+  e.g. `op-adhoc-threshold-tuning`.
+
+Mechanism (no product-code edits): the `session_id` is already threaded via
+`trace_context(session_id=...)`. Pass it explicitly to the programmatic stream
+entry points (`research_graph_stream(..., session_id=)`, `ask_stream(...,
+session_id=)`) or to any throwaway driver you run. For CLI one-shot runs, use
+the `--session/-s` flag **if available** (see the coder enabler); otherwise
+drive the programmatic path so the session is pinned. State the chosen
+`session_id` in the report so the user can find the session in the UI. Do NOT
+put concrete `session_id` values in `operator-memory.md` (per-run, non-durable).
+
 ## Teaching protocol
 
 - Show the exact query/command, then have the user read the output with

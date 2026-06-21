@@ -33,6 +33,22 @@ conversation.
 - Run the brief's smoke test; report concrete results.
 - Surface deviations and open questions in the report.
 
+## Session discipline (Langfuse)
+
+When a smoke test exercises a path that emits Langfuse traces (i.e. Langfuse
+is configured for the run), **pin a structured `session_id`** so the whole
+smoke run groups into one Langfuse **Sessions** timeline instead of scattering
+as orphan traces — the same convention the operator and mentor use. Use
+`coder-<phase>` (e.g. `coder-1.1k`). In pure local mode (no Langfuse keys, the
+common case) no traces are produced and there is nothing to tag — this only
+applies when traces are actually emitted.
+
+Mechanism (no extra deps, stay in scope): pass `session_id=` to the
+programmatic stream entry points (`research_graph_stream`, `ask_stream`) or to
+any test driver you write; for CLI smokes use the `--session/-s` flag if the
+brief's scope includes it. Record the `session_id` you used in the report.
+This is observability hygiene only — it must never change product behaviour.
+
 ## Must / must not
 
 - **May read/write:** product code (`rag/`, `ui/src/`, `transcribe.py`,
