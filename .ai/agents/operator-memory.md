@@ -112,6 +112,12 @@ dependencies
   model. Goal: fluency for production-AI architecture discussions.
 - Teach by showing the query and reading the output together; one new
   concept per lookup.
+- **App Insights teaching mode (2026-06-21 preference):** For App Insights
+  KQL, DO NOT run queries via `az` CLI — instead write the query, explain
+  what each clause does and what to expect, then ask the user to paste it
+  into the Azure Portal (Monitoring → Logs → KQL mode) and share the output.
+  Read the results together. The user wants to build portal fluency, not just
+  see piped results. Keep `az` for non-query tasks (resource discovery, etc.).
 
 ## Phase 1.1k attribute additions (verified 2026-06-21)
 
@@ -155,7 +161,7 @@ dependencies
 | project timestamp, sub_queries
 | order by timestamp desc
 ```
-*(customDimensions key mapping unverified in App Insights — no connection string set in the 2026-06-21 run.)*
+*(Both KQL shapes verified live in App Insights 2026-06-21 — user ran them in Azure Portal, results confirmed.)*
 
 ## Threshold calibration gotcha (2026-06-21)
 
@@ -165,13 +171,25 @@ episode titled "L'IA au service de l'Art et de la Créativité" that fuzzy-match
 block them; 0.45 gave a clean margin. Always probe representative planner
 sub-queries before choosing a threshold — don't assume domain separation is clean.
 
-## List-attribute serialization (VERIFIED 2026-06-21)
+## List-attribute serialization (FULLY VERIFIED 2026-06-21)
 
-`research.sub_queries` serializes as a **JSON array string** in Langfuse
-`metadata.attributes` — e.g. `'["query1","query2"]'`. In App Insights
-`customDimensions` the format is unverified (may be the same JSON string or
-Python repr). The safe KQL idiom is `tostring(...)` for visual compare;
-`mv-expand parse_json(...)` only if confirmed as valid JSON on live data.
+Two backends, two different formats for the SAME attribute:
+
+| Backend | Format | `parse_json()` usable? |
+|---|---|---|
+| Langfuse `metadata.attributes` | JSON array: `["q1","q2"]` | ✅ yes |
+| App Insights `customDimensions` | Python tuple repr: `('q1','q2')` | ❌ no |
+
+Root cause: OTel Python SDK converts `list[str]` → `tuple[str]` for immutability;
+Azure Monitor exporter calls `str(tuple)` → Python repr. Langfuse serializes as JSON.
+Same pattern hits ALL list attributes, including `langfuse.trace.tags` → `('research-graph',)`.
+
+**Safe KQL idiom for list attributes in App Insights:**
+```kql
+| where customDimensions["research.sub_queries"] contains "keyword"  // filter
+| extend sub_q = tostring(customDimensions["research.sub_queries"])  // display
+// NEVER: mv-expand parse_json(customDimensions["research.sub_queries"]) — not valid JSON
+```
 
 ## Operator session modes (2026-06-21)
 
@@ -183,12 +201,42 @@ Two distinct modes of operator work:
    Report STILL required — write to `.ai/memory/personal/<slug>-adhoc-verification.md`
    (or another slug) so findings can be shared with other LLMs.
 
+## Event → table mapping (VERIFIED 2026-06-21)
+
+OTel `add_event("search.recovery_triggered", ...)` → **`traces` table** in App Insights.
+- `message` field = event name (`"search.recovery_triggered"`)
+- `customDimensions` = event attributes (`recovery.triggered`, `recovery.reason`, etc.)
+- `operation_Id` links the event to its parent span
+- The event fires on the `research-request` OTel span (confirmed: `lf.start_as_current_observation(as_type="span")` pushes an OTel current span that `_ot_trace.get_current_span()` sees)
+- **Not** in `dependencies` — that table holds spans, not span events
+
+**Ingestion delay:** App Insights async ingest typically adds 2–5 minutes. An absent
+`traces` result does not mean the event didn't fire — wait and retry.
+
+Definitive KQL:
+```kql
+traces
+| where timestamp > ago(2h)
+      and message == "search.recovery_triggered"
+| project timestamp, operation_Id,
+          retry_count = tostring(customDimensions["search.retry_count"]),
+          reason      = tostring(customDimensions["recovery.reason"])
+```
+
+## `research-request` span in App Insights (VERIFIED 2026-06-21)
+
+The Langfuse SDK span (`research-request`) IS exported to App Insights → `dependencies` table.
+Its `customDimensions` has a DIFFERENT structure than OTel agent spans:
+
+```
+agent *          → customDimensions["search.status"]          flat OTel key
+research-request → customDimensions["langfuse.observation.input"]   Langfuse-namespaced
+                 → customDimensions["langfuse.observation.metadata.model_key"]
+                 → customDimensions["session.id"]             OTel propagated
+```
+
+To query by `model_key` or `llm_key`, prefer `agent *` spans (flat keys) over `research-request`.
+
 ## Open verifications queued
 
-- Phase 1.1i full-research mode + App Insights KQL: still open.
-  The 2026-06-21 ad-hoc session confirmed the Langfuse side (recovery loop,
-  divergent sub_queries, `replan_after_no_results`). The App Insights
-  `customDimensions` key mapping and the event→table mapping remain unverified
-  (no `APPLICATIONINSIGHTS_CONNECTION_STRING` in that run).
-- Event→table mapping: `add_event` spans → `traces` table in App Insights
-  (unconfirmed — needs a run with connection string set).
+*(None currently. Phase 1.1i + 1.1k fully verified on both backends 2026-06-21.)*
