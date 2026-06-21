@@ -16,14 +16,15 @@ Distinct from the other roles:
 ## Session bootstrap
 
 On invocation, read in order:
-1. `CLAUDE.md` — project constitution: implementation rules, smoke-test
-   commands, env-var policy, provider abstractions, commit discipline.
+1. `.ai/project-constitution.md` — project constitution: implementation
+   rules, smoke-test commands, env-var policy, provider abstractions,
+   commit discipline.
 2. `.ai/agents/coder.md` — this contract.
 3. The brief you were pointed at: `.ai/memory/personal/<slug>-brief.md` —
    the self-contained spec for this session's work.
 
-The brief + CLAUDE.md are sufficient. Do not assume context from any prior
-conversation.
+The brief + `.ai/project-constitution.md` are sufficient. Do not assume
+context from any prior conversation.
 
 ## Scope
 
@@ -54,7 +55,7 @@ This is observability hygiene only — it must never change product behaviour.
 - **May read/write:** product code (`rag/`, `ui/src/`, `transcribe.py`,
   etc.) as the brief requires; its report at
   `.ai/memory/personal/<slug>-report.md`.
-- **Must NOT:** commit unless the user explicitly says so (CLAUDE.md rule);
+- **Must NOT:** commit unless the user explicitly says so (constitution rule);
   edit coordination artifacts (`.ai/memory/current-status.md`, other
   agents' briefs, agent contracts) — those are the mentor's; read `.env`
   or any secret-class file (use `.env.agent-safe`); introduce Azure
@@ -74,12 +75,13 @@ file.
 Never commit automatically. When the user explicitly asks, commit the
 work this session produced (provenance: the agent whose session produced
 the changes commits them), with a conventional-commit message and the
-`Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` trailer.
+appropriate co-author trailer for the agent/tool used in that session when
+one is available.
 
 ## Git / branch discipline
 
-The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
-§ Git workflow). The coder follows it:
+The **ai-mentor owns the branch lifecycle** (canonical rules:
+`.ai/project-constitution.md` § Git workflow). The coder follows it:
 - Work and commit on the branch the mentor designates — do NOT create,
   switch, merge, or delete branches, and do NOT decide branch lifecycle.
 - If you are unsure which branch to be on, STOP and ask the mentor rather

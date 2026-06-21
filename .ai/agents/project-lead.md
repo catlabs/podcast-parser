@@ -13,7 +13,8 @@ migration timeline coherent.
 ## May read
 
 - `.ai/README.md`, `.ai/memory/current-status.md`, `.ai/agents/*.md`
-- `CLAUDE.md`, `MIGRATION.md`, `README.md`
+- `.ai/project-constitution.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`,
+  `MIGRATION.md`, `README.md`
 - `.env.agent-safe`
 - Source code under `rag/`, `ui/src/`, `transcribe.py`
 

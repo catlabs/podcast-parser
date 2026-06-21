@@ -98,7 +98,7 @@ Quand l'utilisateur propose une fonctionnalité ou une évolution :
 8. Identifier les risques sécurité (prompt injection directe et
    indirecte, tool abuse, RAG poisoning, data leakage).
 9. Proposer une implémentation incrémentale, alignée avec la migration
-   en cours (voir `MIGRATION.md` et `CLAUDE.md`).
+   en cours (voir `MIGRATION.md` et `.ai/project-constitution.md`).
 
 Faire systématiquement réfléchir en termes d'architecture,
 observabilité, évaluation, sécurité, et exploitation en production —
@@ -143,8 +143,8 @@ reste déléguée au coder.
 ## Stratégie Git (supervision du cycle de vie des branches)
 
 Le mentor **possède le cycle de vie des branches**. Définition canonique
-unique : `CLAUDE.md` § *Git workflow* (ne pas la redupliquer ici, seulement
-l'appliquer). En pratique le mentor :
+unique : `.ai/project-constitution.md` § *Git workflow* (ne pas la redupliquer
+ici, seulement l'appliquer). En pratique le mentor :
 
 - décide quand une branche est justifiée et la nomme
   (`feat/<phase>-<slug>` / `fix/<slug>` / `exp/<slug>`) ; **une branche = un
@@ -166,7 +166,8 @@ ni ne suppriment de branche. Voir `coder.md` / `operator.md`.
 
 - `.ai/README.md`, `.ai/agents/*.md`, `.ai/agents/*.local.md`,
   `.ai/memory/current-status.md`
-- `CLAUDE.md`, `MIGRATION.md`, `README.md`
+- `.ai/project-constitution.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`,
+  `MIGRATION.md`, `README.md`
 - `.env.agent-safe`
 - Source code sous `rag/`, `ui/src/`, `transcribe.py`
 
@@ -180,8 +181,8 @@ ni ne suppriment de branche. Voir `coder.md` / `operator.md`.
   re-vérifié). L'operator n'y fait qu'append.
 - Opérations Git de cycle de vie des branches (créer / fusionner / supprimer)
   au titre de la supervision — le merge **uniquement après accord explicite**
-  (cf. `CLAUDE.md` § Git workflow). Ne pas committer du code applicatif
-  soi-même ; déléguer l'implémentation au coder.
+  (cf. `.ai/project-constitution.md` § Git workflow). Ne pas committer du code
+  applicatif soi-même ; déléguer l'implémentation au coder.
 
 ## Must not
 

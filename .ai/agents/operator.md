@@ -73,7 +73,8 @@ The operator MAY:
 
 ## Must read / write
 
-- **May read:** source code, `CLAUDE.md`, `MIGRATION.md`, `.ai/**`
+- **May read:** source code, `.ai/project-constitution.md`, `AGENTS.md`,
+  `CLAUDE.md`, `CODEX.md`, `MIGRATION.md`, `.ai/**`
   (except other developers' `personal/` scratch and any `*.local.md` not
   its own), `.env.agent-safe`.
 - **May write:** `.ai/agents/operator-memory.md` (append durable
@@ -186,12 +187,12 @@ items → `operator-findings.md` (never pollute the runbook with defects).
 
 ## Git / branch discipline
 
-The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
-§ Git workflow). The operator **never commits, branches, or merges** — it runs
-verification against whatever branch the mentor designates and writes its report
-+ durable learnings. If the working tree state looks wrong for a verification
-(wrong branch, unexpected uncommitted changes), STOP and flag it to the mentor
-rather than changing Git state.
+The **ai-mentor owns the branch lifecycle** (canonical rules:
+`.ai/project-constitution.md` § Git workflow). The operator **never commits,
+branches, or merges** — it runs verification against whatever branch the mentor
+designates and writes its report + durable learnings. If the working tree state
+looks wrong for a verification (wrong branch, unexpected uncommitted changes),
+STOP and flag it to the mentor rather than changing Git state.
 
 ## Teaching protocol
 

@@ -11,7 +11,7 @@ other AI helper. None of these files contain secrets.
 |---|---|---|---|
 | **secret** | `.env`, `*.pem`, `*.key`, anything under `~/.aws/`, customer audio | **no** | no |
 | **agent-safe env** | `.env.agent-safe` — loaded by the app as non-sensitive defaults; precedence is shell > `.env` > `.env.agent-safe` | yes | yes |
-| **project knowledge** | `CLAUDE.md`, `README.md`, `MIGRATION.md`, source code | yes | yes |
+| **project knowledge** | `.ai/project-constitution.md`, `AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `README.md`, `MIGRATION.md`, source code | yes | yes |
 | **shared context** | this directory (`.ai/`) | yes (read; write rules below) | yes |
 | **per-developer scratch** | `.ai/memory/personal/**` | only the developer's own agent | gitignored |
 | **agent-local context** | `.ai/agents/*.local.md` — personal context that complements a public agent contract (employer, mission, secret-adjacent details) | only the developer's own agent | gitignored |
@@ -48,9 +48,9 @@ Each markdown file describes one agent's contract:
 - **typical tools / tasks** — short examples
 
 Roles defined here are descriptive and tool-agnostic. A Claude Code
-subagent (`.claude/agents/<name>.md`) or Cursor "custom agent" can
-reference the matching `.ai/agents/<name>.md` file to inherit the
-contract.
+subagent (`.claude/agents/<name>.md`), Codex session, or Cursor "custom
+agent" can reference the matching `.ai/agents/<name>.md` file to inherit
+the contract.
 
 ## Shared memory (`.ai/memory/`)
 
