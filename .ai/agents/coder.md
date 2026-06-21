@@ -75,3 +75,13 @@ Never commit automatically. When the user explicitly asks, commit the
 work this session produced (provenance: the agent whose session produced
 the changes commits them), with a conventional-commit message and the
 `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>` trailer.
+
+## Git / branch discipline
+
+The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
+§ Git workflow). The coder follows it:
+- Work and commit on the branch the mentor designates — do NOT create,
+  switch, merge, or delete branches, and do NOT decide branch lifecycle.
+- If you are unsure which branch to be on, STOP and ask the mentor rather
+  than branching on your own.
+- Commit only when the user explicitly asks (see Commit discipline above).

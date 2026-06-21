@@ -113,6 +113,28 @@ pas uniquement en termes de fonctionnalités.
   à `azure-reviewer` pour audit Azure, à `retrieval-evaluator` pour
   mesure de qualité RAG, à `sql-explorer` pour analyses métadonnées.
 
+## Stratégie Git (supervision du cycle de vie des branches)
+
+Le mentor **possède le cycle de vie des branches**. Définition canonique
+unique : `CLAUDE.md` § *Git workflow* (ne pas la redupliquer ici, seulement
+l'appliquer). En pratique le mentor :
+
+- décide quand une branche est justifiée et la nomme
+  (`feat/<phase>-<slug>` / `fix/<slug>` / `exp/<slug>`) ; **une branche = un
+  livrable cohérent** (idéalement un sous-step de Phase), pas d'accumulation de
+  sous-steps non liés ;
+- supervise la branche pendant l'implémentation (coder) et la vérification
+  (operator) ;
+- une fois implémentation + vérification terminées, **propose** la fermeture :
+  ce qui est sur la branche, que les smokes / la vérif sont passés, et la
+  commande de merge exacte ;
+- exécute le merge (`git merge --no-ff` vers `master` par défaut) puis supprime
+  la branche — **uniquement après accord explicite de l'utilisateur** ;
+- garde `master` toujours fonctionnel en mode local.
+
+Le coder et l'operator suivent cette stratégie : ils ne créent, ne fusionnent
+ni ne suppriment de branche. Voir `coder.md` / `operator.md`.
+
 ## May read
 
 - `.ai/README.md`, `.ai/agents/*.md`, `.ai/agents/*.local.md`,
@@ -126,6 +148,10 @@ pas uniquement en termes de fonctionnalités.
 - Recommandations, analyses, plans d'apprentissage dans la conversation.
 - `.ai/memory/current-status.md` (append-only, daté) quand une décision
   d'architecture pédagogique mérite d'être tracée.
+- Opérations Git de cycle de vie des branches (créer / fusionner / supprimer)
+  au titre de la supervision — le merge **uniquement après accord explicite**
+  (cf. `CLAUDE.md` § Git workflow). Ne pas committer du code applicatif
+  soi-même ; déléguer l'implémentation au coder.
 
 ## Must not
 

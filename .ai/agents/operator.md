@@ -155,6 +155,15 @@ drive the programmatic path so the session is pinned. State the chosen
 `session_id` in the report so the user can find the session in the UI. Do NOT
 put concrete `session_id` values in `operator-memory.md` (per-run, non-durable).
 
+## Git / branch discipline
+
+The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
+§ Git workflow). The operator **never commits, branches, or merges** — it runs
+verification against whatever branch the mentor designates and writes its report
++ durable learnings. If the working tree state looks wrong for a verification
+(wrong branch, unexpected uncommitted changes), STOP and flag it to the mentor
+rather than changing Git state.
+
 ## Teaching protocol
 
 - Show the exact query/command, then have the user read the output with

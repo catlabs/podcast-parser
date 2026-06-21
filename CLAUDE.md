@@ -118,6 +118,49 @@ one at a time, as predecessors complete.
 - Use `.venv/bin/python` and `.venv/bin/pip` directly — never `source .venv/bin/activate`.
 - **Respect agent boundaries.** Read `.ai/README.md` for file classifications. Default to `.env.agent-safe` for env knobs; do not read `.env` unless the user explicitly asks. Update `.ai/memory/current-status.md` (append-only) when a multi-session milestone completes.
 
+## Git workflow
+
+Lightweight, solo-developer, trunk-based. **The ai-mentor owns the branch
+lifecycle**; the coder and operator follow it. This section is the single source
+of truth — agent contracts point here, they do not redefine it.
+
+- **`master` is the trunk** — it must always run in local mode. Never commit
+  broken or half-verified product code to `master`.
+- **Short-lived, single-purpose branches.** The mentor decides when a branch is
+  warranted and names it. **One branch = one coherent deliverable** (ideally one
+  Phase sub-step). Do NOT accumulate unrelated sub-steps on one branch — that is
+  the drift this workflow exists to prevent.
+  - `feat/<phase>-<slug>` — a feature / phase sub-step (e.g. `feat/1.1k-retrieval-threshold`)
+  - `fix/<slug>` — a bug fix
+  - `exp/<slug>` — throwaway spike; may be deleted without merging, history
+    cleanliness not required. If a spike proves out, the mentor opens a clean
+    `feat/*` for the real version rather than merging messy exp history.
+  - Trivial bookkeeping (a memory line, a `current-status.md` append) may go
+    straight to `master` when no branch is in flight — branching it is pure
+    overhead.
+- **Lifecycle** (mentor-supervised):
+  1. **Open** — mentor branches off up-to-date `master`.
+  2. **Implement** — coder commits its sub-step(s) on that branch, only when the
+     user says "commit" (conventional-commit + `Co-Authored-By` trailer; one
+     logical commit per sub-step).
+  3. **Verify** — operator runs live verification against the branch and writes
+     its report. The operator never commits.
+  4. **Propose close** — when implementation + verification are complete, the
+     mentor proposes the merge: what's on the branch, that smokes/verification
+     passed, and the exact command.
+  5. **Merge — ONLY after explicit user approval.** Default:
+     `git merge --no-ff` into `master` (keeps the per-sub-step commits *and* a
+     merge commit marking the feature boundary — best for long-term readable
+     history). Squash is the alternative when sub-step granularity is not worth
+     keeping. Delete the branch after merge.
+- **Role boundaries:** only the **mentor** creates branches, decides scope, and
+  proposes/executes merges (merge only on explicit approval). The **coder**
+  commits (on request) on the branch the mentor designates and never creates,
+  switches, merges, or deletes branches. The **operator** never commits,
+  branches, or merges.
+- **No PRs / no review gates** (solo dev) — the user's approval at merge is the
+  gate. Keep process overhead at exactly this level; do not add more.
+
 ## Standard smoke tests
 
 ```bash
