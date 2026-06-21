@@ -620,3 +620,58 @@ stage. Mentor independently verified topology (search-only ⊂ no-critic ⊂ ful
 default, bad-mode rejection, CLI flag, and API field (the coder's smoke summary
 was NOT trusted on its own — same run produced the fabrication noted above).
 commit: 6b0e1b4 (branch ``feat/research-modes``)
+
+2026-06-21 — Phase 1.1k shipped: retrieval relevance threshold → natural
+SOFT_FAIL. Every retrieval result gains a derived ``score = round(1 -
+distance/2, 4)`` (≈ cosine sim; Chroma's metric is squared-L2 — the prior
+"cosine" docstrings were wrong and were fixed). New ``RETRIEVAL_MIN_SCORE``
+config (default None = disabled, fully backward compatible). ``SearchAgent``
+reads the threshold; when all chunks fall below it ``episodes_by_title`` is
+empty → existing SOFT_FAIL fires with ``soft_fail_reason="below_threshold"``
+(vs ``"no_match"``), driving the 1.1i/1.1i.1 recovery loop NATURALLY — no
+monkeypatch. No re-index needed (local embeddings are unit-normalized).
+Observability: retrieval span gains ``min_score``/``n_returned``/``n_kept``/
+``n_dropped``/``top_score``/``min_kept_score``; ``agent search`` span gains
+``search.min_score``/``search.soft_fail_reason``. Mentor independently verified
+score formula, disabled==unchanged, config-driven SOFT_FAIL. Process note:
+coder committed despite the brief's "do not commit" (deviation, kept).
+commit: fadfd0b
+
+2026-06-21 — Phase 1.1k + 1.1i/1.1i.1 LIVE VERIFICATION complete (operator,
+BOTH backends) — resolves the ⚠️ flag opened in the 1.1i entry above. Brief-
+driven operator session (session_id ``op-verify-1.1k``) drove a natural
+threshold-triggered zero-result recovery (``search-only`` mode) against real
+Langfuse + Application Insights. Confirmed: ``soft_fail_reason="below_threshold"``,
+``search.min_score`` stamped, two ``agent planner`` spans with divergent
+sub_queries, ``research.replan_after_no_results=true`` on the recovery re-entry,
+exactly one bounded re-plan, ``search.recovery_triggered`` event. GOTCHA
+reconfirmed: ``research.attempt`` reads 1 on BOTH planner spans (distinguish via
+``replan_after_no_results``); the two SEARCH spans carry attempt 1/2. Open
+questions settled: (Q1) App Insights serializes list attributes as Python tuple
+repr ``('a','b')`` NOT JSON → use ``contains``/``tostring``, never ``parse_json``;
+(Q2) ``add_event`` lands in the ``traces`` table (not ``dependencies``), linked
+by ``operation_Id``. Recommended prod threshold for minilm on this French corpus:
+``RETRIEVAL_MIN_SCORE=0.45`` (tight headroom; on-topic peaks ~0.47–0.53). The
+earlier fabricated-coder verification is fully superseded. Durable verdicts in
+operator-memory.md.
+
+2026-06-21 — Agent-ecosystem governance formalized (mentor session, no product
+code). (1) **Git workflow** — lightweight trunk-based; the mentor owns the
+branch lifecycle (open → coder implements → operator verifies → mentor proposes
+close → merge ONLY on explicit user approval, default ``--no-ff`` → delete).
+Canonical definition in ``CLAUDE.md`` § Git workflow; role pointers in the three
+agent contracts. (2) **Langfuse session discipline** — structured ``session_id``
+convention (``op-verify-<phase>`` / ``op-adhoc-<slug>`` / ``coder-<phase>``) so
+test traffic groups in Langfuse Sessions. (3) **Operator role upgrade** — two
+session modes (brief-driven / ad-hoc) + a first-class bug-escalation channel:
+operator appends findings to ``.ai/memory/operator-findings.md``, mentor owns
+the full lifecycle (triage → coder brief → remove once fixed + re-verified).
+commits: 2456033 (workflow), 50df509 (session discipline), + findings-channel
+batch this session.
+
+2026-06-21 — Feature ``feat/research-modes`` CLOSED: merged into ``master`` via
+``git merge --no-ff`` and the branch deleted. Bundled Phase 1.1j (execution
+modes) + Phase 1.1k (retrieval threshold) + the agent-ecosystem governance.
+First exercise of the new mentor-supervised feature-close flow (the branch had
+drifted into a catch-all — the very pattern the new Git workflow now prevents).
+Going forward: one single-purpose branch per sub-step.
