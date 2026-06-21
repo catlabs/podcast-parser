@@ -44,7 +44,11 @@ from rag.agents.base import _run_with_span
 from rag.chat import ask_stream
 from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LANGFUSE_DEFAULT_USER_ID
 from rag.observability import span, trace_context
-from rag.research_graph import research_graph_stream
+from rag.research_graph import (
+    DEFAULT_RESEARCH_MODE,
+    RESEARCH_MODES,
+    research_graph_stream,
+)
 
 
 app     = typer.Typer(
@@ -63,9 +67,26 @@ def ask(
     query:     str = typer.Argument(...,                       help="Natural-language question."),
     llm_key:   str = typer.Option(DEFAULT_LLM_KEY,   "--llm",   help="Chat LLM key from LLM_REGISTRY."),
     model_key: str = typer.Option(DEFAULT_MODEL_KEY, "--embed", help="Embedding model key for retrieval."),
+    mode:      str = typer.Option(
+        DEFAULT_RESEARCH_MODE, "--mode", "-m",
+        help=(
+            "Research pipeline depth (research intent only). "
+            f"One of: {', '.join(RESEARCH_MODES)}. "
+            "Ignored for chat/list intents."
+        ),
+    ),
 ):
     """One-shot: classify, dispatch, stream the answer, exit."""
-    _run_query(query, llm_key=llm_key, model_key=model_key, session_id=None)
+    # Validate mode early — before any trace is opened — so a bad flag
+    # produces a clean CLI error with zero Langfuse pollution. Mirrors the
+    # `_fetch_episode_or_die` "fail before the span opens" idiom from 1.1g.
+    if mode not in RESEARCH_MODES:
+        console.print(
+            f"[red bold]Error:[/red bold] unknown mode {mode!r}. "
+            f"Valid: {', '.join(RESEARCH_MODES)}"
+        )
+        raise typer.Exit(code=1)
+    _run_query(query, llm_key=llm_key, model_key=model_key, session_id=None, mode=mode)
 
 
 @app.command()
@@ -86,12 +107,28 @@ def summarize(
 def repl(
     llm_key:   str = typer.Option(DEFAULT_LLM_KEY,   "--llm",   help="Chat LLM key from LLM_REGISTRY."),
     model_key: str = typer.Option(DEFAULT_MODEL_KEY, "--embed", help="Embedding model key for retrieval."),
+    mode:      str = typer.Option(
+        DEFAULT_RESEARCH_MODE, "--mode", "-m",
+        help=(
+            "Research pipeline depth (research intent only). "
+            f"One of: {', '.join(RESEARCH_MODES)}. "
+            "Ignored for chat/list intents."
+        ),
+    ),
 ):
     """Interactive REPL — every turn shares one Langfuse session_id."""
+    # Validate mode before the REPL loop starts — same fail-fast idiom as ask().
+    if mode not in RESEARCH_MODES:
+        console.print(
+            f"[red bold]Error:[/red bold] unknown mode {mode!r}. "
+            f"Valid: {', '.join(RESEARCH_MODES)}"
+        )
+        raise typer.Exit(code=1)
     session_id = f"cli-{uuid.uuid4().hex[:8]}"
     console.print(Panel.fit(
         f"[bold]podcast-parser CLI[/bold]\n"
-        f"[dim]session_id = {session_id}    llm = {llm_key}    embed = {model_key}[/dim]\n"
+        f"[dim]session_id = {session_id}    llm = {llm_key}    embed = {model_key}    "
+        f"mode = {mode}[/dim]\n"
         f"[dim]Type 'quit' / 'exit' / 'q' or hit Ctrl-D to leave.[/dim]",
         border_style="cyan",
     ))
@@ -105,7 +142,7 @@ def repl(
             continue
         if query.lower() in {"quit", "exit", "q"}:
             break
-        _run_query(query, llm_key=llm_key, model_key=model_key, session_id=session_id)
+        _run_query(query, llm_key=llm_key, model_key=model_key, session_id=session_id, mode=mode)
 
 
 # ── Dispatch core ───────────────────────────────────────────────────────────
@@ -117,17 +154,22 @@ def _run_query(
     llm_key:    str,
     model_key:  str,
     session_id: str | None,
+    mode:       str = DEFAULT_RESEARCH_MODE,
 ) -> None:
     """Classify → dispatch → render. Wraps the whole invocation in a
     ``cli-request`` SDK span so the orchestrator span + the downstream
     flow's span land as siblings under one trace.
+
+    ``mode`` is forwarded to ``research_graph_stream`` when the intent is
+    ``research``; for ``chat``/``list`` intents it is simply unused (no error).
     """
     user_id = LANGFUSE_DEFAULT_USER_ID
     with span(
         "cli-request",
         input    = {"query": query},
         metadata = {"llm_key": llm_key, "model_key": model_key,
-                    "session_id": session_id or "", "surface": "cli"},
+                    "session_id": session_id or "", "surface": "cli",
+                    "research_mode": mode},
     ) as req, trace_context(
         user_id    = user_id,
         session_id = session_id,
@@ -149,6 +191,7 @@ def _run_query(
             stream  = research_graph_stream(
                 sub_query, model_key=model_key, llm_key=llm_key,
                 session_id=session_id, user_id=user_id,
+                mode=mode,
             )
             feature = "research-cli"
         else:

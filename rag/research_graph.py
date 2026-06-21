@@ -13,16 +13,16 @@ Why LangGraph?
     - Add retry policies per node
   None of these require rewriting the pipeline — they're graph-level concerns.
 
-Graph:
-  planner → search → analyst → synthesizer → critic → END
-  with two conditional edges:
-    - search  → {planner | analyst}  (outcome-based search recovery, 1.1i)
-    - critic  → {planner | END}      (domain-level reflection loop)
+Graph (topology depends on execution mode — Phase 1.1j):
+  search-only      : planner → search → END
+  research-no-critic: planner → search → analyst → synthesizer → END
+  full-research    : planner → search → analyst → synthesizer → critic → {planner | END}
+  In all modes, the search → planner recovery edge (Phase 1.1i) remains active.
 
 Public API:
-  build_graph()   → compiled LangGraph (reusable, thread-safe)
-  research_graph_stream(query, model_key, llm_key, token_queue)
-                  → sync generator of SSE-compatible events
+  build_graph(mode)   → compiled LangGraph (reusable, thread-safe)
+  research_graph_stream(query, model_key, llm_key, token_queue, *, mode)
+                      → sync generator of SSE-compatible events
 """
 
 import logging
@@ -40,6 +40,28 @@ from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
 from rag.observability import span, trace_context
 
 log = logging.getLogger(__name__)
+
+# ── Execution modes (Phase 1.1j) ─────────────────────────────────────────────
+# Three levels of pipeline depth, selectable per request. ``full-research`` is
+# the default and is byte-for-byte identical to the pre-1.1j behaviour — no
+# nodes removed, no logic changed.
+#
+# Mode              Topology                                  LLM stages
+# ----------------- ----------------------------------------- -----------
+# search-only       planner → search → END                    1 + search
+# research-no-critic planner → search → analyst → synth → END 3
+# full-research     planner → search → analyst → synth         4 + retries
+#                   → critic → {planner | END}
+#
+# The search-recovery loop (Phase 1.1i, ``MAX_SEARCH_RETRIES``) is ON in ALL
+# modes — even search-only. That is a deliberate design decision: search-only
+# is the cheapest venue to study bounded recovery. The loop is transparent to
+# the mode — ``route_after_search`` returns stable literals ("planner" /
+# "proceed") and each mode's ``add_conditional_edges`` mapping resolves where
+# "proceed" goes.
+
+RESEARCH_MODES = ("search-only", "research-no-critic", "full-research")
+DEFAULT_RESEARCH_MODE = "full-research"
 
 # ── Reflection loop ─────────────────────────────────────────────────────────
 # Cap to prevent infinite loops. ``MAX_REFLECTION_LOOPS = 2`` means the
@@ -90,6 +112,11 @@ class ResearchState(TypedDict):
     model_key:  str
     llm_key:    str
     llm_label:  str
+    # Execution mode (Phase 1.1j): one of RESEARCH_MODES. Injected at
+    # invocation by ``research_graph_stream`` and forwarded to every node
+    # via ``input_attrs`` so it lands in App Insights customDimensions on
+    # every ``agent *`` span as ``research.mode``.
+    mode:       str
 
     # ── Accumulated by nodes ─────────────────────────────────────────────
     sub_queries:       list[str]
@@ -211,6 +238,10 @@ def planner_node(state: ResearchState) -> dict:
         "research.is_retry":              is_retry,
         "research.reflection_loop_count": new_count,
         "research.llm_key":               state["llm_key"],
+        # Phase 1.1j: execution mode — the App Insights canonical attribute
+        # (`summarize count() by research.mode`). Carried on every node span
+        # so a KQL grouping across any agent produces consistent results.
+        "research.mode":                  state.get("mode", DEFAULT_RESEARCH_MODE),
     }
     if state.get("search_status") == AgentStatus.SOFT_FAIL.value:
         planner_input_attrs["research.recovery_reason"]         = "no_results"
@@ -270,6 +301,8 @@ def search_node(state: ResearchState) -> dict:
             "research.n_sub_queries": len(sub_queries),
             "research.top_k":         CHUNKS_PER_QUERY,
             "research.model_key":     model_key,
+            # Phase 1.1j: execution mode — see planner_node comment.
+            "research.mode":          state.get("mode", DEFAULT_RESEARCH_MODE),
         },
         # Observability is a first-class deliverable (Phase 1.1i): stamp the
         # queryable recovery signals on the `agent search` span. Attributes
@@ -354,6 +387,8 @@ def analyst_node(state: ResearchState) -> dict:
         input_attrs = {
             "research.n_episodes": n,
             "research.llm_key":    state["llm_key"],
+            # Phase 1.1j: execution mode — see planner_node comment.
+            "research.mode":       state.get("mode", DEFAULT_RESEARCH_MODE),
         },
         output_attrs_fn = lambda r: {
             "research.n_analyses": len(r.data["episode_analyses"]),
@@ -395,6 +430,8 @@ def synthesizer_node(state: ResearchState) -> dict:
             "research.n_analyses": len(state["episode_analyses"]),
             "research.llm_key":    state["llm_key"],
             "research.stream":     True,
+            # Phase 1.1j: execution mode — see planner_node comment.
+            "research.mode":       state.get("mode", DEFAULT_RESEARCH_MODE),
         },
         output_attrs_fn = lambda r: {
             "research.answer_length": len(r.data["answer"]),
@@ -433,6 +470,8 @@ def critic_node(state: ResearchState) -> dict:
             "research.n_chunks_inspected": n_chunks_inspected,
             "research.answer_length":      answer_length,
             "research.llm_key":            state["llm_key"],
+            # Phase 1.1j: execution mode — see planner_node comment.
+            "research.mode":               state.get("mode", DEFAULT_RESEARCH_MODE),
         },
         output_attrs_fn = lambda r: {
             "research.verdict": (r.data.get("grounding") or {}).get("verdict", "unknown"),
@@ -474,14 +513,18 @@ def critic_node(state: ResearchState) -> dict:
 # ── Search recovery router ───────────────────────────────────────────────────
 
 
-def route_after_search(state: ResearchState) -> Literal["planner", "analyst"]:
+def route_after_search(state: ResearchState) -> Literal["planner", "proceed"]:
     """Outcome-based recovery router — mirrors ``route_after_critic``.
 
     Branches on the contract-level ``AgentResult.status`` (a
     message-envelope outcome) rather than a domain value: a soft-failed
     search with re-plan budget remaining routes back to the planner — a
-    *compensating* action — while anything else proceeds forward. The loop
-    is bounded by ``MAX_SEARCH_RETRIES`` so there is no infinite
+    *compensating* action — while anything else returns "proceed". Each
+    mode's ``add_conditional_edges`` mapping then decides what "proceed"
+    means (``END`` for search-only, ``"analyst"`` otherwise). This keeps
+    the router mode-agnostic — it knows only "compensate" vs "forward".
+
+    The loop is bounded by ``MAX_SEARCH_RETRIES`` so there is no infinite
     re-delivery; re-entry is safe because each agent step is idempotent
     over its inputs.
 
@@ -489,6 +532,12 @@ def route_after_search(state: ResearchState) -> Literal["planner", "analyst"]:
     (intentional): when compensating, drop a ``search.recovery_triggered``
     event on the currently-active span (the Langfuse-SDK research-request
     span on the API path), mirroring ``reflection.loop_triggered``.
+
+    Phase 1.1j note: returning ``"proceed"`` (stable literal) instead of
+    ``"analyst"`` (the pre-1.1j return value) makes this router mode-
+    agnostic. The mapping in each mode's ``add_conditional_edges`` call
+    resolves the target: ``END`` for search-only, ``"analyst"`` for the
+    two multi-stage modes.
     """
     if state.get("search_status") == AgentStatus.SOFT_FAIL.value \
        and state.get("search_retry_count", 0) <= MAX_SEARCH_RETRIES:
@@ -503,7 +552,7 @@ def route_after_search(state: ResearchState) -> Literal["planner", "analyst"]:
             },
         )
         return "planner"
-    return "analyst"
+    return "proceed"
 
 
 # ── Reflection router ───────────────────────────────────────────────────────
@@ -542,68 +591,108 @@ def route_after_critic(state: ResearchState) -> Literal["planner", "__end__"]:
 
 # ── Graph construction ───────────────────────────────────────────────────────
 
-def build_graph() -> StateGraph:
+def build_graph(mode: str = DEFAULT_RESEARCH_MODE) -> StateGraph:
     """
-    Build and compile the research graph.
+    Build and compile the research graph for a specific execution mode.
 
-    The compiled graph is reusable and thread-safe — build it once at module
-    level or on first use.
+    The compiled graph is reusable and thread-safe — all three mode variants
+    are built eagerly at module load and cached in ``_GRAPHS``. Building all
+    three at import time is cheap (compilation is fast) and avoids any
+    first-request latency.
 
-    Topology (Phase 1.1i):
+    Topology per mode (Phase 1.1j):
+
+    ``search-only``
+      START → planner → search → {planner | END}
+      Recovery loop ON: soft-failed search re-routes to planner (bounded by
+      ``MAX_SEARCH_RETRIES``); "proceed" lands at END.
+
+    ``research-no-critic``
+      START → planner → search → {planner | analyst} → synthesizer → END
+      Recovery loop ON: same bounded re-plan+re-search cycle; "proceed"
+      lands at analyst. No critic node, no reflection loop.
+
+    ``full-research`` (default)
       START → planner → search → {planner | analyst}
                         analyst → synthesizer → critic → {planner | END}
+      Identical to the pre-1.1j graph — this is the byte-for-byte backward-
+      compatible path. Recovery loop AND reflection loop both active.
 
-    The search → planner edge is the outcome-based recovery loop (Phase
-    1.1i): when ``SearchAgent`` soft-fails (zero episodes matched) and the
-    re-plan budget (``MAX_SEARCH_RETRIES``) is not exhausted,
-    ``route_after_search`` compensates by re-planning; otherwise the graph
-    proceeds to the analyst on a degraded (empty) episode set. This branches
-    on the contract-level ``AgentResult.status``, distinct from the
-    domain-level critic reflection loop below.
+    In all modes, ``route_after_search`` returns the stable literals
+    ``"planner"`` (compensate) or ``"proceed"`` (forward). Each mode's
+    ``add_conditional_edges`` mapping resolves where ``"proceed"`` goes,
+    keeping the router mode-agnostic.
 
-    The critic → planner edge is the reflection loop: when the critic
-    flags the synthesized answer as not ``supported`` AND the reflection
-    counter is below ``MAX_REFLECTION_LOOPS``, ``route_after_critic``
-    sends control back to the planner with the previous verdict folded
-    into ``state['grounding_history']``. The planner uses that history
-    to produce different sub-queries on the retry.
-
-    Future extensions:
+    Future extensions (apply to any mode):
       - interrupt_before=["synthesizer"] for human approval of the plan
       - checkpointer=SqliteSaver for resumable long-running research
     """
+    if mode not in RESEARCH_MODES:
+        raise ValueError(
+            f"Unknown research mode {mode!r}. Valid: {RESEARCH_MODES}"
+        )
+
     graph = StateGraph(ResearchState)
 
-    graph.add_node("planner",     planner_node)
-    graph.add_node("search",      search_node)
-    graph.add_node("analyst",     analyst_node)
-    graph.add_node("synthesizer", synthesizer_node)
-    graph.add_node("critic",      critic_node)
+    # ── Nodes present in ALL modes ───────────────────────────────────────────
+    graph.add_node("planner", planner_node)
+    graph.add_node("search",  search_node)
 
-    graph.add_edge(START,         "planner")
-    graph.add_edge("planner",     "search")
-    # Outcome-based recovery edge (Phase 1.1i): a soft-failed search
-    # (zero episodes) routes back to the planner to re-plan, bounded by
-    # MAX_SEARCH_RETRIES; otherwise it proceeds to the analyst. This is
-    # distinct from the domain-level reflection loop on the critic.
-    graph.add_conditional_edges(
-        "search",
-        route_after_search,
-        {"planner": "planner", "analyst": "analyst"},
-    )
-    graph.add_edge("analyst",     "synthesizer")
-    graph.add_edge("synthesizer", "critic")
-    graph.add_conditional_edges(
-        "critic",
-        route_after_critic,
-        {"planner": "planner", END: END},
-    )
+    graph.add_edge(START, "planner")
+    graph.add_edge("planner", "search")
+
+    if mode == "search-only":
+        # Recovery loop ON: compensate → "planner", forward → END.
+        # ``route_after_search`` is mode-agnostic; the mapping here decides
+        # what "proceed" means for this mode.
+        graph.add_conditional_edges(
+            "search",
+            route_after_search,
+            {"planner": "planner", "proceed": END},
+        )
+
+    elif mode == "research-no-critic":
+        graph.add_node("analyst",     analyst_node)
+        graph.add_node("synthesizer", synthesizer_node)
+
+        graph.add_conditional_edges(
+            "search",
+            route_after_search,
+            {"planner": "planner", "proceed": "analyst"},
+        )
+        graph.add_edge("analyst",     "synthesizer")
+        graph.add_edge("synthesizer", END)
+
+    else:
+        # full-research — byte-for-byte identical to the pre-1.1j graph.
+        graph.add_node("analyst",     analyst_node)
+        graph.add_node("synthesizer", synthesizer_node)
+        graph.add_node("critic",      critic_node)
+
+        # Outcome-based recovery edge (Phase 1.1i): a soft-failed search
+        # (zero episodes) routes back to the planner to re-plan, bounded by
+        # MAX_SEARCH_RETRIES; otherwise it proceeds to the analyst. This is
+        # distinct from the domain-level reflection loop on the critic.
+        graph.add_conditional_edges(
+            "search",
+            route_after_search,
+            {"planner": "planner", "proceed": "analyst"},
+        )
+        graph.add_edge("analyst",     "synthesizer")
+        graph.add_edge("synthesizer", "critic")
+        graph.add_conditional_edges(
+            "critic",
+            route_after_critic,
+            {"planner": "planner", END: END},
+        )
 
     return graph.compile()
 
 
-# Module-level compiled graph — built once, reused across requests.
-_graph = build_graph()
+# Module-level compiled graphs — one per mode, built eagerly at import.
+# Compilation is fast and thread-safe; building all three upfront avoids
+# any first-request latency and keeps request-time path strictly lookup-only.
+_GRAPHS: dict[str, object] = {m: build_graph(m) for m in RESEARCH_MODES}
 
 
 # ── Streaming bridge ─────────────────────────────────────────────────────────
@@ -617,14 +706,29 @@ def research_graph_stream(
     *,
     session_id:  str | None = None,
     user_id:     str | None = None,
+    mode:        str = DEFAULT_RESEARCH_MODE,
 ):
     """
     Run the LangGraph research pipeline and yield SSE-compatible events.
+
+    ``mode`` selects the execution depth (Phase 1.1j):
+      - ``"search-only"``        — planner → search → END
+      - ``"research-no-critic"`` — planner → search → analyst → synthesizer → END
+      - ``"full-research"``      — full pipeline with critic + reflection loop (default)
+
+    Unknown modes raise ``ValueError`` immediately (before any trace is opened)
+    so the caller layers (CLI / API) can surface a clean error without Langfuse
+    noise.
 
     Uses stream_mode="values" — each yielded value is the full accumulated
     state after a node completes.  We diff the events list to emit only
     new events since the last yield.
     """
+    if mode not in RESEARCH_MODES:
+        raise ValueError(
+            f"Unknown research mode {mode!r}. Valid modes: {list(RESEARCH_MODES)}"
+        )
+
     resolved_key = llm_key or DEFAULT_LLM_KEY
     llm_label = LLM_REGISTRY.get(resolved_key, LLM_REGISTRY[DEFAULT_LLM_KEY]).label
 
@@ -633,6 +737,11 @@ def research_graph_stream(
         "model_key":             model_key,
         "llm_key":               resolved_key,
         "llm_label":             llm_label,
+        # Phase 1.1j: execution mode — injected into the graph state so every
+        # node can stamp ``research.mode`` on its OTel span via the existing
+        # _run_with_span(input_attrs=...) hook, landing it in App Insights
+        # customDimensions for KQL aggregation (``summarize count() by research.mode``).
+        "mode":                  mode,
         "sub_queries":           [],
         "chunks":                [],
         "episodes_by_title":     {},
@@ -655,14 +764,24 @@ def research_graph_stream(
     with span(
         "research-request",
         input    = {"query": query, "top_k": top_k},
-        metadata = {"model_key": model_key, "llm_key": resolved_key,
-                    "mode":      "research-graph", "stream": True},
+        metadata = {
+            "model_key":      model_key,
+            "llm_key":        resolved_key,
+            # ``mode`` = "research-graph" is the orchestrator *family* (not the
+            # execution depth). Do NOT overload this key — it pre-dates 1.1j and
+            # must keep its meaning for existing Langfuse filters. The execution
+            # depth lives under the distinct key ``research_mode`` below.
+            "mode":           "research-graph",
+            "research_mode":  mode,  # Phase 1.1j execution-depth attribute
+            "stream":         True,
+        },
     ) as req, trace_context(
         user_id    = user_id,
         session_id = session_id,
         feature    = "research-graph",
     ):
-        for state_snapshot in _graph.stream(initial_state, stream_mode="values"):
+        graph = _GRAPHS[mode]
+        for state_snapshot in graph.stream(initial_state, stream_mode="values"):
             final_state = state_snapshot
             all_events = state_snapshot.get("events", [])
             # Yield only the new events since last snapshot

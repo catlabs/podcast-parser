@@ -2052,6 +2052,135 @@ switch short-circuits before either processor is built.
 
 ---
 
+## Phase 1.1j — research execution modes (`research.mode`)
+
+### Context
+
+The LangGraph research pipeline had a single fixed topology — planner → search
+→ analyst → synthesizer → critic → {planner | END}. Running it at full depth
+for a learning or observability session incurred unnecessary cost, latency, and
+trace noise. Phase 1.1j introduces three explicit execution modes so a session
+can target one stage of the pipeline without paying for the rest.
+
+### Topology per mode
+
+| Mode | Node sequence | LLM stages |
+|---|---|---|
+| `search-only` | planner → search → END | 1 planner + search |
+| `research-no-critic` | planner → search → analyst → synthesizer → END | 3 |
+| `full-research` | planner → search → analyst → synthesizer → critic → {planner\|END} | 4 + reflection retries |
+
+`full-research` is the **default** — byte-for-byte identical to the pre-1.1j
+behaviour. This is a purely additive, backward-compatible change.
+
+### Search recovery in all modes
+
+The Phase 1.1i search-recovery loop (`route_after_search` → planner re-entry,
+bounded by `MAX_SEARCH_RETRIES = 1`) is **ON in every mode, including
+`search-only`**. `search-only` is the cheapest venue to study bounded recovery.
+The router `route_after_search` returns stable literals (`"planner"` /
+`"proceed"`) and each mode's `add_conditional_edges` mapping decides where
+`"proceed"` goes (`END` for `search-only`, `"analyst"` for the two multi-stage
+modes) — keeping the router mode-agnostic.
+
+### Observability (`research.mode`)
+
+Two canonical attributes are added for the execution mode:
+
+1. **Langfuse trace root** — the `research-request` span `metadata` gains a
+   `research_mode` key (distinct from the pre-existing `mode="research-graph"`
+   key, which identifies the orchestrator *family* and must not be overloaded).
+2. **App Insights / per-span** — every node's `input_attrs` dict carries
+   `"research.mode": mode` via the existing Phase 1.1f `_run_with_span` hook.
+   This lands `research.mode` in `customDimensions` on every `agent *` span,
+   enabling KQL aggregation: `summarize count() by research.mode`.
+
+### What ships in 1.1j
+
+#### `rag/research_graph.py`
+
+- `RESEARCH_MODES = ("search-only", "research-no-critic", "full-research")` and
+  `DEFAULT_RESEARCH_MODE = "full-research"` constants (promoted to module-level
+  public symbols for import by CLI and API).
+- `ResearchState.mode: str` field — injected at invocation, forwarded to every
+  node's `input_attrs` so `research.mode` lands on all `agent *` OTel spans.
+- `build_graph(mode=DEFAULT_RESEARCH_MODE)` — refactored from the previous
+  no-argument `build_graph()`. Constructs only the nodes/edges the mode needs.
+- `_GRAPHS: dict[str, object]` — replaces the old `_graph`. All three graphs
+  built eagerly at module import; request-time path is purely a dict lookup.
+- `research_graph_stream(..., *, mode=DEFAULT_RESEARCH_MODE)` — new keyword-only
+  `mode` parameter. Validates before opening any trace; selects `_GRAPHS[mode]`;
+  injects `mode` into `initial_state`; adds `research_mode` to Langfuse span
+  metadata.
+
+#### `rag/cli.py`
+
+- `ask` and `repl` gain `--mode/-m` option (default `DEFAULT_RESEARCH_MODE`).
+  Validation happens before the trace span opens (fail-fast, zero Langfuse
+  pollution on a bad flag). `mode` is forwarded to `research_graph_stream` when
+  the intent is `research`; for `chat`/`list` intents it is unused.
+
+#### `rag/api.py`
+
+- `ResearchRequest.mode: str = DEFAULT_RESEARCH_MODE` field added.
+- `research_graph_endpoint` validates `mode` before any trace is opened (HTTP 422
+  with valid-modes message when unknown), then passes `mode=body.mode` into
+  `research_graph_stream`.
+
+### What did NOT change
+
+- `rag/research.py` — legacy orchestrator (`/chat/research` endpoint), unchanged.
+- Any agent class under `rag/agents/` — mode lives in graph wiring only.
+- `MAX_SEARCH_RETRIES`, `MAX_REFLECTION_LOOPS`.
+- UI frontend — web UI omits the `mode` field and defaults to `full-research`.
+- SSE event shape, `_run_with_span` contract, agent contracts.
+
+### Smoke test
+
+```bash
+# 1. Regression — full pipeline unchanged (default mode)
+.venv/bin/python -m rag.cli ask "Future of AI?"
+# expect: planner → search → analyst → synthesizer → critic events, grounding verdict
+
+# 2. search-only
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode search-only
+# expect: planner + search events only; NO analyst/synthesizer/critic
+
+# 3. research-no-critic
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode research-no-critic
+# expect: planner + search + analyst + synthesizer; NO critic/grounding event
+
+# 4. Bad mode — clean error, exit 1, no trace
+.venv/bin/python -m rag.cli ask "Future of AI?" --mode bogus
+# expect: error message listing valid modes, exit code 1
+
+# 5. API bad mode — HTTP 422 with valid-modes message
+curl -s -X POST localhost:8000/chat/research-graph \
+  -H "Content-Type: application/json" \
+  -d '{"query": "test", "mode": "bogus"}' | jq .
+# expect: {"detail": "Unknown research mode 'bogus'. Valid modes: [...]}
+
+# 6. API regression — no mode field → full-research (HTTP 200)
+curl -s -o /dev/null -w "%{http_code}" -X POST localhost:8000/chat/research-graph \
+  -H "Content-Type: application/json" \
+  -d '{"query": "Future of AI?"}' --max-time 3
+# expect: 200
+
+# 7. Topology assertion
+.venv/bin/python -c "
+from rag.research_graph import _GRAPHS, RESEARCH_MODES
+for m, g in _GRAPHS.items():
+    nodes = sorted(set(g.nodes.keys()) - {'__start__'})
+    print(m, nodes)
+"
+# expect:
+#   search-only      ['planner', 'search']
+#   research-no-critic ['analyst', 'planner', 'search', 'synthesizer']
+#   full-research    ['analyst', 'critic', 'planner', 'search', 'synthesizer']
+```
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.
