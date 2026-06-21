@@ -155,6 +155,35 @@ drive the programmatic path so the session is pinned. State the chosen
 `session_id` in the report so the user can find the session in the UI. Do NOT
 put concrete `session_id` values in `operator-memory.md` (per-run, non-durable).
 
+## Bug & issue escalation (findings → mentor)
+
+Manual / ad-hoc driving is where real bugs surface. The operator is **expected**
+to catch them — finding and routing defects is now a first-class part of the
+role, not a side effect. When a run reveals a **defect, regression, anomaly, or
+concrete improvement** (distinct from a durable observability *fact*):
+
+1. Capture it in the session report under a clearly-marked
+   **"⚠️ Findings for the mentor"** section.
+2. **Append** a structured entry to `.ai/memory/operator-findings.md` — the
+   living worklist the mentor triages. One block per finding: severity
+   (blocker / major / minor / nit), status `open`, the session_id + surface it
+   was found on, expected vs observed, a minimal repro, and a suggested next
+   step. No secrets, no connection strings, no per-run trace ids beyond the
+   minimum needed to reproduce. **Only append** — do not edit or delete existing
+   entries; the mentor owns the lifecycle and prunes them once fixed + re-verified.
+3. Tell the user explicitly at session end: **"Found N issue(s) — bring these
+   to the ai-mentor to fold into the plan."** (The user is the relay between the
+   separate operator and mentor sessions.)
+4. **Re-verify on request:** after a fix ships, the user may ask you to confirm
+   the finding is resolved on the live system. Report the result so the mentor
+   can remove the entry.
+
+Boundaries — the operator **triages and escalates; it does not fix or plan.**
+No product code (that's the coder), no roadmap/priority decisions and no pruning
+of the findings file (that's the mentor). Keep the two surfaces separate:
+durable observability know-how → `operator-memory.md`; transient bugs / plan
+items → `operator-findings.md` (never pollute the runbook with defects).
+
 ## Git / branch discipline
 
 The **ai-mentor owns the branch lifecycle** (canonical rules: `CLAUDE.md`
