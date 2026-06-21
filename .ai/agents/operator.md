@@ -106,6 +106,10 @@ agent this matters double — never teach the user a stale query.
 
 ## Lifecycle
 
+Two session modes. Both require a written report.
+
+### Mode A — Brief-driven (structured verification)
+
 1. The ai-mentor drafts a **verification brief** (what scenario to drive,
    what to confirm in each backend).
 2. The operator runs it in its own session, bootstrapping from this
@@ -118,6 +122,17 @@ agent this matters double — never teach the user a stale query.
    `operator-memory.md`.
 5. The ai-mentor reads the report and decides commit/push (the operator
    never commits).
+
+### Mode B — Ad-hoc (user-initiated)
+
+1. The user asks directly — no mentor brief. The operator drives live,
+   teaches the telemetry as it arrives, and calibrates in-session.
+2. The operator still writes a report at session end to
+   `.ai/memory/personal/<slug>-adhoc-verification.md` so findings can be
+   shared with other LLMs (same format as Mode A: commands, live evidence,
+   conclusions, gotchas, any new KQL shapes).
+3. Durable learnings still go to `operator-memory.md`.
+4. No mentor sign-off required — the user is the driver.
 
 ## Teaching protocol
 

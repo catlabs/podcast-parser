@@ -554,3 +554,69 @@ SOFT_FAIL or `degraded_segments` count for partial-success signalling;
 (avoid double-retry); (3) per-agent pool vs a shared orchestrator-level
 concurrency budget when multiple agents fan out at once.
 commit: a33c936 (coder session) — strategy recalibration in 66a0770 (mentor)
+
+2026-06-19 — Phase 1.1i + 1.1i.1 shipped: outcome-based search recovery in
+the LangGraph research graph. 1.1i (5d16089) makes the orchestrator branch on
+the contract-level ``AgentResult.status`` (a message-envelope outcome),
+distinct from the domain-level reflection branch on the critic verdict.
+``SearchAgent`` now declares ``failure_policy="soft"`` and returns
+``SOFT_FAIL`` (empty-but-present keys) on zero episodes matched;
+``route_after_search`` routes a soft-failed search back to the planner — a
+bounded compensating action capped by ``MAX_SEARCH_RETRIES=1`` — otherwise it
+proceeds to the analyst on a degraded set. EDA framing named inline:
+supervisor-owned recovery (saga-style compensation), the deliberate contrast
+to ``SummarizerAgent``'s in-agent retry (1.1h.2). 1.1i.1 (88a9749) closes the
+loop for real: the 1.1i skeleton left recovery a no-op (the planner
+regenerated the same sub-queries), so it extends the EXISTING
+reflection-feedback mechanism — ``planner._augment_with_feedback`` gains a
+``search_recovery_history`` "broaden" block; ``ResearchState`` gains
+``search_recovery_history`` (node-owned full overwrite, not an add-reducer);
+the recovery re-entry planner span carries
+``research.replan_after_no_results=true`` and the two planner spans show
+divergent ``research.sub_queries``. Observability: ``search.*`` /
+``research.attempt`` queryable attrs on ``agent search``; a
+``search.recovery_triggered`` event as the Langfuse timeline breadcrumb.
+⚠️ LIVE VERIFICATION STILL OPEN — a coder run (2026-06-20) fabricated a
+verification report + edited operator-memory with invented App Insights/Langfuse
+results; both were reverted/deleted. The genuine operator session
+(``.ai/memory/personal/phase-1.1i-verification-brief.md``, live backends) has
+NOT run yet. The recovery loop is verified in code/topology only.
+commits: 5d16089, 88a9749
+
+2026-06-19 — Operator role added (4643280). Third agent role:
+``.ai/agents/operator.md`` drives the live system and teaches observability
+(Langfuse + Application Insights); the only worker role with persistent memory
+(``.ai/agents/operator-memory.md``, a no-secrets observability runbook), in
+deliberate contrast to the stateless coder. ``.ai/agents/coder.md`` formalizes
+the coder's standing contract (stateless, brief-driven, smoke + report-to-file,
+no auto-commit). Companion subagent launchers live under the gitignored
+``.claude/``.
+commit: 4643280
+
+2026-06-21 — Phase 1.1j shipped: explicit research execution modes
+(``research.mode``). The LangGraph research pipeline is now runnable at three
+depths so a learning/observability session can target one stage without the
+full pipeline's cost, latency, and trace noise — the Critic is made OPTIONAL,
+not removed. Modes (``full-research`` is the backward-compatible default,
+byte-for-byte identical to pre-1.1j): ``search-only`` (planner→search→END),
+``research-no-critic`` (planner→search→analyst→synth→END), ``full-research``
+(adds critic + reflection loop). Topology IS the mode: ``build_graph(mode)``
+wires only the needed nodes/edges, all three compiled eagerly into ``_GRAPHS``
+at import. ``route_after_search`` stays mode-agnostic — returns the stable
+literals ``"planner"`` (compensate) / ``"proceed"`` (forward), each mode's
+edge mapping resolving where "proceed" goes (END for search-only, analyst
+otherwise). Search recovery (1.1i/1.1i.1) stays ON in ALL modes including
+search-only — the cheapest venue to study bounded compensation; a zero-result
+first search re-plans + re-searches once (unchanged ``MAX_SEARCH_RETRIES=1``)
+then proceeds degraded. Observability: ``research.mode`` stamped on every
+``agent *`` span via the 1.1f ``input_attrs`` hook (queryable in App Insights
+``customDimensions``) + on the Langfuse ``research-request`` root under a key
+distinct from the pre-existing ``metadata.mode="research-graph"`` (orchestrator
+family vs execution mode). CLI gains ``--mode/-m`` on ask/repl (research intent
+only); API gains ``ResearchRequest.mode``; both validate before any trace opens.
+Legacy ``rag/research.py`` and the web UI untouched. EDA framing:
+capability-gated orchestration — the critic is a toggleable validation/quality-gate
+stage. Mentor independently verified topology (search-only ⊂ no-critic ⊂ full),
+default, bad-mode rejection, CLI flag, and API field (the coder's smoke summary
+was NOT trusted on its own — same run produced the fabrication noted above).
+commit: 6b0e1b4 (branch ``feat/research-modes``)

@@ -113,9 +113,82 @@ dependencies
 - Teach by showing the query and reading the output together; one new
   concept per lookup.
 
+## Phase 1.1k attribute additions (verified 2026-06-21)
+
+New attributes on `agent search` spans (Phase 1.1k, commit fadfd0b):
+- `search.soft_fail_reason` — `"below_threshold"` | `"no_match"` — WHY zero results.
+  Present only on SOFT_FAIL; omitted on success.
+- `search.min_score` — the `RETRIEVAL_MIN_SCORE` value in effect; omitted when disabled.
+
+New attributes on `retrieval` spans (Phase 1.1k):
+- `retrieval.n_returned` — raw chunks from Chroma (before filter)
+- `retrieval.n_kept`     — chunks surviving the score filter
+- `retrieval.n_dropped`  — filtered out (= n_returned − n_kept)
+- `retrieval.top_score`  — best score in the raw set
+- `retrieval.min_kept_score` — worst score that survived
+
+Score formula: `score = 1 − distance / 2`, valid for unit-normalized embeddings
+(sentence-transformers, text-embedding-3-*). Distance is **squared-L2** (Chroma
+default) — NOT cosine distance. Earlier docs/comments were wrong.
+
+## Verified KQL shapes (Phase 1.1k)
+
+```kql
+// Threshold-triggered zero-result searches
+dependencies
+| where name == "agent search"
+| extend status    = tostring(customDimensions["search.status"]),
+         reason    = tostring(customDimensions["search.soft_fail_reason"]),
+         min_score = todouble(customDimensions["search.min_score"]),
+         attempt   = toint(customDimensions["research.attempt"])
+| where status == "soft_fail" and reason == "below_threshold"
+| project timestamp, attempt, min_score, reason
+| order by timestamp desc
+```
+```kql
+// Recovery replan spans (two planner spans in same trace)
+dependencies
+| where name == "agent planner"
+| extend replan      = tostring(customDimensions["research.replan_after_no_results"]),
+         sub_queries = tostring(customDimensions["research.sub_queries"])
+| where replan == "True"
+| project timestamp, sub_queries
+| order by timestamp desc
+```
+*(customDimensions key mapping unverified in App Insights — no connection string set in the 2026-06-21 run.)*
+
+## Threshold calibration gotcha (2026-06-21)
+
+Art-history queries score up to 0.41 against an AI-podcast corpus because of an
+episode titled "L'IA au service de l'Art et de la Créativité" that fuzzy-matches
+"art / techniques / influence" vocabulary. Threshold 0.35 was insufficient to
+block them; 0.45 gave a clean margin. Always probe representative planner
+sub-queries before choosing a threshold — don't assume domain separation is clean.
+
+## List-attribute serialization (VERIFIED 2026-06-21)
+
+`research.sub_queries` serializes as a **JSON array string** in Langfuse
+`metadata.attributes` — e.g. `'["query1","query2"]'`. In App Insights
+`customDimensions` the format is unverified (may be the same JSON string or
+Python repr). The safe KQL idiom is `tostring(...)` for visual compare;
+`mv-expand parse_json(...)` only if confirmed as valid JSON on live data.
+
+## Operator session modes (2026-06-21)
+
+Two distinct modes of operator work:
+1. **Brief-driven**: mentor drafts `.ai/memory/personal/<slug>-verification-brief.md`
+   → operator runs a structured verification → writes report to
+   `.ai/memory/personal/<slug>-verification.md`.
+2. **Ad-hoc**: user asks directly; no brief. Operator drives and teaches live.
+   Report STILL required — write to `.ai/memory/personal/<slug>-adhoc-verification.md`
+   (or another slug) so findings can be shared with other LLMs.
+
 ## Open verifications queued
 
-- Live 1.1i.1 check: confirm divergent `research.sub_queries` across the two
-  planner spans (Langfuse Metadata) + `research.replan_after_no_results` in
-  App Insights `customDimensions`; and settle the list-attribute
-  serialization + the event→table mapping questions above.
+- Phase 1.1i full-research mode + App Insights KQL: still open.
+  The 2026-06-21 ad-hoc session confirmed the Langfuse side (recovery loop,
+  divergent sub_queries, `replan_after_no_results`). The App Insights
+  `customDimensions` key mapping and the event→table mapping remain unverified
+  (no `APPLICATIONINSIGHTS_CONNECTION_STRING` in that run).
+- Event→table mapping: `add_event` spans → `traces` table in App Insights
+  (unconfirmed — needs a run with connection string set).
