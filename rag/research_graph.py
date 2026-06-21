@@ -36,7 +36,7 @@ from opentelemetry import trace as _ot_trace
 from rag.agents import AgentContext, get as get_agent
 from rag.agents.base import AgentStatus, _run_with_span
 from rag.agents.search import CHUNKS_PER_QUERY
-from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, TOP_K
+from rag.config import DEFAULT_LLM_KEY, DEFAULT_MODEL_KEY, LLM_REGISTRY, RETRIEVAL_MIN_SCORE, TOP_K
 from rag.observability import span, trace_context
 
 log = logging.getLogger(__name__)
@@ -311,6 +311,11 @@ def search_node(state: ResearchState) -> dict:
         # Langfuse's span metadata. ``search.status`` / ``search.results_count``
         # / ``research.attempt`` are the canonical keys; the ``research.*``
         # count attrs below predate 1.1i and are kept for existing dashboards.
+        #
+        # Phase 1.1k: ``search.min_score`` (threshold applied, or omitted when
+        # disabled) and ``search.soft_fail_reason`` ("below_threshold" |
+        # "no_match", present only on soft-fail) make the zero-result cause
+        # queryable in App Insights without text-scanning ``errors``.
         output_attrs_fn = lambda r: {
             "search.status":             r.status.value,                          # success | soft_fail
             "search.results_count":      len(r.data.get("episodes_by_title", {})),
@@ -319,6 +324,12 @@ def search_node(state: ResearchState) -> dict:
             "research.total_chunks":     sum(
                 len(cs) for cs in r.data.get("episodes_by_title", {}).values()
             ),
+            # Threshold signal — omit the key entirely when threshold is off
+            # so KQL can distinguish "threshold disabled" from "threshold = 0".
+            **({"search.min_score": RETRIEVAL_MIN_SCORE} if RETRIEVAL_MIN_SCORE is not None else {}),
+            # Soft-fail reason — present only when the agent actually soft-failed.
+            **({"search.soft_fail_reason": r.data["soft_fail_reason"]}
+               if r.data.get("soft_fail_reason") else {}),
         },
     )
 
@@ -351,7 +362,10 @@ def search_node(state: ResearchState) -> dict:
     if soft:
         # Degraded outcome — mirror the success "done" step shape but mark
         # it ``error`` so the UI can surface "no matches, re-planning".
-        events.append(_ev("search", "search", "error", "no episodes matched — re-planning", tool="semantic_search"))
+        # Phase 1.1k: propagate the agent's reason string (errors[0]) so the
+        # UI and SSE log distinguish "below_threshold" from "no_match".
+        reason_detail = result.errors[0] if result.errors else "no episodes matched"
+        events.append(_ev("search", "search", "error", f"{reason_detail} — re-planning", tool="semantic_search"))
     else:
         events.append(_ev("search", "search", "done", f"{total} chunks from {len(episodes_by_title)} episodes", tool="semantic_search"))
     events.append({"type": "search_results", "episodes_found": len(episodes_by_title), "total_chunks": total})

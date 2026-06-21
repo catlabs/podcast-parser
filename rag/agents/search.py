@@ -34,6 +34,7 @@ from rag.agents.base import (
     CapabilityCard,
     register,
 )
+from rag.config import RETRIEVAL_MIN_SCORE
 from rag.embed import get_collection
 from rag.search import semantic_search
 
@@ -90,6 +91,9 @@ class SearchAgent:
     def run(self, state: dict, ctx: AgentContext) -> AgentResult:
         sub_queries = state["sub_queries"]
         model_key   = state["model_key"]
+        # Read threshold once per invocation from config (set at module-import
+        # time from RETRIEVAL_MIN_SCORE env var; None = disabled).
+        min_score   = RETRIEVAL_MIN_SCORE
 
         # Pre-warm the Chroma client + collection in the main thread before
         # fanning out. Chroma's SharedSystemClient lazily mutates a global
@@ -102,13 +106,18 @@ class SearchAgent:
         # workers always see a ready cache.
         get_collection(model_key)
 
+        # Helper that captures model_key and min_score from the enclosing
+        # scope; each worker thread calls this so contextvars.copy_context()
+        # correctly captures the parent OTel span as well.
+        def _search_one(sq: str) -> list[dict]:
+            return semantic_search(sq, CHUNKS_PER_QUERY, model_key, min_score=min_score)
+
         all_chunks: list[dict] = []
         with ThreadPoolExecutor(max_workers=min(len(sub_queries), 4)) as pool:
             futures = {
                 pool.submit(
                     contextvars.copy_context().run,
-                    semantic_search, sq,
-                    CHUNKS_PER_QUERY, model_key,
+                    _search_one, sq,
                 ): sq
                 for sq in sub_queries
             }
@@ -123,10 +132,29 @@ class SearchAgent:
             # outcome the orchestrator can compensate for (re-plan, Phase
             # 1.1i). Return empty-but-present keys so downstream nodes that
             # index ``result.data`` never KeyError on the degraded path.
+            #
+            # Phase 1.1k: distinguish two zero-result flavours so the
+            # orchestrator can surface the right reason in traces and SSE:
+            #   "below_threshold" — threshold was active; chunks existed but
+            #                       all fell below the relevance floor.
+            #   "no_match"        — no threshold (or Chroma itself returned
+            #                       nothing); queries simply found no content.
+            if min_score is not None:
+                soft_fail_reason = "below_threshold"
+                error_msg        = "all results below relevance threshold"
+            else:
+                soft_fail_reason = "no_match"
+                error_msg        = "no episodes matched the sub-queries"
+
             return AgentResult(
                 status = AgentStatus.SOFT_FAIL,
-                data   = {"chunks": [], "episodes_by_title": {}, "sources": []},
-                errors = ("no episodes matched the sub-queries",),
+                data   = {
+                    "chunks":            [],
+                    "episodes_by_title": {},
+                    "sources":           [],
+                    "soft_fail_reason":  soft_fail_reason,
+                },
+                errors = (error_msg,),
             )
 
         # Rank episodes by best chunk distance, keep top N

@@ -2181,6 +2181,145 @@ for m, g in _GRAPHS.items():
 
 ---
 
+## Phase 1.1k — retrieval relevance threshold → natural SOFT_FAIL
+
+### Context
+
+Chroma always returns the nearest neighbours, even for completely off-topic
+queries. Before 1.1k, `SearchAgent` almost never SOFT_FAILed naturally — the
+1.1i/1.1i.1 recovery path could only be exercised by monkeypatching. Phase 1.1k
+introduces a **configurable relevance threshold** so irrelevant chunks are dropped
+post-retrieval; when everything is dropped the existing SOFT_FAIL → replan
+recovery fires **naturally** without any test scaffolding. This is the
+enterprise-RAG posture: returning irrelevant context is worse than returning none.
+
+### Distance metric correction
+
+The `podcasts` (minilm) collection uses **squared-L2** (`l2` space) — Chroma's
+default, because it was created with bare `get_or_create_collection(name)` and
+NO `metadata={"hnsw:space": ...}`. Earlier docstrings in `rag/search.py` and
+`rag/embed.py` said "cosine distance" — that was WRONG and is now corrected.
+
+For unit-normalized embeddings (sentence-transformers produces unit vectors;
+`text-embedding-3-*` from Azure OpenAI is also unit-normalized), the relation
+between squared-L2 distance `d` and cosine similarity is:
+
+```
+cosine_sim = 1 − d / 2
+```
+
+Each result dict now carries a **`score`** field (derived cosine similarity ∈
+[0, 1]) alongside the existing `distance` field. No re-indexing or collection
+recreation is required.
+
+Measured spread (minilm, top-1):
+
+| Query type   | distance (approx) | score (approx) |
+|---|---|---|
+| on-topic     | 0.86              | 0.57           |
+| off-topic    | 1.09              | 0.45           |
+| gibberish    | 1.48              | 0.26           |
+
+### What ships in 1.1k
+
+#### `rag/config.py`
+
+New `RETRIEVAL_MIN_SCORE: float | None` (default `None`, read from
+`RETRIEVAL_MIN_SCORE` env var). When `None` (unset / empty) behaviour is
+byte-for-byte identical to pre-1.1k for every caller.
+
+#### `rag/search.py`
+
+- **Docstrings corrected**: module-level and `_do_search` now say "squared-L2"
+  instead of the previous incorrect "cosine distance".
+- **`_do_search`**: each result dict gains `"score": round(1 - dist/2, 4)`.
+  The existing `"distance"` field is preserved unchanged.
+- **`_retrieval_output`**: adds `"score"` alongside `"distance"` per result so
+  Langfuse and App Insights show both metrics per chunk. `"text"` is still
+  excluded (privacy rule unchanged).
+- **`semantic_search`** gains keyword-only `min_score: float | None = None`.
+  When set, chunks with `score < min_score` are dropped after retrieval (retrieve
+  `top_k` from Chroma first, then filter in Python). When `None` — the default
+  — no filtering; all callers (chat RAG via `rag/chat.py`, compare, eval,
+  `rag/research.py` legacy path, MCP) are unaffected.
+- **Langfuse `retrieval` span** gains retrieval stats in `metadata`:
+  `min_score`, `n_returned` (pre-filter), `n_kept` (post-filter), `n_dropped`,
+  `top_score`, `min_kept_score`.
+- **OTel retrieval span** receives the same stats as attributes (`retrieval.*`)
+  so they land in App Insights `customDimensions`.
+
+#### `rag/embed.py`
+
+`LocalVectorStore.query` adds `"score": round(1 - dist/2, 4)` per result for
+symmetry with `_do_search`. The `VectorStore` protocol's dict return is open;
+existing consumers are unaffected.
+
+#### `rag/agents/search.py`
+
+- Imports `RETRIEVAL_MIN_SCORE` from config.
+- `SearchAgent.run` reads `min_score = RETRIEVAL_MIN_SCORE` once and passes it
+  to each `semantic_search` call via a local `_search_one` helper (captures
+  `model_key` and `min_score` from enclosing scope; passed to
+  `contextvars.copy_context().run` so OTel context still propagates correctly).
+- **Two SOFT_FAIL flavours** (Phase 1.1k addition):
+  - `soft_fail_reason = "below_threshold"` + `errors = ("all results below relevance threshold",)` — threshold was active and chunks were dropped to zero.
+  - `soft_fail_reason = "no_match"` + `errors = ("no episodes matched the sub-queries",)` — no threshold or Chroma returned nothing.
+  `soft_fail_reason` is stored in `result.data` so it propagates to the
+  orchestrator.
+
+#### `rag/research_graph.py`
+
+- Imports `RETRIEVAL_MIN_SCORE` from config.
+- `search_node`'s `output_attrs_fn` adds two conditional attributes:
+  - `search.min_score` — present only when threshold is enabled (avoids
+    polluting dashboards with a null key when threshold is off).
+  - `search.soft_fail_reason` (`"below_threshold"` | `"no_match"`) — present
+    only on soft-fail; makes the cause queryable in KQL without text-scanning
+    `errors`.
+- SSE `"error"` step event's `detail` now surfaces the actual reason string
+  (`result.errors[0]`) rather than the hard-coded `"no episodes matched"`.
+
+### Recovery path — unchanged, fires naturally
+
+No graph edits. `route_after_search` (1.1i) already routes SOFT_FAIL → planner;
+the 1.1i.1 broaden-feedback replan already handles the re-plan. After 1.1k, an
+off-topic or gibberish query produces a **real** SOFT_FAIL and the recovery loop
+runs end-to-end without monkeypatching.
+
+### Env vars
+
+| Var | Default | Purpose |
+|---|---|---|
+| `RETRIEVAL_MIN_SCORE` | unset (disabled) | Minimum cosine-similarity score to keep a chunk. Unset → threshold off, pre-1.1k behaviour preserved. |
+
+Documented in both `.env.example` and `.env.agent-safe` (commented out / unset by default).
+
+### Observability keys
+
+| Layer | Key | Values |
+|---|---|---|
+| Langfuse `retrieval` span metadata | `min_score` | float or null |
+| Langfuse `retrieval` span metadata | `n_returned` | int (pre-filter) |
+| Langfuse `retrieval` span metadata | `n_kept` | int (post-filter) |
+| Langfuse `retrieval` span metadata | `n_dropped` | int |
+| Langfuse `retrieval` span metadata | `top_score` | float or null |
+| Langfuse `retrieval` span metadata | `min_kept_score` | float or null |
+| OTel `retrieval` span attrs | `retrieval.*` | same keys, stamped via `get_current_span().set_attribute()` |
+| OTel `agent search` span attrs | `search.min_score` | float (omitted when disabled) |
+| OTel `agent search` span attrs | `search.soft_fail_reason` | `"below_threshold"` \| `"no_match"` (omitted on success) |
+| Langfuse result per chunk | `score` | float ∈ [0, 1] |
+
+### What did NOT change in 1.1k
+
+- Graph topology (`route_after_search`, `MAX_SEARCH_RETRIES`, any edge) — unchanged.
+- Chat RAG (`rag/chat.py`) and compare mode — `semantic_search` default `min_score=None` applies; no threshold.
+- Legacy orchestrator (`rag/research.py`) — same.
+- `rag/eval.py`, `rag/mcp_server.py` — same.
+- Existing `"distance"` field, chunk rankings, `MAX_EPISODES`, `CHUNKS_PER_QUERY`.
+- Phase 1.1f trace-dedup invariant and 1.1f.2 unified topology.
+
+---
+
 ## Out of scope (later steps)
 
 Azure Speech, Azure AI Search — none introduced here.
