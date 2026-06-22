@@ -11,7 +11,15 @@ venv/
 env/
 
 # Tooling and local runtime data
-.claude/
+# Ignore .claude/ contents (settings.local.json, skills, etc.) EXCEPT the role
+# wrappers under .claude/agents/ — those are tracked so `--agent ai-mentor|
+# coder|operator` survives across machines/sessions (they were local-only
+# before and got lost). Must ignore contents (.claude/*), not the dir itself,
+# or the negations below can't re-include.
+.claude/*
+!.claude/agents/
+.claude/agents/*
+!.claude/agents/*.md
 .chroma_step0/
 output/
 rag/data/
