@@ -677,3 +677,32 @@ modes) + Phase 1.1k (retrieval threshold) + the agent-ecosystem governance.
 First exercise of the new mentor-supervised feature-close flow (the branch had
 drifted into a catch-all — the very pattern the new Git workflow now prevents).
 Going forward: one single-purpose branch per sub-step.
+
+2026-06-22 — Azure.1 SHIPPED + CLOSED: SearchAgent containerized as an HTTP
+service. First step of the Container Apps deploy arc. New `rag/service.py` —
+thin FastAPI app (`GET /healthz` + `POST /search`) exposing the Phase-1
+`SearchAgent` over a **third transport** (after CLI 1.1e and MCP stdio 1.MCP);
+it mirrors `rag/mcp_server.py::_run_search` trace plumbing under an `http.*`
+namespace (`http-request` SDK root, `feature=http-search`, attrs on the
+`agent search` OTel span via the 1.1f hooks — no sibling SDK span; blank query
+→ 422 before any trace opens; observability stays opt-in). New `Dockerfile`
+(python:3.12-slim) bakes the minilm model + the `podcasts` Chroma collection
+at build time, sets `HF_HUB_OFFLINE=1`, runs non-root, ships **zero secrets**.
+New `.dockerignore` (excludes `.env*`/`.git`/`.ai`/`metadata.db`, keeps
+`rag/data/chroma`) + minimal `requirements-search-service.txt` (drops whisper,
+yt-dlp, feedparser, langgraph, mcp, anthropic, openai, typer, rich). The shared
+agent/retrieval/observability modules were **untouched** — the contract
+transports to HTTP-in-a-container with no agent change. Mentor LIVE-verified on
+a local Docker host (colima, installed for this): `docker build` OK; in-container
+`/healthz` 200; `/search` 200 → 1 episode / 3 chunks; empty query 422; the
+decisive **`--network none` offline proof** passed (model loaded + retrieval
+served with only `lo`, 0 network failures); HF hits = 0 in networked mode
+(baked cache genuinely used). Coder honored "no commit" this time; the only
+report error was a harmless `str`/`int` type-hint typo. KNOWN follow-ups for
+Azure.2: (1) image is **9.83 GB** — torch pulls full CUDA libs; switch to a
+CPU-only torch wheel to cut to ~1–2 GB; (2) build was native arm64 — Container
+Apps needs `--platform linux/amd64`; (3) cloud build via `az acr build`
+sidesteps the missing-Docker-host blocker entirely. Merged to `master` via
+`git merge --no-ff` (commit 634977e), branch `feat/azure-container-apps-deploy`
+deleted. Next: Azure.2 — ACR build + Container Apps deploy + Managed Identity
+for App Insights.
