@@ -669,6 +669,8 @@ the full lifecycle (triage → coder brief → remove once fixed + re-verified).
 commits: 2456033 (workflow), 50df509 (session discipline), + findings-channel
 batch this session.
 
+2026-06-22 — Retrieval stack migration recorded as a future roadmap item (mentor decision, no code). Step 9 in the migration table is expanded to capture the full intent: migrate from MiniLM + Chroma to Azure OpenAI embeddings + Azure AI Search, **after an explicit comparison phase** evaluating quality (semantic relevance on this French/English corpus), latency (local sentence-transformer inference vs. Azure OpenAI embedding API round-trip), cost (per-query: AI Search query-unit pricing + embedding API calls), observability (span coverage at the managed AI Search tier vs. the existing Chroma retrieval span), operational complexity (managed Azure service vs. self-hosted Chroma + local model), and container image size (MiniLM baked into the current `podcast-search:azure1` image adds ~2 GB; AI Search removes that layer entirely). Not an immediate priority — Phase 1 remains the active spine. The comparison phase is mandatory before any migration decision is taken. See project-constitution.md § Migration order Step 9.
+
 2026-06-21 — Feature ``feat/research-modes`` CLOSED: merged into ``master`` via
 ``git merge --no-ff`` and the branch deleted. Bundled Phase 1.1j (execution
 modes) + Phase 1.1k (retrieval threshold) + the agent-ecosystem governance.

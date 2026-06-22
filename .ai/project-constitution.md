@@ -203,7 +203,7 @@ cd ui && npm run dev                                  # http://localhost:5173
 | 7 (step 5) | done | Langfuse — context tags (session_id, user_id, feature) |
 | 8a | done | Storage consumer rewire — rss/yt/ingest go through ObjectStore |
 | 8b | done | Azure Blob Storage (opt-in `AzureBlobObjectStore`, `DefaultAzureCredential` only) |
-| 9 | **deferred** | Azure AI Search — re-introduced later as agent-tool upgrade (see 2026-06-06 recalibration) |
+| 9 | **deferred** | **Retrieval stack migration: MiniLM + Chroma → Azure OpenAI embeddings + Azure AI Search.** Re-introduced later as an agent-tool upgrade (see 2026-06-06 recalibration). Must include an **explicit comparison phase** before committing: quality (semantic relevance on this corpus), latency (local inference vs. API round-trip), cost (embedding API + AI Search query-unit pricing), observability (span coverage at the AI Search tier), operational complexity (managed vs. self-hosted Chroma), and container image size (MiniLM baked into the container is currently 2+ GB; AI Search removes that layer entirely). |
 | 10 | — | Azure Speech |
 | 11 | — | async ingestion jobs |
 | 12 | — | deployment |
