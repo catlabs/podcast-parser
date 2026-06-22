@@ -1,0 +1,39 @@
+# Keep the search-service image lean. CRITICAL: do NOT exclude
+# rag/data/chroma — the baked podcasts collection is what the service serves.
+
+# Secrets — must never enter the image.
+.env
+.env.*
+!.env.example
+
+# VCS / tooling
+.git
+.gitignore
+.github
+.ai
+
+# Frontend — not on the search path.
+ui/node_modules
+ui/dist
+
+# Local runtime artifacts not needed by search.
+output/
+rag/data/metadata.db
+.chroma_step0/
+
+# Python caches / virtualenv
+.venv
+__pycache__/
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Model / download caches (re-baked at build time, not copied from host).
+.cache
+*.log
+
+# Editor / OS noise
+.vscode
+.idea
+.DS_Store

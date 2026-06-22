@@ -1,0 +1,30 @@
+# Minimal dependency subset for the Azure.1 search HTTP service
+# (rag/service.py). Deliberately a strict subset of requirements.txt — it
+# drops everything off the SearchAgent HTTP path:
+#   openai-whisper, yt-dlp, feedparser, langgraph, mcp, anthropic, openai,
+#   typer, rich.
+# The retrieval path needs only Chroma + sentence-transformers; observability
+# stays opt-in (no-op when the LANGFUSE_* / APPLICATIONINSIGHTS_* env is unset).
+#
+# If a container import fails, note exactly which module pulled it and fall
+# back to the full requirements.txt (documented in the report).
+
+# ── Web layer ────────────────────────────────────────────────────────────────
+fastapi
+uvicorn
+pydantic
+python-dotenv
+
+# ── Indexing / retrieval ─────────────────────────────────────────────────────
+sentence-transformers
+chromadb
+
+# ── Observability (opt-in; no-op without keys) ───────────────────────────────
+# Pins mirror requirements.txt: azure-monitor-opentelemetry-exporter hard-pins
+# opentelemetry-{api,sdk}==1.40, so the OTLP HTTP exporter is pinned to the same
+# minor to avoid ABI drift on a shared TracerProvider.
+langfuse
+opentelemetry-sdk~=1.40.0
+opentelemetry-exporter-otlp-proto-http~=1.40.0
+azure-monitor-opentelemetry-exporter
+azure-identity
