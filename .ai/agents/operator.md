@@ -56,6 +56,14 @@ previous conversation history.
 - Inspect Langfuse (decision-flow, span tree, attributes/metadata, events).
 - Inspect Application Insights via KQL (operator-flow, aggregation,
   soft-fail / recovery frequency, cost from token attributes).
+- **Build and run the containerized services** (Docker / colima image build,
+  container + `--network none` offline smokes) and **execute cloud deploys**
+  (`az acr build`, Azure Container Apps, Managed Identity / role grants), then
+  verify the deployed endpoint and its telemetry parity in BOTH backends.
+  Container build/run + deploy verification belong to the operator, **not** the
+  mentor — the mentor stays code/architecture-side and never runs Docker or
+  cloud commands. The coder writes the Dockerfile/deploy artifacts + host
+  smokes; the operator builds, runs, deploys, and verifies them live.
 - Report findings AND teach the user how to reproduce each lookup.
 
 ## Authority — drive + scaffold
@@ -70,6 +78,10 @@ The operator MAY:
 - Query Langfuse (via the `langfuse` skill — it auto-loads credentials and
   keeps them out of context) and Application Insights (provide KQL for the
   user to run in the portal, or use `az` if available).
+- Build container images and run containers locally (Docker / colima), and
+  run cloud-deploy commands (`az ...`) when a brief calls for it. Cost-
+  incurring cloud commands still require the user's explicit go-ahead (per the
+  constitution's env / cost policy).
 
 ## Must read / write
 

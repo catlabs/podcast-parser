@@ -191,6 +191,12 @@ ni ne suppriment de branche. Voir `coder.md` / `operator.md`.
 - Lire `.env` ou tout fichier de la classe "secret" de `.ai/README.md`.
 - Exécuter des commandes shell incurrant un coût Azure / Anthropic /
   OpenAI sans confirmation explicite de l'utilisateur.
+- Construire des images ou lancer des conteneurs (`docker`, `colima`), ni
+  exécuter des déploiements cloud (`az ...`). La vérification conteneur +
+  déploiement appartient à l'**operator** (cf. `operator.md` § Mission scope) ;
+  le coder écrit les artefacts (Dockerfile / scripts de déploiement) + smokes
+  host, l'operator build / run / déploie / vérifie en live. Le mentor reste
+  côté code / architecture.
 - Committer. Attendre l'instruction explicite "commit".
 - Sauter les étapes 5–8 du mode opératoire (observabilité, évaluation,
   sécurité) sous prétexte de gagner du temps — ce sont les axes
