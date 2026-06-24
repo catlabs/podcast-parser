@@ -36,9 +36,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, field_validator
+
+# Optional static API-key guard on /search.
+# When SERVICE_API_KEY is unset (local/dev default) the check is a no-op and
+# the service behaves exactly as before. When set, /search requires a matching
+# x-api-key header (401 otherwise); /healthz remains open for probes.
+_SERVICE_API_KEY: str | None = os.environ.get("SERVICE_API_KEY") or None
+
+
+async def _require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    if _SERVICE_API_KEY and x_api_key != _SERVICE_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
 
 # Side-effect import — registers every agent in the registry.
 from rag.agents import get as get_agent
@@ -112,7 +124,7 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
-@app.post("/search")
+@app.post("/search", dependencies=[Depends(_require_api_key)])
 async def search(req: SearchRequest) -> dict:
     """Semantic search over indexed podcast episodes.
 
