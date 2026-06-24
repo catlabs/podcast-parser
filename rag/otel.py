@@ -60,10 +60,17 @@ Why share the global TracerProvider (Phase 1.1f.2 change):
 
 Activation:
 
-  - `OTEL_ENABLED=true`            — master switch (off by default)
-  - `LANGFUSE_PUBLIC_KEY`          — used to build Basic auth header
-  - `LANGFUSE_SECRET_KEY`          — used to build Basic auth header
-  - `LANGFUSE_HOST`                — defaults to https://cloud.langfuse.com
+  The OTel side track is active when at least one exporter is configured:
+
+  - `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY` — Langfuse OTLP export
+  - `APPLICATIONINSIGHTS_CONNECTION_STRING`       — App Insights export
+
+  `OTEL_ENABLED=false` / `0` / `no` is an explicit kill switch. The env var
+  no longer has to be set to `true` for App-Insights-only production deploys.
+
+  Langfuse optional:
+
+  - `LANGFUSE_HOST` — defaults to https://cloud.langfuse.com
 
   Optional Phase 1.OBS.1 second exporter (Application Insights):
 
@@ -73,8 +80,8 @@ Activation:
     ``DefaultAzureCredential`` (NOT the embedded instrumentation key).
     Same spans, two backends — see ``rag/azure_monitor.py`` for details.
 
-  If any of the Langfuse vars above is missing, `get_tracer()` returns
-  an OTel no-op tracer so call sites stay branch-free.
+  If no exporter is configured, `get_tracer()` returns an OTel no-op tracer so
+  call sites stay branch-free.
 
 This file intentionally never raises: a failure to initialise OTel
 must never bring the app down.
@@ -92,22 +99,51 @@ from typing import Any
 from rag import config  # noqa: F401
 
 
-# Phase 1.1f.2: ``_SERVICE_NAME`` is no longer set on a resource (we
-# share Langfuse SDK's TracerProvider, so the resource attrs come from
-# the SDK's `_init_tracer_provider`). The instrumentation scope name
-# below ("rag.gen_ai") is what our scope-filtered processor matches on
-# — keep them in sync or the filter stops forwarding our spans.
-_TRACER_NAME     = "rag.gen_ai"
-_OTLP_PATH       = "/api/public/otel/v1/traces"
+_SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "podcast-search-service")
+
+# The instrumentation scope name below ("rag.gen_ai") is what our
+# scope-filtered Langfuse processor matches on — keep them in sync or
+# the filter stops forwarding our spans.
+_TRACER_NAME = "rag.gen_ai"
+_OTLP_PATH = "/api/public/otel/v1/traces"
 
 _inited: bool       = False
 _tracer: Any | None = None
 _processor          = None    # Phase 1.1f.2 — scope-filtered processor on the global TP
 
 
+def _env_flag(name: str) -> str:
+    return os.environ.get(name, "").strip().lower()
+
+
+def _otel_explicitly_disabled() -> bool:
+    return _env_flag("OTEL_ENABLED") in ("0", "false", "no")
+
+
+def _langfuse_enabled() -> bool:
+    if _env_flag("LANGFUSE_ENABLED") in ("0", "false", "no"):
+        return False
+    return bool(
+        os.environ.get("LANGFUSE_PUBLIC_KEY")
+        and os.environ.get("LANGFUSE_SECRET_KEY")
+    )
+
+
 def is_enabled() -> bool:
-    """True when the OTel side track is explicitly switched on."""
-    return os.environ.get("OTEL_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+    """True when at least one OTel exporter is configured.
+
+    ``OTEL_ENABLED=false`` is retained as a kill switch. A missing
+    ``OTEL_ENABLED`` no longer disables App-Insights-only export.
+    """
+    if _otel_explicitly_disabled():
+        return False
+    if _langfuse_enabled():
+        return True
+    try:
+        from rag import azure_monitor
+        return azure_monitor.is_enabled()
+    except Exception:
+        return False
 
 
 def _build_noop_tracer():
@@ -125,16 +161,14 @@ def _build_noop_tracer():
 def get_tracer():
     """Return a Tracer.
 
-    When OTel is enabled and Langfuse keys are present, the tracer is
-    bound to the *global* TracerProvider (the one Langfuse SDK
-    registered at import time). We additionally install a
-    scope-filtered BatchSpanProcessor that exports only the spans
-    issued through this module's tracer (instrumentation scope
-    ``rag.gen_ai``), so the no-double-export invariant from the
-    pre-1.1f.2 private-provider design is preserved. Spans from any
-    other scope — including Langfuse-SDK spans and
-    `gen_ai.*`-auto-instrumented spans — are handled exclusively by
-    Langfuse's own `LangfuseSpanProcessor`.
+    When any exporter is enabled, the tracer is bound to the global
+    TracerProvider. If Langfuse SDK already registered one, we reuse it;
+    otherwise we create an SDK TracerProvider with a service.name resource so
+    App Insights can populate a meaningful cloud role name.
+
+    The Langfuse OTLP processor stays gated on Langfuse credentials and keeps
+    its no-double-export scope filter. The App Insights processor is gated only
+    on ``APPLICATIONINSIGHTS_CONNECTION_STRING`` and attaches independently.
 
     Otherwise a no-op tracer is returned.
 
@@ -152,30 +186,13 @@ def get_tracer():
     public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
     secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "")
     host       = os.environ.get("LANGFUSE_HOST", "https://cloud.langfuse.com").rstrip("/")
-    if not (public_key and secret_key):
-        _tracer = _build_noop_tracer()
-        return _tracer
 
     try:
-        from opentelemetry                            import trace as _ot_trace
-        from opentelemetry.sdk.trace                  import ReadableSpan
-        from opentelemetry.sdk.trace.export           import BatchSpanProcessor
+        from opentelemetry import trace as _ot_trace
+        from opentelemetry.sdk.resources import Resource
+        from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-        auth     = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
-        exporter = OTLPSpanExporter(
-            endpoint = f"{host}{_OTLP_PATH}",
-            headers  = {
-                "Authorization":                "Basic " + auth,
-                # Pin to Langfuse's current "Fast Preview" real-time ingestion
-                # pipeline. Without this header the BullMQ job can be picked up
-                # by a legacy code path that rejects or delays modern OTel
-                # spans (e.g. missing usage details on otherwise-valid GenAI
-                # observations). Cheap defence even when the project version
-                # already matches; required when it doesn't.
-                "x-langfuse-ingestion-version": "4",
-            },
-        )
 
         class _AgentScopeOnlyBatchProcessor(BatchSpanProcessor):
             """Forward only ``rag.gen_ai``-scoped spans that are NOT also
@@ -214,43 +231,49 @@ def get_tracer():
                     return
                 super().on_end(span)
 
-        processor = _AgentScopeOnlyBatchProcessor(exporter)
-
         global_tp = _ot_trace.get_tracer_provider()
-        # ``add_span_processor`` exists on real TracerProviders; the
-        # ProxyTracerProvider (fallback when no provider was ever set)
-        # does not have it. In our deployment Langfuse SDK has already
-        # installed a real TracerProvider by the time observability.py
-        # imports us — but be defensive and degrade to no-op rather
-        # than crash if that ever changes.
-        if hasattr(global_tp, "add_span_processor"):
+        if not hasattr(global_tp, "add_span_processor"):
+            resource = Resource.create({"service.name": _SERVICE_NAME})
+            global_tp = TracerProvider(resource=resource)
+            _ot_trace.set_tracer_provider(global_tp)
+
+        if _langfuse_enabled():
+            auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
+            exporter = OTLPSpanExporter(
+                endpoint=f"{host}{_OTLP_PATH}",
+                headers={
+                    "Authorization": "Basic " + auth,
+                    # Pin to Langfuse's current "Fast Preview" real-time ingestion
+                    # pipeline. Without this header the BullMQ job can be picked up
+                    # by a legacy code path that rejects or delays modern OTel
+                    # spans (e.g. missing usage details on otherwise-valid GenAI
+                    # observations). Cheap defence even when the project version
+                    # already matches; required when it doesn't.
+                    "x-langfuse-ingestion-version": "4",
+                },
+            )
+            processor = _AgentScopeOnlyBatchProcessor(exporter)
             global_tp.add_span_processor(processor)
             atexit.register(processor.shutdown)
             _processor = processor
-            _tracer    = global_tp.get_tracer(_TRACER_NAME)
 
-            # Phase 1.OBS.1 — optional SECOND processor: Application
-            # Insights / Azure Monitor. Same shared TracerProvider,
-            # different destination. Spans are recorded once and fan
-            # out to both backends (Langfuse + App Insights). Opt-in
-            # via APPLICATIONINSIGHTS_CONNECTION_STRING; auth is
-            # DefaultAzureCredential (Step 8b pattern), NOT the
-            # instrumentation key embedded in the connection string.
-            #
-            # The Phase 1.1f.2 unified topology is preserved across
-            # both backends because both processors see the same
-            # in-process spans on the same TracerProvider.
-            try:
-                from rag.azure_monitor import build_processor as _ai_build
-                ai_proc = _ai_build()
-                if ai_proc is not None:
-                    global_tp.add_span_processor(ai_proc)
-                    atexit.register(ai_proc.shutdown)
-            except Exception:
-                # Belt-and-suspenders — observability must never fail the app.
-                pass
-        else:
-            _tracer = _build_noop_tracer()
+        # Phase 1.OBS.1 — optional SECOND processor: Application
+        # Insights / Azure Monitor. Same shared TracerProvider,
+        # different destination. Spans are recorded once and fan out to
+        # every configured backend. This exporter is independently gated
+        # by APPLICATIONINSIGHTS_CONNECTION_STRING; it intentionally does
+        # not require Langfuse credentials or OTEL_ENABLED=true.
+        try:
+            from rag.azure_monitor import build_processor as _ai_build
+            ai_proc = _ai_build()
+            if ai_proc is not None:
+                global_tp.add_span_processor(ai_proc)
+                atexit.register(ai_proc.shutdown)
+        except Exception:
+            # Belt-and-suspenders — observability must never fail the app.
+            pass
+
+        _tracer = global_tp.get_tracer(_TRACER_NAME)
     except Exception:
         # Never let observability bring the app down — fall back to no-op.
         _tracer = _build_noop_tracer()

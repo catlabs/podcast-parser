@@ -20,6 +20,10 @@ env/
 !.claude/agents/
 .claude/agents/*
 !.claude/agents/*.md
+# Codex local tooling dir — ignored entirely (unlike .claude/agents/, the Codex
+# wrappers are not tracked for now; revisit if `codex --agent` must survive across
+# machines the way the Claude wrappers do).
+.codex/
 .chroma_step0/
 output/
 rag/data/
