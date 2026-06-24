@@ -748,3 +748,39 @@ equivalent — by design, not a gap. Commit cadence corrected mid-arc (new memor
 mentor proposes a checkpoint commit per verified sub-step; coder never commits).
 App parked at `min-replicas=0`. Merged to `master` via `git merge --no-ff`,
 branch deleted.
+
+2026-06-24 — Roadmap addition (mentor planning, no product code): new
+**Step 9b — Retrieval-profile abstraction** added to `project-constitution.md`
+§ Migration order, marked **future (low-prio)**, placed after the deferred Step 9
+(retrieval-stack migration). A `RetrievalProfile` / adapter layer behind a common,
+backend-independent retrieval contract so different backends (Chroma+local
+embeddings, Azure AI Search + Azure OpenAI embeddings, future providers) can be
+normalized (per-provider score scales → comparable [0,1]), threshold-calibrated
+per provider (the minilm ~0.45 `min_score` doesn't transfer), and benchmarked
+side-by-side on quality/latency/cost against a golden dataset. It generalizes the
+Eval.1 per-model baselines (`rag/eval_baselines/<key>.json`) into per-profile
+baselines and makes Step 9's mandatory comparison phase rigorous + repeatable.
+Explicitly **off the pre-mission-start critical path** — pick up only when
+retrieval-backend choice becomes a live question. Surrounding steps unchanged
+(10 Speech / 11 async ingestion / 12 deployment keep their numbers; Step 9 gains
+a cross-reference to 9b).
+
+2026-06-24 — Eval.1 SHIPPED + CLOSED: retrieval **regression gate** + abstention
+metric. First step of the Eval arc (JD priority #3 — eval / regression / rollback
+gates). Evolved `rag/eval.py` from a metrics printer into a CI-gateable check:
+`--save-baseline` writes per-model metrics to tracked `rag/eval_baselines/<key>.json`
+(hit/recall/mrr/abstention + top_k, min_score, dataset size + SHA-256 content
+hash); `--check` diffs current vs baseline, prints a per-metric delta table, and
+**exits non-zero** when a gated metric drops beyond `--tolerance` (default 0.0);
+missing baseline or dataset hash/size mismatch both **refuse to gate** (non-zero,
+before any retrieval) so a moved goalpost is explicit; `--json` emits a parseable
+run summary. Added 4 off-topic **negative queries** + an `abstention` metric
+(computed on negatives only) that exercises the Phase 1.1k `min_score` threshold
+(minilm @0.45 → abstention 1.0). Mentor-verified offline (gate exits 0 at
+baseline, 1 on a forced `--top 1` regression with a clean FAIL table). **minilm is
+the live gate**; the `multilingual` baseline is a degenerate all-zero placeholder
+(that collection is unpopulated on this index) — populate-or-gate-minilm-only is
+an Eval.2 item. Stays in-process, no LLM calls. Merged to `master` via
+`git merge --no-ff` (commit 6474534), branch `feat/eval-regression-gate` deleted.
+Next: Eval.2 — route eval through the SearchAgent contract + observability
+(trace `feature=eval`, Langfuse scores) + `min_score`/`top_k` baseline validation.
