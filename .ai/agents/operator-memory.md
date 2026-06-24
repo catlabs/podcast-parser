@@ -421,10 +421,49 @@ To fix: add an OTel-native `retrieval` span in `rag/search.py` using
 `rag.otel.get_tracer()` (scope `rag.gen_ai`, no `gen_ai.*` attrs). The Langfuse
 SDK observation can remain as a wrapper on top when Langfuse is enabled.
 
+## OTel-native `retrieval` span (VERIFIED 2026-06-24, azure2d)
+
+`rag/search.py::semantic_search()` now emits a `retrieval` span via
+`rag.otel.get_tracer()` (scope `rag.gen_ai`, no `gen_ai.*` attrs). This is
+the SAME dual-export pattern as `agent search`: the `_AgentScopeOnlyBatchProcessor`
+sends it to Langfuse, the Azure Monitor processor sends it to App Insights.
+
+Expected customDimensions keys on the `retrieval` span:
+```
+retrieval.query              retrieval.top_k
+retrieval.model_key          retrieval.embedding_provider
+retrieval.collection         retrieval.n_returned
+retrieval.n_kept             retrieval.n_dropped
+retrieval.top_score          retrieval.min_kept_score
+retrieval.min_score          ← only present when RETRIEVAL_MIN_SCORE is set
+```
+
+The Langfuse SDK `start_as_current_observation("retrieval")` block was removed
+to avoid double-emit in Langfuse. The OTel span is the single source.
+
+Full 3-span chain in App Insights (verified):
+```
+agent search  →  retrieval  →  embeddings all-MiniLM-L6-v2
+```
+
+KQL to query retrieval performance:
+```kql
+dependencies
+| where name == "retrieval"
+| where timestamp > ago(1h)
+| extend
+    query      = tostring(customDimensions["retrieval.query"]),
+    n_kept     = toint(customDimensions["retrieval.n_kept"]),
+    top_score  = todouble(customDimensions["retrieval.top_score"]),
+    n_dropped  = toint(customDimensions["retrieval.n_dropped"])
+| project timestamp, query, n_kept, n_dropped, top_score, duration
+| order by timestamp desc
+```
+
 ## Open verifications queued
 
-- **Azure.2b BLOCKER: RESOLVED** (2026-06-24 azure2c). `agent search` spans flow
-  to App Insights with no Langfuse keys. Two minor follow-on findings open:
-  (a) `http.*` attr namespace collides with Azure Monitor exporter filter → rename to `search.*`
-  (b) `retrieval` span is Langfuse-SDK-only → add OTel-native span in `rag/search.py`
-  Both logged in operator-findings.md 2026-06-24. Mentor to triage + brief the coder.
+- **Azure.2 arc: FULLY VERIFIED** (2026-06-24, azure2d). Full telemetry parity
+  confirmed: 3-span chain (agent search → retrieval → embeddings), all domain
+  attrs in customDimensions (agent.*, retrieval.*, search.*), no Langfuse keys
+  in cloud. Both 2026-06-24 findings resolved. Mentor to merge + record in
+  current-status.md.
