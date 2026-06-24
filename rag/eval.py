@@ -4,7 +4,8 @@ rag/eval.py
 Minimal retrieval evaluation — no LLM calls.
 
 For each labeled query, run semantic_search and check whether the expected
-episode title(s) appear in the top-K results. The labels live inline so the
+episode title(s) appear in the top-K results. Negative queries expect zero
+results after the retrieval min_score filter. The labels live inline so the
 eval is self-contained; expand or replace QUERIES when the indexed corpus
 changes.
 
@@ -16,19 +17,30 @@ Metrics (per model):
               multiple episodes (e.g. OpenClaw covered in two episodes).
   MRR         mean reciprocal rank of the first matching result. Rewards
               "right answer at position 1" over "right answer at position 5".
+  Abstention  fraction of negative queries returning zero results after
+              min_score filtering.
 
 Run:
     python -m rag.eval                       # default: top_k=5, all models
     python -m rag.eval --top 10
     python -m rag.eval --model minilm        # single model
+    python -m rag.eval --json
+    python -m rag.eval --save-baseline
+    python -m rag.eval --check
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import json
+import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
-from rag.config import EMBED_MODELS
+from rag.config import BASE_DIR, EMBED_MODELS, RETRIEVAL_MIN_SCORE
 from rag.search import semantic_search
 
 
@@ -44,9 +56,21 @@ from rag.search import semantic_search
 class Query:
     query:           str
     expected_titles: tuple[str, ...]
+    negative:        bool = False
+
+    @property
+    def kind(self) -> str:
+        return "negative" if self.negative else "positive"
+
+
+BASELINE_DIR = BASE_DIR / "rag" / "eval_baselines"
+GATED_METRICS = ("hit", "recall", "mrr", "abstention")
 
 
 QUERIES: list[Query] = [
+    # Positive labels were the working eval set during Phase 1.1k threshold
+    # tuning, so abstention/threshold conclusions from this tiny corpus are
+    # optimistic. Future expansion should add held-out positive labels.
     Query("Qu'est-ce que Nanocorp ?",                  ("Nanocorp",)),
     Query("Comment fonctionne OpenClaw ?",             ("Marc Andreessen", "OpenClaw : comprendre")),
     Query("Marie Dollé compétences de demain",         ("Marie Dollé",)),
@@ -59,7 +83,41 @@ QUERIES: list[Query] = [
     Query("Death of the Browser Marc Andreessen",      ("Marc Andreessen",)),
     Query("Trump blockade against Iran",               ("Iran",)),
     Query("Décupler sa productivité avec l'IA",        ("décupler",)),
+    Query("Recette de risotto aux champignons",        (), negative=True),
+    Query("Résultat du match Belgique Brésil football", (), negative=True),
+    Query("Calendrier lunaire plantation carottes potager", (), negative=True),
+    Query("Meilleur entraînement marathon débutant",   (), negative=True),
 ]
+
+
+def _positive_queries() -> list[Query]:
+    return [q for q in QUERIES if not q.negative]
+
+
+def _negative_queries() -> list[Query]:
+    return [q for q in QUERIES if q.negative]
+
+
+def _dataset_hash() -> str:
+    payload = [
+        {
+            "query": q.query,
+            "expected_titles": list(q.expected_titles),
+            "negative": q.negative,
+        }
+        for q in QUERIES
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _dataset_summary() -> dict:
+    return {
+        "total_queries": len(QUERIES),
+        "positive_queries": len(_positive_queries()),
+        "negative_queries": len(_negative_queries()),
+        "content_hash": _dataset_hash(),
+    }
 
 
 # ── Per-query evaluation ──────────────────────────────────────────────────────
@@ -82,9 +140,25 @@ def _first_match_rank(titles_norm: list[str], needle_norm: str) -> int | None:
     return None
 
 
-def _evaluate_query(q: Query, model_key: str, top_k: int) -> dict:
-    results     = semantic_search(q.query, top_k=top_k, model_key=model_key)
+def _evaluate_query(q: Query, model_key: str, top_k: int, min_score: float | None) -> dict:
+    results     = semantic_search(q.query, top_k=top_k, model_key=model_key, min_score=min_score)
     titles_norm = [_norm(r["title"]) for r in results]
+
+    if q.negative:
+        return {
+            "query":      q.query,
+            "kind":       q.kind,
+            "rank":       None,
+            "hit":        None,
+            "recall":     None,
+            "rr":         None,
+            "abstained":  len(results) == 0,
+            "top_title":  results[0]["title"] if results else "(none)",
+            "top_score":  results[0].get("score") if results else None,
+            "n_results":  len(results),
+            "n_expected": 0,
+            "n_matched":  0,
+        }
 
     ranks   = [_first_match_rank(titles_norm, _norm(n)) for n in q.expected_titles]
     matched = [r for r in ranks if r is not None]
@@ -95,27 +169,107 @@ def _evaluate_query(q: Query, model_key: str, top_k: int) -> dict:
     rr        = (1.0 / best_rank) if best_rank else 0.0
 
     return {
-        "query":     q.query,
-        "rank":      best_rank,
-        "hit":       hit,
-        "recall":    recall,
-        "rr":        rr,
-        "top_title": results[0]["title"] if results else "(none)",
+        "query":      q.query,
+        "kind":       q.kind,
+        "rank":       best_rank,
+        "hit":        hit,
+        "recall":     recall,
+        "rr":         rr,
+        "abstained":  None,
+        "top_title":  results[0]["title"] if results else "(none)",
+        "top_score":  results[0].get("score") if results else None,
+        "n_results":  len(results),
         "n_expected": len(q.expected_titles),
         "n_matched":  len(matched),
     }
 
 
-def evaluate(model_key: str, top_k: int) -> dict:
-    rows = [_evaluate_query(q, model_key, top_k) for q in QUERIES]
-    n    = len(rows)
+def evaluate(model_key: str, top_k: int, min_score: float | None) -> dict:
+    rows = [_evaluate_query(q, model_key, top_k, min_score) for q in QUERIES]
+    positive_rows = [r for r in rows if r["kind"] == "positive"]
+    negative_rows = [r for r in rows if r["kind"] == "negative"]
+    n_positive    = len(positive_rows)
+    n_negative    = len(negative_rows)
     return {
-        "model_key": model_key,
-        "hit":       sum(r["hit"]    for r in rows) / n,
-        "recall":    sum(r["recall"] for r in rows) / n,
-        "mrr":       sum(r["rr"]     for r in rows) / n,
-        "rows":      rows,
+        "model_key":   model_key,
+        "top_k":       top_k,
+        "min_score":   min_score,
+        "dataset":     _dataset_summary(),
+        "hit":         sum(r["hit"]    for r in positive_rows) / n_positive,
+        "recall":      sum(r["recall"] for r in positive_rows) / n_positive,
+        "mrr":         sum(r["rr"]     for r in positive_rows) / n_positive,
+        "abstention":  (
+            sum(1 for r in negative_rows if r["abstained"]) / n_negative
+            if n_negative else 0.0
+        ),
+        "rows":        rows,
     }
+
+
+def _baseline_path(model_key: str) -> Path:
+    return BASELINE_DIR / f"{model_key}.json"
+
+
+def _baseline_payload(res: dict) -> dict:
+    return {
+        "model_key": res["model_key"],
+        "saved_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "top_k": res["top_k"],
+        "min_score": res["min_score"],
+        "dataset": res["dataset"],
+        "metrics": {metric: res[metric] for metric in GATED_METRICS},
+    }
+
+
+def _write_baseline(res: dict) -> Path:
+    BASELINE_DIR.mkdir(parents=True, exist_ok=True)
+    path = _baseline_path(res["model_key"])
+    path.write_text(json.dumps(_baseline_payload(res), indent=2, sort_keys=True) + "\n")
+    return path
+
+
+def _load_baseline(model_key: str) -> dict:
+    path = _baseline_path(model_key)
+    if not path.exists():
+        raise SystemExit(
+            f"Missing baseline for model {model_key!r}: {path}. "
+            "Run `python -m rag.eval --save-baseline` first."
+        )
+    return json.loads(path.read_text())
+
+
+def _validate_baseline(base: dict, model_key: str) -> None:
+    current_dataset = _dataset_summary()
+    baseline_dataset = base.get("dataset", {})
+    if baseline_dataset.get("content_hash") != current_dataset["content_hash"]:
+        raise SystemExit(
+            f"Dataset hash changed for model {model_key!r}; refusing to gate. "
+            "Run `python -m rag.eval --save-baseline` to re-baseline explicitly."
+        )
+    if baseline_dataset.get("total_queries") != current_dataset["total_queries"]:
+        raise SystemExit(
+            f"Dataset size changed for model {model_key!r}; refusing to gate. "
+            "Run `python -m rag.eval --save-baseline` to re-baseline explicitly."
+        )
+
+
+def _check_result(base: dict, res: dict, tolerance: float) -> tuple[list[dict], bool]:
+    rows = []
+    failed = False
+    for metric in GATED_METRICS:
+        baseline_value = float(base["metrics"][metric])
+        current_value = float(res[metric])
+        delta = current_value - baseline_value
+        metric_failed = delta < -tolerance
+        failed = failed or metric_failed
+        rows.append({
+            "metric": metric,
+            "baseline": baseline_value,
+            "current": current_value,
+            "delta": delta,
+            "failed": metric_failed,
+        })
+    return rows, failed
 
 
 # ── Reporting ─────────────────────────────────────────────────────────────────
@@ -123,36 +277,77 @@ def evaluate(model_key: str, top_k: int) -> dict:
 def _print_model_report(res: dict, top_k: int) -> None:
     print(f"=== {res['model_key']}  ({EMBED_MODELS[res['model_key']]}) ===")
     print(f"  {'Q':<3} {'Rank':>5} {'Hit':>4} {'Rec':>5} {'RR':>5}   Query  →  Top result")
-    for i, row in enumerate(res["rows"], 1):
+    positive_rows = [r for r in res["rows"] if r["kind"] == "positive"]
+    negative_rows = [r for r in res["rows"] if r["kind"] == "negative"]
+    for i, row in enumerate(positive_rows, 1):
         rank   = str(row["rank"]) if row["rank"] else "—"
         marker = "✓" if row["hit"] else "✗"
         query  = row["query"][:38] + ("…" if len(row["query"]) > 38 else "")
         top    = row["top_title"][:48] + ("…" if len(row["top_title"]) > 48 else "")
         print(f"  Q{i:<2} {rank:>5} {marker:>4} {row['recall']:>5.2f} {row['rr']:>5.2f}   "
               f"{query!r}  →  {top!r}")
+    if negative_rows:
+        print(f"\n  {'N':<3} {'Abstain':>7} {'N':>3} {'Score':>7}   Query  →  Top result")
+        for i, row in enumerate(negative_rows, 1):
+            marker = "✓" if row["abstained"] else "✗"
+            score = f"{row['top_score']:.4f}" if row["top_score"] is not None else "—"
+            query = row["query"][:38] + ("…" if len(row["query"]) > 38 else "")
+            top = row["top_title"][:48] + ("…" if len(row["top_title"]) > 48 else "")
+            print(f"  N{i:<2} {marker:>7} {row['n_results']:>3} {score:>7}   "
+                  f"{query!r}  →  {top!r}")
     print(f"\n  Hit@{top_k}: {res['hit']:.2f}   "
           f"Recall@{top_k}: {res['recall']:.2f}   "
-          f"MRR: {res['mrr']:.3f}\n")
+          f"MRR: {res['mrr']:.3f}   "
+          f"Abstention: {res['abstention']:.2f}\n")
 
 
 def _print_summary(summaries: list[dict], top_k: int) -> None:
     if len(summaries) < 2:
         return
     print("=== Side-by-side ===")
-    print(f"  {'model':<15} {f'Hit@{top_k}':>7} {f'Rec@{top_k}':>7} {'MRR':>6}")
+    print(f"  {'model':<15} {f'Hit@{top_k}':>7} {f'Rec@{top_k}':>7} {'MRR':>6} {'Abstain':>8}")
     for s in summaries:
-        print(f"  {s['model_key']:<15} {s['hit']:>7.2f} {s['recall']:>7.2f} {s['mrr']:>6.3f}")
+        print(f"  {s['model_key']:<15} {s['hit']:>7.2f} {s['recall']:>7.2f} "
+              f"{s['mrr']:>6.3f} {s['abstention']:>8.2f}")
+
+
+def _print_check_report(model_key: str, rows: list[dict], tolerance: float) -> None:
+    print(f"=== Regression check: {model_key} (tolerance={tolerance:.4f}) ===")
+    print(f"  {'metric':<12} {'baseline':>10} {'current':>10} {'delta':>10} {'status':>8}")
+    for row in rows:
+        status = "FAIL" if row["failed"] else "ok"
+        print(f"  {row['metric']:<12} {row['baseline']:>10.4f} {row['current']:>10.4f} "
+              f"{row['delta']:>+10.4f} {status:>8}")
+    print()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description="Minimal retrieval eval (no LLM calls).")
     ap.add_argument("--top",   type=int, default=5,
                     help="Top-K results to consider (default: 5)")
     ap.add_argument("--model", default=None,
                     help="Single embedding model key (default: all configured)")
+    ap.add_argument("--min-score", type=float, default=RETRIEVAL_MIN_SCORE,
+                    help=(
+                        "Drop retrieval results below this score before scoring. "
+                        "Defaults to RETRIEVAL_MIN_SCORE from config/env; unset disables filtering."
+                    ))
+    ap.add_argument("--json", action="store_true",
+                    help="Print the full result payload as JSON to stdout.")
+    ap.add_argument("--save-baseline", action="store_true",
+                    help="Write aggregate metrics to rag/eval_baselines/<model_key>.json.")
+    ap.add_argument("--check", action="store_true",
+                    help="Compare current metrics to committed baselines and fail on regression.")
+    ap.add_argument("--tolerance", type=float, default=0.0,
+                    help="Allowed metric drop before --check fails (default: 0.0).")
     args = ap.parse_args()
+
+    if args.save_baseline and args.check:
+        raise SystemExit("--save-baseline and --check are mutually exclusive.")
+    if args.tolerance < 0:
+        raise SystemExit("--tolerance must be >= 0.")
 
     if args.model and args.model not in EMBED_MODELS:
         raise SystemExit(
@@ -160,16 +355,60 @@ def main() -> None:
         )
     model_keys = [args.model] if args.model else list(EMBED_MODELS.keys())
 
-    print(f"Retrieval eval — {len(QUERIES)} queries, top_k={args.top}\n")
-
     summaries = []
-    for mk in model_keys:
-        res = evaluate(mk, args.top)
-        summaries.append(res)
+    checks = []
+    failed = False
+    baselines = {mk: _load_baseline(mk) for mk in model_keys} if args.check else {}
+    for mk, baseline in baselines.items():
+        _validate_baseline(baseline, mk)
+    output_target = sys.stderr if args.json else sys.stdout
+    with contextlib.redirect_stdout(output_target):
+        for mk in model_keys:
+            res = evaluate(mk, args.top, args.min_score)
+            summaries.append(res)
+            if args.save_baseline:
+                path = _write_baseline(res)
+                res["baseline_path"] = str(path)
+            if args.check:
+                check_rows, check_failed = _check_result(baselines[mk], res, args.tolerance)
+                checks.append({"model_key": mk, "rows": check_rows, "failed": check_failed})
+                failed = failed or check_failed
+
+    if args.json:
+        payload = {
+            "top_k": args.top,
+            "min_score": args.min_score,
+            "dataset": _dataset_summary(),
+            "summaries": summaries,
+        }
+        if checks:
+            payload["checks"] = checks
+            payload["passed"] = not failed
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 1 if failed else 0
+
+    print(
+        f"Retrieval eval — {_dataset_summary()['positive_queries']} positive + "
+        f"{_dataset_summary()['negative_queries']} negative queries, top_k={args.top}, "
+        f"min_score={args.min_score}\n"
+    )
+    for res in summaries:
         _print_model_report(res, args.top)
+        if args.save_baseline:
+            print(f"Saved baseline: {res['baseline_path']}\n")
+
+    if args.check:
+        for check in checks:
+            _print_check_report(check["model_key"], check["rows"], args.tolerance)
+        if failed:
+            print("Regression check failed.")
+            return 1
+        print("Regression check passed.")
+        return 0
 
     _print_summary(summaries, args.top)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
