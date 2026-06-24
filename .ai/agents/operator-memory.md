@@ -237,6 +237,194 @@ research-request → customDimensions["langfuse.observation.input"]   Langfuse-n
 
 To query by `model_key` or `llm_key`, prefer `agent *` spans (flat keys) over `research-request`.
 
+## Container image verification runbook (Azure.2a, 2026-06-22)
+
+### Build command
+```bash
+docker build -t podcast-search:azure2a .
+# native arm64 (local, fast) — acceptable for size/smoke checks
+# for production amd64 image use: docker build --platform linux/amd64 ... or az acr build
+```
+
+### CPU-torch check (inside container)
+```bash
+docker run --rm podcast-search:azure2a \
+    python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# expect: <version>+cpu  False
+```
+Azure.2a result: `2.12.1+cpu False`. CUDA absent confirmed.
+
+### Offline smoke (decisive — use exec'd python, not host curl)
+```bash
+CID=$(docker run -d --network none podcast-search:azure2a)
+docker exec -i "$CID" python - <<'PY'
+import time, urllib.request, json, sys
+for i in range(30):
+    try: urllib.request.urlopen("http://127.0.0.1:8000/healthz", timeout=1); break
+    except: time.sleep(1)
+else: sys.exit("TIMEOUT")
+r = urllib.request.urlopen("http://127.0.0.1:8000/healthz")
+print(json.loads(r.read()))
+req = urllib.request.Request(
+    "http://127.0.0.1:8000/search",
+    data=json.dumps({"query":"artificial intelligence"}).encode(),
+    headers={"Content-Type": "application/json"}, method="POST")
+r2 = urllib.request.urlopen(req)
+body = json.loads(r2.read())
+print("n_episodes=%d n_chunks=%d" % (body["n_episodes"], body["n_chunks"]))
+PY
+docker stop "$CID" && docker rm "$CID"
+```
+Key gotchas: `--network none` means no host port; exec heredoc needs `-i`; poll
+uvicorn readiness with `time.sleep` INSIDE the exec'd python (not host `sleep`).
+
+### Auth guard check
+```bash
+CID=$(docker run -d -e SERVICE_API_KEY=secret123 -p 8001:8000 podcast-search:azure2a)
+sleep 8
+curl -s -o /dev/null -w "%{http_code}" http://localhost:8001/healthz              # 200
+curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8001/search \
+    -H "Content-Type: application/json" -d '{"query":"ai"}' # 401 (no key)
+curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8001/search \
+    -H "Content-Type: application/json" -H "x-api-key: secret123" -d '{"query":"ai"}' # 200
+docker stop "$CID" && docker rm "$CID"
+```
+
+### Image size expectations (aarch64 vs amd64)
+- Azure.1 (CUDA torch baked): 9.83 GB
+- Azure.2a arm64 (CPU torch): **2.68 GB** (−73%)
+- Azure.2a amd64 (ACR build): TBD in Phase B — x86 CPU wheel expected smaller
+  (the 1–2 GB brief target was calibrated for amd64)
+- Layer breakdown: `/venv` 1.5 GB, HF model 88 MB, Chroma 99 MB, base ~150 MB
+
+## Azure Container Apps deploy runbook (Azure.2b, 2026-06-24)
+
+### Provisioning order that works (script assumes these exist)
+1. ACR: `az acr create -n <name> -g <rg> --sku Basic --admin-enabled false`
+   (name globally unique; `az acr check-name -n <name>` first).
+2. Cloud build (server-side, no local Docker): `az acr build --registry <name>
+   --platform linux/amd64 --image podcast-search:<tag> .` — ~5 min for this image.
+3. Container Apps env: `az containerapp env create -n <env> -g <rg> --location <loc>`
+   (auto-creates an LA workspace for system logs if none given).
+4. Container App: `az containerapp create ... --system-assigned --target-port 8000
+   --ingress external --min-replicas 0 --max-replicas 3 --cpu 0.5 --memory 1.0Gi
+   --env-vars APPLICATIONINSIGHTS_CONNECTION_STRING=<conn>`.
+
+### Providers + CLI gotchas (hit live 2026-06-24)
+- Register BEFORE deploy or create fails: `Microsoft.App` AND
+  `Microsoft.ContainerRegistry`. `az provider register -n Microsoft.App --wait`.
+- **`az extension add --name application-insights` FAILS** on Homebrew az
+  (pip/Python 3.13 incompat). Workaround for telemetry: skip the extension, query
+  the App Insights data API directly via `az rest` (see KQL-without-portal below).
+- Connection string without the broken extension:
+  `az rest --method GET --url ".../components/<name>?api-version=2020-02-02"
+  --query "properties.ConnectionString" -o tsv`.
+
+### ACR pull auth — bootstrap chicken-and-egg
+System-MI needs `AcrPull` before it can pull, but the MI only exists AFTER the app
+is created. Two clean options:
+  (a) create the app with `--registry-username/--registry-password` (admin creds),
+      then `az containerapp registry set --identity system` + grant `AcrPull` +
+      disable admin; OR
+  (b) pre-create a user-assigned MI, grant AcrPull, attach at create time.
+GOTCHA: if you flip a config (e.g. `--min-replicas`) that spawns a NEW revision
+while ACR admin is disabled and registry auth still references admin creds, the new
+revision hits `ActivationFailed` (can't pull). Fix: `az containerapp registry set
+--identity system` so the revision pulls via MI. The system-MI `principalId` is
+STABLE across revisions (tied to the app, not the revision).
+- Role list needs `--all`: `az role assignment list --assignee <pid> --all`.
+
+### amd64 vs arm64 image size
+amd64 ACR build = **651 MB compressed** in the registry
+(`az acr manifest list-metadata --registry <r> --name <repo> --query "[].imageSize"`).
+vs 2.68 GB uncompressed arm64 locally. The 1–2 GB target was for amd64 — confirmed.
+
+### Scale-to-zero DROPS buffered spans (operator gotcha)
+`min-replicas=0`: Container Apps kills the replica after idle. The OTel
+`BatchSpanProcessor` (5 s export cycle) can lose spans buffered since the last flush
+if shutdown beats the cycle. The uvicorn lifespan in `rag/service.py` flushes Langfuse
+(`flush_langfuse()`) but NOT the OTel `TracerProvider.force_flush()`. For telemetry
+verification, pin `min-replicas=1` to hold the container up; for prod, the lifespan
+needs an OTel force_flush. (Separate from the blocker below.)
+
+### ⚠️ App Insights export coupled to Langfuse keys (BLOCKER — see operator-findings.md 2026-06-24)
+The cloud "App-Insights-only, no Langfuse keys" deploy emits ZERO telemetry. Root
+cause: `rag/otel.py::get_tracer()` attaches the Azure Monitor processor ONLY inside
+the block gated by `OTEL_ENABLED=true` AND Langfuse keys present (otel.py:148,155).
+With neither set in the cloud, `get_tracer()` returns a no-op tracer and the AI
+exporter (`azure_monitor.build_processor()`, otel.py:244) is never reached. So
+`agent search` spans are no-ops. `rag/azure_monitor.py` is itself fine (needs only
+the connection string). Diagnostic that nailed it: container logs show `/search`
+200s but NO Azure Monitor exporter init line; `dependencies` table empty.
+**Lesson for future deploys:** verify the telemetry pipeline ACTUALLY initializes
+(look for the exporter init in logs / a test span) — a healthy app serving 200s tells
+you nothing about whether spans are being EXPORTED.
+
+### KQL without the portal (when the portal editor is unusable)
+Query the App Insights data API directly (resource token `api.applicationinsights.io`):
+```bash
+APPID=$(az rest --method GET --url ".../components/<name>?api-version=2020-02-02" \
+  --query "properties.AppId" -o tsv)
+az rest --method post \
+  --url "https://api.applicationinsights.io/v1/apps/$APPID/query" \
+  --resource "https://api.applicationinsights.io" \
+  --headers "Content-Type=application/json" \
+  --body '{"query":"dependencies | where timestamp > ago(30m) | summarize count() by name"}'
+```
+Response shape: `tables[0].columns[].name` + `tables[0].rows[]`. This is the escape
+hatch when the user can't type in the portal KQL editor (and for the operator to
+self-verify ingest before teaching). Default teaching preference is still the portal.
+
+## Azure Monitor exporter attribute filter (VERIFIED 2026-06-24)
+
+The `azure-monitor-opentelemetry-exporter` silently drops span attributes whose
+key starts with any prefix in `_STANDARD_OPENTELEMETRY_ATTRIBUTE_PREFIXES`:
+
+```python
+# azure/monitor/opentelemetry/exporter/export/trace/_exporter.py
+_STANDARD_OPENTELEMETRY_ATTRIBUTE_PREFIXES = [
+    "http.", "db.", "message.", "messaging.", "rpc.", "enduser.",
+    "net.", "peer.", "exception.", "thread.", "fass.", "code.",
+]
+```
+
+These are excluded from `customDimensions` because the exporter maps them to
+standard AI telemetry fields (url, resultCode, target, etc.). Custom domain attrs
+that happen to use a reserved prefix (e.g. `http.query`, `http.top_k`) are NOT
+mapped to any AI field and are silently dropped — they never appear in
+`customDimensions` OR any other column.
+
+**Rule: Never use `http.*`, `db.*`, `rpc.*`, `net.*`, `exception.*`, etc. as**
+**prefixes for custom domain attributes intended for App Insights queries.**
+
+Safe prefixes confirmed in this project: `agent.*`, `research.*`, `retrieval.*`,
+`search.*`, `mcp.*`, `recovery.*`, `summarizer.*`. Any non-standard namespace is safe.
+
+Diagnostic that nailed it: `customDimensions` had 7 `agent.*` keys but zero
+`http.*` keys, even though both are set via the same `span.set_attribute()` call
+in `_run_with_span`. Confirmed locally: no SDK exception, attrs are set on the span.
+Confirmed in exporter source at `_filter_custom_properties(span.attributes, lambda k, v: not _is_standard_attribute(k))`.
+
+## `retrieval` span is Langfuse-SDK-only (VERIFIED 2026-06-24)
+
+`rag/search.py::semantic_search()` creates the `retrieval` span ONLY via
+`lf.start_as_current_observation()`. When Langfuse is absent, `get_langfuse()`
+returns None and the function early-exits (line 157) with NO span. The `retrieval.*`
+attrs (n_returned, n_kept, top_score, etc.) are also only stamped inside that block.
+
+In App-Insights-only mode:
+- Trace structure is `agent search → embeddings` (2 spans, not 3)
+- `dependencies | where name == "retrieval"` → always 0 rows
+- This is NOT a regression from azure2c; it's a design gap predating this work
+
+To fix: add an OTel-native `retrieval` span in `rag/search.py` using
+`rag.otel.get_tracer()` (scope `rag.gen_ai`, no `gen_ai.*` attrs). The Langfuse
+SDK observation can remain as a wrapper on top when Langfuse is enabled.
+
 ## Open verifications queued
 
-*(None currently. Phase 1.1i + 1.1k fully verified on both backends 2026-06-21.)*
+- **Azure.2b BLOCKER: RESOLVED** (2026-06-24 azure2c). `agent search` spans flow
+  to App Insights with no Langfuse keys. Two minor follow-on findings open:
+  (a) `http.*` attr namespace collides with Azure Monitor exporter filter → rename to `search.*`
+  (b) `retrieval` span is Langfuse-SDK-only → add OTel-native span in `rag/search.py`
+  Both logged in operator-findings.md 2026-06-24. Mentor to triage + brief the coder.
