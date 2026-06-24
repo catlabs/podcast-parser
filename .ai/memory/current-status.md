@@ -706,3 +706,45 @@ sidesteps the missing-Docker-host blocker entirely. Merged to `master` via
 `git merge --no-ff` (commit 634977e), branch `feat/azure-container-apps-deploy`
 deleted. Next: Azure.2 — ACR build + Container Apps deploy + Managed Identity
 for App Insights.
+
+2026-06-24 — Azure.2 SHIPPED: SearchAgent HTTP service deployed to **Azure
+Container Apps**, emitting telemetry to **Application Insights only, via Managed
+Identity (zero-secret)** — and verified at **full trace parity** with the local
+Langfuse topology. Four sub-steps on `feat/azure-container-apps-deploy`:
+**2a** (`9494916`) — deploy-ready image: multi-stage build installs CPU-only
+torch before requirements so the CUDA wheel (~7 GB) stays out; `build-essential`
+confined to the builder stage. amd64 ACR build = **651 MB compressed** (was 9.83
+GB). Adds an env-gated `SERVICE_API_KEY` guard on `/search` (open when unset) +
+the idempotent, COST-marked `deploy/azure-containerapp.sh` (`az acr build
+--platform linux/amd64`, system-assigned MI, Monitoring Metrics Publisher grant,
+App Insights conn-string resolved dynamically, scale-to-zero).
+**2c** (`ce0678b`) — **obs-exporter decoupling** (the key lesson): the App
+Insights span processor was only attached *inside* the Langfuse-enabled block in
+`rag/otel.py::get_tracer()`, so an App-Insights-only deploy (no Langfuse keys, no
+`OTEL_ENABLED`) emitted **zero** telemetry. Fixed: `is_enabled()` true when
+EITHER backend is configured; a real `TracerProvider` (service.name resource) is
+created when the Langfuse SDK hasn't; the Langfuse OTLP processor stays gated on
+Langfuse keys; the Azure Monitor processor attaches independently on
+`APPLICATIONINSIGHTS_CONNECTION_STRING`. `OTEL_ENABLED=false` kept as a
+kill-switch. **Each backend exporter is gated on its own config** — the
+production observability fan-out pattern.
+**2d** (`e16d869`) — two cloud-parity gaps the operator caught by walking the
+span tree (not just "spans arrived"): (i) the `retrieval` span was Langfuse-SDK-
+only → re-emitted as an **OTel-native** span via `get_tracer()` (scope
+`rag.gen_ai`, no `gen_ai.*` attrs) so it fans out to both backends; SDK
+observation dropped to avoid double-emit; (ii) the `agent search` domain attrs
+used an `http.*` prefix, which the Azure Monitor exporter **reserves for standard
+HTTP semantics and silently strips** → renamed `http.*` → `search.*`. Lesson:
+custom span attrs must avoid reserved OTel prefixes (`http.`, `db.`, `rpc.`,
+`net.`, `exception.`, …); use a domain prefix (`agent.*`, `retrieval.*`,
+`search.*`, `mcp.*`).
+Operator live-verified each fix on the deployed app (sessions
+`op-verify-azure2*`): blocker resolved (spans reach App Insights with no Langfuse
+keys), then full parity — `dependencies | where name == "retrieval"` non-empty,
+3-span chain `agent search → retrieval → embeddings` whole, `search.*` in
+`customDimensions`, zero custom `http.*`. The one non-parity item
+(`feature=http-search`) is a Langfuse trace-level tag with no App Insights
+equivalent — by design, not a gap. Commit cadence corrected mid-arc (new memory:
+mentor proposes a checkpoint commit per verified sub-step; coder never commits).
+App parked at `min-replicas=0`. Merged to `master` via `git merge --no-ff`,
+branch deleted.
