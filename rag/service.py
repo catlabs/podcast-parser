@@ -13,7 +13,7 @@ The agent (``Agent`` / ``AgentContext`` / ``AgentResult`` + ``_run_with_span``)
 is invoked exactly as the MCP server invokes it — ``rag/mcp_server.py::_run_search``
 is the direct reference. The only deliberate differences:
 
-  * the surface namespace is ``http.*`` (vs ``mcp.*``) and the trace root is
+  * the surface namespace is ``search.*`` (vs ``mcp.*``) and the trace root is
     ``http-request`` tagged ``feature=http-search``;
   * normal logging is fine here — HTTP does not use stdout for framing, so the
     "no print to stdout" MCP discipline does not apply.
@@ -67,7 +67,7 @@ logging.basicConfig(
 logger = logging.getLogger("rag.service")
 
 
-# Truncation guard for the ``http.query`` OTel attribute — mirrors the MCP
+# Truncation guard for the ``search.query`` OTel attribute — mirrors the MCP
 # server's ``MCP_QUERY_MAX_ATTR_CHARS``. The full query still rides in the
 # request body and in the ``http-request`` SDK span's ``input``; only the
 # OTel attribute stamp is bounded (unbounded user text is not a good fit for
@@ -165,9 +165,12 @@ def _run_search(
     ``semantic_search`` nest under that automatically.
 
     Domain attributes ride the ``agent search`` OTel span via the Phase 1.1f
-    ``input_attrs`` / ``output_attrs_fn`` hooks under an ``http.*`` namespace —
-    no sibling SDK span wraps the agent call (Phase 1.1f rule). Direct mirror
-    of ``rag/mcp_server.py::_run_search`` with the namespace swapped.
+    ``input_attrs`` / ``output_attrs_fn`` hooks under a ``search.*`` namespace
+    — no sibling SDK span wraps the agent call (Phase 1.1f rule). Direct mirror
+    of ``rag/mcp_server.py::_run_search`` with the namespace swapped. The
+    service avoids custom ``http.*`` keys because Azure Monitor reserves that
+    prefix for standard HTTP semantic conventions and strips it from
+    customDimensions.
     """
     state   = {"sub_queries": [query], "model_key": model_key}
     user_id = LANGFUSE_DEFAULT_USER_ID
@@ -190,17 +193,17 @@ def _run_search(
             state,
             AgentContext.empty(),
             input_attrs = {
-                "http.endpoint":  "/search",
-                "http.query":     query[:HTTP_QUERY_MAX_ATTR_CHARS],
-                "http.top_k":     top_k,
-                "http.model_key": model_key,
+                "search.endpoint":  "/search",
+                "search.query":     query[:HTTP_QUERY_MAX_ATTR_CHARS],
+                "search.top_k":     top_k,
+                "search.model_key": model_key,
             },
             # Defensive ``.get(...)`` chains: SearchAgent is soft-policy, so a
             # degraded result with partial ``data`` is possible; ``_run_with_span``
             # swallows attribute-stamping exceptions anyway (Phase 1.1f).
             output_attrs_fn = lambda r: {
-                "http.n_chunks":   len(r.data.get("chunks") or []),
-                "http.n_episodes": len(r.data.get("episodes_by_title") or {}),
+                "search.n_chunks":   len(r.data.get("chunks") or []),
+                "search.n_episodes": len(r.data.get("episodes_by_title") or {}),
             },
         )
         chunks     = result.data.get("chunks") or []

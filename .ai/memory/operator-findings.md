@@ -80,8 +80,9 @@ then the entry is **deleted**. Append new findings at the bottom, dated.
   `search.top_k`, `search.model_key`, `search.n_chunks`, `search.n_episodes`.
   Also check `rag/mcp_server.py` uses `mcp.*` prefix (already clean). After the
   rename, rebuild image and re-query customDimensions.
-- mentor:   brief-drafted 2026-06-24 — Fix B in `azure-2d-cloud-parity-coder-brief.md`
-  (`http.*` → `search.*`). On feat/azure-container-apps-deploy.
+- mentor:   re-verify 2026-06-24 — Fix B shipped in azure2d (rag/service.py: `http.*`
+  → `search.*`). Mentor-verified offline (no http.* keys emitted; search.* present).
+  Awaits operator LIVE confirmation (customDimensions contains `search.*`).
 
 ### 2026-06-24 — `retrieval` span absent from App Insights (Langfuse-SDK-only construct)
 - severity: minor
@@ -104,5 +105,8 @@ then the entry is **deleted**. Append new findings at the bottom, dated.
   Azure Monitor processor (cloud path). The existing Langfuse SDK observation block can
   remain for backwards compat (when Langfuse is on, Langfuse's observation wraps it).
   Stamp `retrieval.* attrs` on the OTel span unconditionally (not inside the LF block).
-- mentor:   brief-drafted 2026-06-24 — Fix A in `azure-2d-cloud-parity-coder-brief.md`
-  (OTel-native `retrieval` span). On feat/azure-container-apps-deploy.
+- mentor:   re-verify 2026-06-24 — Fix A shipped in azure2d (rag/search.py: OTel-native
+  `retrieval` span via get_tracer(), scope rag.gen_ai, attrs stamped unconditionally;
+  Langfuse SDK observation dropped to avoid double-emit). Mentor-verified offline
+  (retrieval span exports to AI exporter with retrieval.* attrs). Awaits operator
+  LIVE confirmation (`dependencies | where name == "retrieval"` non-empty).

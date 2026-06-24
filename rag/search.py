@@ -33,11 +33,9 @@ Run directly to try a query:
   python -m rag.search "Nanocorp" --top 3 --model multilingual
 """
 
-from opentelemetry import trace as _ot_trace
-
 from rag.config import DEFAULT_MODEL_KEY, EMBED_REGISTRY, TOP_K
 from rag.embed import get_collection
-from rag.observability import get_langfuse
+from rag.otel import get_tracer
 from rag.providers import get_embedding_provider
 
 
@@ -130,10 +128,11 @@ def semantic_search(
     Chroma first; filtering happens in Python.  When None (default) all
     retrieved chunks are returned — byte-for-byte identical to pre-1.1k.
 
-    When Langfuse is configured (see rag/observability.py), the call is wrapped
-    in a "retrieval" span. The embedding call inside is nested automatically
-    for Azure embeddings (the langfuse.openai drop-in instruments it); for
-    local sentence-transformers the embedding step is free and unobserved.
+    When an OTel exporter is configured (Langfuse or App Insights), the call is
+    wrapped in a "retrieval" span. The embedding call inside is nested
+    automatically for Azure embeddings (the langfuse.openai drop-in instruments
+    it); for local sentence-transformers the embedding step is free and
+    unobserved.
 
     Returns a list of dicts, one per result:
       {
@@ -152,20 +151,18 @@ def semantic_search(
             return raw
         return [r for r in raw if r["score"] >= min_score]
 
-    lf = get_langfuse()
-    if lf is None:
-        return _apply_filter(_do_search(query, top_k, model_key))
-
     cfg = EMBED_REGISTRY.get(model_key)
-    with lf.start_as_current_observation(
-        as_type = "span",
-        name    = "retrieval",
-        input   = {
-            "query":     query,
-            "top_k":     top_k,
-            "model_key": model_key,
-        },
-    ) as span:
+    tracer = get_tracer()
+    with tracer.start_as_current_span("retrieval") as span:
+        span.set_attribute("retrieval.query", query)
+        span.set_attribute("retrieval.top_k", top_k)
+        span.set_attribute("retrieval.model_key", model_key)
+        if cfg:
+            span.set_attribute("retrieval.embedding_provider", cfg.provider)
+            span.set_attribute("retrieval.collection", cfg.collection)
+        if min_score is not None:
+            span.set_attribute("retrieval.min_score", min_score)
+
         raw     = _do_search(query, top_k, model_key)
         results = _apply_filter(raw)
 
@@ -175,11 +172,7 @@ def semantic_search(
         top_score      = round(max((r["score"] for r in raw),     default=0.0), 4) if raw     else None
         min_kept_score = round(min((r["score"] for r in results), default=0.0), 4) if results else None
 
-        # Stamp retrieval stats on the OTel span so they land in
-        # App Insights customDimensions (retrieval span exports via the unified TP).
-        ot_span = _ot_trace.get_current_span()
         for _k, _v in {
-            "retrieval.min_score":      min_score,
             "retrieval.n_returned":     n_returned,
             "retrieval.n_kept":         n_kept,
             "retrieval.n_dropped":      n_dropped,
@@ -187,21 +180,7 @@ def semantic_search(
             "retrieval.min_kept_score": min_kept_score,
         }.items():
             if _v is not None:
-                ot_span.set_attribute(_k, _v)
-
-        span.update(
-            output   = _retrieval_output(results),
-            metadata = {
-                "embedding_provider": cfg.provider   if cfg else None,
-                "collection":         cfg.collection if cfg else None,
-                "min_score":          min_score,
-                "n_returned":         n_returned,
-                "n_kept":             n_kept,
-                "n_dropped":          n_dropped,
-                "top_score":          top_score,
-                "min_kept_score":     min_kept_score,
-            },
-        )
+                span.set_attribute(_k, _v)
         return results
 
 
