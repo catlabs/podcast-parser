@@ -851,3 +851,20 @@ instructions. Deferred by design: Azure Content Safety Prompt Shields,
 ingestion quarantine, and LLM-resistance eval set. One minor non-blocking
 finding remains open: orphan `retrieval` root traces on the research path in
 Langfuse. Next: **Voice.1 architecture**, then final Demo.
+
+2026-06-29 — Voice.1 architecture cadrage delivered (no code). Personal note:
+`.ai/memory/personal/voice-1-architecture-note.md`. Decision: do not build a
+full voice stack before mission start; treat voice as a transport/front-door into
+the existing agent platform. Scope covered: managed realtime voice vs explicit
+Azure Speech STT→orchestrator→TTS chain, turn detection / barge-in, memory vs
+personality boundaries, latency budget, OTel/App Insights trace model, safety /
+PII / prompt-injection controls, and evaluation metrics. Next: final Demo
+synthesis — architecture doc + 15-minute walkthrough that integrates Eval,
+Security, MCP/agent transport, Azure deployment/observability, and Voice.1.
+
+2026-06-29 — Final Demo walkthrough prepared (no code). Personal note:
+`.ai/memory/personal/final-demo-walkthrough.md`. 15-minute structure covers:
+context, agent architecture, orchestration/recovery, observability, eval,
+Security.1, Azure deployment, Voice.1, and first-30-days framing. This is the
+closing deliverable for the prep project unless the user asks for polish or a
+slide/diagram export.
