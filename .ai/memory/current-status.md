@@ -811,3 +811,43 @@ backlogged** (open in operator-findings): local dual-export runs label spans
 `cloud_RoleName="unknown_service"` because the Langfuse-owned global TP carries no
 `service.name` resource (immutable once built) — local-dev-only, container path
 unaffected. Next: **Security** milestone (then Demo) — Eval arc complete.
+
+2026-06-29 — Roadmap decision: add **Voice.1 — conversational voice architecture**
+before the final Demo, after Security.1 closes. This is deliberately **no-code /
+architecture-first** unless time remains: the goal is credible technical
+discussion of ChatGPT-Voice-like agents, not shipping a full voice stack in the
+final prep week. Minimal ROI scope: one defensible architecture note + diagram
+mapping the existing agent platform to voice I/O (speech-to-text, turn detection,
+barge-in / interruption, streaming LLM/tool calls, text-to-speech, memory /
+personality boundary, latency budget, fallback path), with Azure-native options
+called out (Azure AI Speech STT/TTS, Azure OpenAI realtime / audio path where
+available, App Insights / OTel for per-turn traces, Content Safety / Prompt
+Shields / PII handling). Priority order for the remaining week becomes:
+Security.1 operator verification + merge first (already implemented and on a
+branch), then Voice.1 architecture, then final Demo synthesis. Do NOT displace
+Security or Eval; do NOT build a full voice system. The Demo should absorb
+Voice.1 as an architecture discussion section.
+
+2026-06-29 — Execution policy adjustment for the final prep week: operator
+verification is **timeboxed, not gating**, unless the change is production-risky
+or unverified at all. Security.1 is already committed + mentor-verified offline;
+waiting for full live Langfuse/App Insights proof now has worse ROI than moving
+to Voice.1 + Demo. Remaining order: propose Security.1 merge with explicit
+"live obs debt" caveat, then spend the time on defensible architecture material
+for voice/conversational agents and the final walkthrough. Park non-blocking
+findings unless they directly affect the Demo narrative.
+
+2026-06-29 — Security.1 SHIPPED + VERIFIED: prompt spotlighting against indirect
+prompt injection. New `rag/security.py` wraps untrusted RAG content in
+`[UNTRUSTED_DATA]` blocks, adds `SPOTLIGHT_INSTRUCTION`, and scans for common
+injection patterns; `AnalystAgent` and `SynthesizerAgent` now wrap transcript
+chunks / derived notes before LLM calls. Detection is non-fatal and observable:
+OTel span event `security.injection_suspected` with `security.*` attributes +
+Langfuse numeric score `injection_suspected=1`; `/search` also clamps `top_k`
+to 1..50. Operator live-verification (`op-verify-security1`) confirmed the
+signal in both backends (App Insights traces event + Langfuse root score), with
+`security.*` attrs intact, and Claude Sonnet 4.5 resisted the tested injected
+instructions. Deferred by design: Azure Content Safety Prompt Shields,
+ingestion quarantine, and LLM-resistance eval set. One minor non-blocking
+finding remains open: orphan `retrieval` root traces on the research path in
+Langfuse. Next: **Voice.1 architecture**, then final Demo.
