@@ -26,6 +26,7 @@ from rag.agents.base import (
 )
 from rag.observability import should_log_full_prompts
 from rag.providers import get_chat_provider
+from rag.security import SPOTLIGHT_INSTRUCTION, scan_for_injection, wrap_untrusted
 
 
 SYNTHESIZE_SYSTEM = """\
@@ -41,12 +42,47 @@ Rédige une synthèse structurée et comparative :
 Règles strictes :
 - Base-toi UNIQUEMENT sur les analyses fournies
 - Cite toujours l'épisode source
-- Réponds en français"""
+- Réponds en français
+
+""" + SPOTLIGHT_INSTRUCTION
+
+
+def _emit_injection_signal(*, hits: list[str], title: str) -> None:
+    if not hits:
+        return
+    try:
+        from opentelemetry import trace as _ot
+
+        span = _ot.get_current_span()
+        span.add_event(
+            "security.injection_suspected",
+            {
+                "security.patterns": ",".join(hits),
+                "security.source": "synthesizer",
+                "security.episode": title,
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        from rag.observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf:
+            lf.score_current_trace(
+                name="injection_suspected",
+                value=1,
+                data_type="NUMERIC",
+                metadata={"patterns": hits, "source": "synthesizer", "episode": title},
+            )
+    except Exception:
+        pass
 
 
 def _build_user_message(query: str, analyses: list[dict]) -> str:
     analyses_block = "\n\n---\n\n".join(
-        f'## Épisode : "{a["episode"]}"\n\n{a["notes"]}'
+        f"## Épisode :\n{wrap_untrusted(a['episode'])}\n\n{wrap_untrusted(a['notes'])}"
         for a in analyses
     )
     return f"Question de recherche : {query}\n\nAnalyses par épisode :\n\n{analyses_block}"
@@ -70,6 +106,11 @@ class SynthesizerAgent:
         llm_key  = state["llm_key"]
         analyses = state["episode_analyses"]
         token_q  = ctx.token_queue
+
+        for a in analyses:
+            title = a["episode"]
+            hits = sorted(set(scan_for_injection(title) + scan_for_injection(a["notes"])))
+            _emit_injection_signal(hits=hits, title=title)
 
         user_msg = _build_user_message(query, analyses)
         tokens: list[str] = []

@@ -73,6 +73,7 @@ logger = logging.getLogger("rag.service")
 # OTel attribute stamp is bounded (unbounded user text is not a good fit for
 # OTel attribute values).
 HTTP_QUERY_MAX_ATTR_CHARS = 500
+SEARCH_TOP_K_MAX = 50
 
 
 # ── App ─────────────────────────────────────────────────────────────────────
@@ -137,7 +138,7 @@ async def search(req: SearchRequest) -> dict:
     ``asyncio.to_thread`` so the ASGI event loop stays responsive (same reason
     as the MCP server; ``contextvars.copy_context`` is handled inside the agent).
     """
-    top_k     = req.top_k     or CHUNKS_PER_QUERY
+    top_k     = min(max(req.top_k or CHUNKS_PER_QUERY, 1), SEARCH_TOP_K_MAX)
     model_key = req.model_key or DEFAULT_MODEL_KEY
 
     chunks, n_episodes = await asyncio.to_thread(
