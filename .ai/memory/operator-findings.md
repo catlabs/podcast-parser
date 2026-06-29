@@ -76,3 +76,26 @@ then the entry is **deleted**. Append new findings at the bottom, dated.
   "unknown_service" and upgrade it. OTEL_SERVICE_NAME already has a fallback
   default; it just isn't applied to the reused Langfuse TP.
 - mentor:   (to triage)
+
+### 2026-06-29 — Orphan `retrieval` root traces in Langfuse (research path)
+- severity: minor
+- status:   open
+- found:    op-verify-security1, Langfuse trace list during Security.1 verification
+- expected: all `retrieval` spans are children of `agent search` within the `cli-request`
+  root trace — consistent with the 1.1f.2 context-propagation fix.
+- observed: 3–4 `retrieval` spans per research run appear as ORPHAN ROOT traces in
+  Langfuse (no parent, no tags, empty metadata) alongside the correct `cli-request`
+  root. Some retrievals ARE correctly parented (visible in the cli-request observation
+  tree) and some escape. Pattern matches a race condition in `ThreadPoolExecutor` —
+  some threads capture the OTel context correctly, others don't.
+- repro:    `python -m rag.cli ask "<research query>" --mode research-no-critic` → check
+  Langfuse trace list; orphan `retrieval` root traces appear at the same timestamp as
+  the run, tagless.
+- next:     Check `rag/agents/search.py` — confirm `contextvars.copy_context().run(...)`
+  is still applied to ALL thread submissions; check if the Security.1 diff touched
+  SearchAgent or any of its call stack. May be a pre-existing issue not caught before
+  (prior verifications focused on App Insights, not the Langfuse trace structure).
+- mentor:   Parked as non-blocking observability debt for the final prep week.
+  Does not block Security.1 merge: the security signal itself was confirmed in
+  both backends, and this appears to be pre-existing research-path trace topology
+  noise rather than a product behavior or security-control failure.

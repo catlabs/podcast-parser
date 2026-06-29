@@ -30,6 +30,7 @@ from rag.agents.base import (
 )
 from rag.providers import get_chat_provider
 from rag.search import format_context
+from rag.security import SPOTLIGHT_INSTRUCTION, scan_for_injection, wrap_untrusted
 
 
 ANALYZE_SYSTEM = """\
@@ -42,11 +43,46 @@ Rédige des notes d'analyse concises et structurées :
 - Position ou opinion exprimée (si applicable)
 
 Réponds en français. Sois concis (150-250 mots max).
-Ne réponds pas à la question — analyse ce que l'épisode dit sur le sujet."""
+Ne réponds pas à la question — analyse ce que l'épisode dit sur le sujet.
+
+""" + SPOTLIGHT_INSTRUCTION
 
 
 def _noop_emit(_event: dict) -> None:
     pass
+
+
+def _emit_injection_signal(*, hits: list[str], title: str) -> None:
+    if not hits:
+        return
+    try:
+        from opentelemetry import trace as _ot
+
+        span = _ot.get_current_span()
+        span.add_event(
+            "security.injection_suspected",
+            {
+                "security.patterns": ",".join(hits),
+                "security.source": "analyst",
+                "security.episode": title,
+            },
+        )
+    except Exception:
+        pass
+
+    try:
+        from rag.observability import get_langfuse
+
+        lf = get_langfuse()
+        if lf:
+            lf.score_current_trace(
+                name="injection_suspected",
+                value=1,
+                data_type="NUMERIC",
+                metadata={"patterns": hits, "source": "analyst", "episode": title},
+            )
+    except Exception:
+        pass
 
 
 class AnalystAgent:
@@ -76,9 +112,13 @@ class AnalystAgent:
                   "detail": f"{i + 1}/{n} episodes",
                   "agent":  "analyst", "tool":  "generate"})
             context = format_context(ep_chunks)
+            hits = sorted(set(scan_for_injection(title) + scan_for_injection(context)))
+            _emit_injection_signal(hits=hits, title=title)
+            safe_title = wrap_untrusted(title)
+            safe_context = wrap_untrusted(context)
             notes   = chat.generate(
                 ANALYZE_SYSTEM,
-                f'Question de recherche : {query}\n\nÉpisode : "{title}"\n\nExtraits :\n{context}',
+                f"Question de recherche : {query}\n\nÉpisode :\n{safe_title}\n\nExtraits :\n{safe_context}",
             )
             analyses.append({"episode": title, "notes": notes})
             emit({"type": "episode_analysis", "episode": title, "notes": notes})
