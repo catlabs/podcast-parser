@@ -1,12 +1,12 @@
 """
 rag/eval.py
 ===========
-Minimal retrieval evaluation — no LLM calls.
+Minimal retrieval-agent evaluation — no LLM calls.
 
-For each labeled query, run semantic_search and check whether the expected
-episode title(s) appear in the top-K results. Negative queries expect zero
-results after the retrieval min_score filter. The labels live inline so the
-eval is self-contained; expand or replace QUERIES when the indexed corpus
+For each labeled query, invoke the SearchAgent contract and check whether the
+expected episode title(s) appear in the top-K ordered chunks. Negative queries
+expect zero chunks after the retrieval min_score filter. The labels live inline
+so the eval is self-contained; expand or replace QUERIES when the indexed corpus
 changes.
 
 Metrics (per model):
@@ -21,7 +21,7 @@ Metrics (per model):
               min_score filtering.
 
 Run:
-    python -m rag.eval                       # default: top_k=5, all models
+    python -m rag.eval                       # default: top_k=5, deployed model
     python -m rag.eval --top 10
     python -m rag.eval --model minilm        # single model
     python -m rag.eval --json
@@ -39,9 +39,20 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
-from rag.config import BASE_DIR, EMBED_MODELS, RETRIEVAL_MIN_SCORE
-from rag.search import semantic_search
+# Side-effect import registers every agent in the registry.
+from rag.agents import get as get_agent
+from rag.agents.base import AgentContext, AgentStatus, _run_with_span
+from rag.config import (
+    BASE_DIR,
+    DEFAULT_MODEL_KEY,
+    EMBED_MODELS,
+    LANGFUSE_DEFAULT_USER_ID,
+    RETRIEVAL_MIN_SCORE,
+)
+from rag.observability import flush as flush_langfuse
+from rag.observability import get_langfuse, span, trace_context
 
 
 # ── Labeled dataset ───────────────────────────────────────────────────────────
@@ -140,8 +151,107 @@ def _first_match_rank(titles_norm: list[str], needle_norm: str) -> int | None:
     return None
 
 
-def _evaluate_query(q: Query, model_key: str, top_k: int, min_score: float | None) -> dict:
-    results     = semantic_search(q.query, top_k=top_k, model_key=model_key, min_score=min_score)
+def _agent_chunks(q: Query, model_key: str, top_k: int) -> list[dict]:
+    state = {"sub_queries": [q.query], "model_key": model_key}
+    result = _run_with_span(
+        get_agent("search"),
+        state,
+        AgentContext.empty(),
+        input_attrs={
+            "eval.query": q.query[:500],
+            "eval.query_kind": q.kind,
+            "eval.top_k": top_k,
+            "eval.model_key": model_key,
+            **({"eval.min_score": RETRIEVAL_MIN_SCORE} if RETRIEVAL_MIN_SCORE is not None else {}),
+        },
+        output_attrs_fn=lambda r: {
+            "eval.n_chunks": len(r.data.get("chunks") or []),
+            "eval.n_episodes": len(r.data.get("episodes_by_title") or {}),
+        },
+    )
+    if result.status == AgentStatus.HARD_FAIL:
+        errors = "; ".join(result.errors) if result.errors else "unknown error"
+        raise SystemExit(f"SearchAgent failed for eval query {q.query!r}: {errors}")
+    # SearchAgent preserves retrieval order in data["chunks"]. Eval metrics
+    # apply the requested top_k cutoff over that ordered agent contract.
+    return (result.data.get("chunks") or [])[:top_k]
+
+
+def _score_current_trace(row: dict) -> None:
+    lf = get_langfuse()
+    if lf is None:
+        return
+    try:
+        metadata = {"query": row["query"], "kind": row["kind"]}
+        if row["kind"] == "negative":
+            lf.score_current_trace(
+                name="abstained",
+                value=1.0 if row["abstained"] else 0.0,
+                data_type="NUMERIC",
+                metadata=metadata,
+            )
+        else:
+            lf.score_current_trace(
+                name="hit",
+                value=float(row["hit"]),
+                data_type="NUMERIC",
+                metadata=metadata,
+            )
+            lf.score_current_trace(
+                name="rr",
+                value=float(row["rr"]),
+                data_type="NUMERIC",
+                metadata=metadata,
+            )
+    except Exception:
+        pass
+
+
+def _evaluate_query(
+    q: Query,
+    model_key: str,
+    top_k: int,
+    *,
+    run_id: str,
+    trace_enabled: bool,
+    user_id: str,
+) -> dict:
+    cm = contextlib.nullcontext()
+    if trace_enabled:
+        cm = span(
+            "eval-query",
+            input={"query": q.query, "kind": q.kind},
+            metadata={
+                "model_key": model_key,
+                "top_k": top_k,
+                "min_score": RETRIEVAL_MIN_SCORE,
+            },
+        )
+
+    with cm as query_span, trace_context(
+        user_id=user_id if trace_enabled else None,
+        session_id=run_id if trace_enabled else None,
+        feature="eval" if trace_enabled else None,
+        metadata={"model_key": model_key, "top_k": top_k} if trace_enabled else None,
+    ):
+        results = _agent_chunks(q, model_key, top_k)
+        row = _score_query(q, results)
+        if trace_enabled:
+            _score_current_trace(row)
+            try:
+                query_span.update(output={
+                    "hit": row["hit"],
+                    "rr": row["rr"],
+                    "abstained": row["abstained"],
+                    "n_results": row["n_results"],
+                    "top_title": row["top_title"],
+                })
+            except Exception:
+                pass
+        return row
+
+
+def _score_query(q: Query, results: list[dict]) -> dict:
     titles_norm = [_norm(r["title"]) for r in results]
 
     if q.negative:
@@ -184,8 +294,25 @@ def _evaluate_query(q: Query, model_key: str, top_k: int, min_score: float | Non
     }
 
 
-def evaluate(model_key: str, top_k: int, min_score: float | None) -> dict:
-    rows = [_evaluate_query(q, model_key, top_k, min_score) for q in QUERIES]
+def evaluate(
+    model_key: str,
+    top_k: int,
+    *,
+    run_id: str,
+    trace_enabled: bool,
+    user_id: str,
+) -> dict:
+    rows = [
+        _evaluate_query(
+            q,
+            model_key,
+            top_k,
+            run_id=run_id,
+            trace_enabled=trace_enabled,
+            user_id=user_id,
+        )
+        for q in QUERIES
+    ]
     positive_rows = [r for r in rows if r["kind"] == "positive"]
     negative_rows = [r for r in rows if r["kind"] == "negative"]
     n_positive    = len(positive_rows)
@@ -193,7 +320,7 @@ def evaluate(model_key: str, top_k: int, min_score: float | None) -> dict:
     return {
         "model_key":   model_key,
         "top_k":       top_k,
-        "min_score":   min_score,
+        "min_score":   RETRIEVAL_MIN_SCORE,
         "dataset":     _dataset_summary(),
         "hit":         sum(r["hit"]    for r in positive_rows) / n_positive,
         "recall":      sum(r["recall"] for r in positive_rows) / n_positive,
@@ -238,7 +365,7 @@ def _load_baseline(model_key: str) -> dict:
     return json.loads(path.read_text())
 
 
-def _validate_baseline(base: dict, model_key: str) -> None:
+def _validate_baseline(base: dict, model_key: str, top_k: int) -> None:
     current_dataset = _dataset_summary()
     baseline_dataset = base.get("dataset", {})
     if baseline_dataset.get("content_hash") != current_dataset["content_hash"]:
@@ -250,6 +377,20 @@ def _validate_baseline(base: dict, model_key: str) -> None:
         raise SystemExit(
             f"Dataset size changed for model {model_key!r}; refusing to gate. "
             "Run `python -m rag.eval --save-baseline` to re-baseline explicitly."
+        )
+    if base.get("top_k") != top_k:
+        raise SystemExit(
+            f"Baseline top_k mismatch for model {model_key!r}: "
+            f"baseline={base.get('top_k')!r}, current={top_k!r}. "
+            "Run `python -m rag.eval --save-baseline` to re-baseline explicitly, "
+            "or rerun with matching parameters."
+        )
+    if base.get("min_score") != RETRIEVAL_MIN_SCORE:
+        raise SystemExit(
+            f"Baseline min_score mismatch for model {model_key!r}: "
+            f"baseline={base.get('min_score')!r}, current={RETRIEVAL_MIN_SCORE!r}. "
+            "Run `python -m rag.eval --save-baseline` to re-baseline explicitly, "
+            "or rerun with matching RETRIEVAL_MIN_SCORE."
         )
 
 
@@ -321,18 +462,28 @@ def _print_check_report(model_key: str, rows: list[dict], tolerance: float) -> N
     print()
 
 
+def _new_run_id() -> str:
+    stamp = datetime.now(UTC).replace(microsecond=0).strftime("%Y%m%dT%H%M%SZ")
+    return f"eval-{stamp}-{uuid4().hex[:8]}"
+
+
+def _trace_enabled(no_trace: bool) -> bool:
+    return (not no_trace) and get_langfuse() is not None
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Minimal retrieval eval (no LLM calls).")
+    ap = argparse.ArgumentParser(description="SearchAgent retrieval eval (no LLM calls).")
     ap.add_argument("--top",   type=int, default=5,
                     help="Top-K results to consider (default: 5)")
     ap.add_argument("--model", default=None,
-                    help="Single embedding model key (default: all configured)")
+                    help=f"Single embedding model key (default: {DEFAULT_MODEL_KEY})")
     ap.add_argument("--min-score", type=float, default=RETRIEVAL_MIN_SCORE,
                     help=(
-                        "Drop retrieval results below this score before scoring. "
-                        "Defaults to RETRIEVAL_MIN_SCORE from config/env; unset disables filtering."
+                        "Compatibility assertion for RETRIEVAL_MIN_SCORE. "
+                        "SearchAgent reads the threshold from config/env; if supplied here, "
+                        "the value must match the effective config threshold."
                     ))
     ap.add_argument("--json", action="store_true",
                     help="Print the full result payload as JSON to stdout.")
@@ -342,29 +493,47 @@ def main() -> int:
                     help="Compare current metrics to committed baselines and fail on regression.")
     ap.add_argument("--tolerance", type=float, default=0.0,
                     help="Allowed metric drop before --check fails (default: 0.0).")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="Disable eval trace/scoring even when Langfuse is configured.")
+    ap.add_argument("--user-id", default=LANGFUSE_DEFAULT_USER_ID,
+                    help="Trace user_id when tracing is enabled.")
     args = ap.parse_args()
 
     if args.save_baseline and args.check:
         raise SystemExit("--save-baseline and --check are mutually exclusive.")
     if args.tolerance < 0:
         raise SystemExit("--tolerance must be >= 0.")
+    if args.min_score != RETRIEVAL_MIN_SCORE:
+        raise SystemExit(
+            f"--min-score={args.min_score!r} does not match effective "
+            f"RETRIEVAL_MIN_SCORE={RETRIEVAL_MIN_SCORE!r}. SearchAgent reads "
+            "the threshold from config/env; rerun with matching env/config or omit --min-score."
+        )
 
     if args.model and args.model not in EMBED_MODELS:
         raise SystemExit(
             f"Unknown model key {args.model!r}. Valid: {list(EMBED_MODELS.keys())}"
         )
-    model_keys = [args.model] if args.model else list(EMBED_MODELS.keys())
+    model_keys = [args.model] if args.model else [DEFAULT_MODEL_KEY]
 
     summaries = []
     checks = []
     failed = False
+    run_id = _new_run_id()
+    trace_enabled = _trace_enabled(args.no_trace)
     baselines = {mk: _load_baseline(mk) for mk in model_keys} if args.check else {}
     for mk, baseline in baselines.items():
-        _validate_baseline(baseline, mk)
+        _validate_baseline(baseline, mk, args.top)
     output_target = sys.stderr if args.json else sys.stdout
     with contextlib.redirect_stdout(output_target):
         for mk in model_keys:
-            res = evaluate(mk, args.top, args.min_score)
+            res = evaluate(
+                mk,
+                args.top,
+                run_id=run_id,
+                trace_enabled=trace_enabled,
+                user_id=args.user_id,
+            )
             summaries.append(res)
             if args.save_baseline:
                 path = _write_baseline(res)
@@ -377,7 +546,9 @@ def main() -> int:
     if args.json:
         payload = {
             "top_k": args.top,
-            "min_score": args.min_score,
+            "min_score": RETRIEVAL_MIN_SCORE,
+            "trace_enabled": trace_enabled,
+            "session_id": run_id if trace_enabled else None,
             "dataset": _dataset_summary(),
             "summaries": summaries,
         }
@@ -385,13 +556,16 @@ def main() -> int:
             payload["checks"] = checks
             payload["passed"] = not failed
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        flush_langfuse()
         return 1 if failed else 0
 
     print(
         f"Retrieval eval — {_dataset_summary()['positive_queries']} positive + "
         f"{_dataset_summary()['negative_queries']} negative queries, top_k={args.top}, "
-        f"min_score={args.min_score}\n"
+        f"min_score={RETRIEVAL_MIN_SCORE}\n"
     )
+    if trace_enabled:
+        print(f"Eval trace session_id: {run_id}\n")
     for res in summaries:
         _print_model_report(res, args.top)
         if args.save_baseline:
@@ -402,11 +576,14 @@ def main() -> int:
             _print_check_report(check["model_key"], check["rows"], args.tolerance)
         if failed:
             print("Regression check failed.")
+            flush_langfuse()
             return 1
         print("Regression check passed.")
+        flush_langfuse()
         return 0
 
     _print_summary(summaries, args.top)
+    flush_langfuse()
     return 0
 
 

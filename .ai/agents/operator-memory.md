@@ -460,6 +460,54 @@ dependencies
 | order by timestamp desc
 ```
 
+## Eval.2 verification (VERIFIED 2026-06-26, op-verify-eval2)
+
+session_id used: `eval-20260626T114721Z-ded6b47d` (printed by `python -m rag.eval --model minilm`).
+
+### Langfuse side (verified via REST API, full trace fetch)
+
+- 16 traces in session (12 positive + 4 negative) ✅
+- All tagged `["eval"]`, `feature="eval"` in metadata ✅
+- Positive traces: `hit` + `rr` scores with correct values (Q2 "OpenClaw" = hit=0, rr=0; rank-3 queries = rr=0.333) ✅
+- Negative traces: only `abstained` score (value=0, expected — `min_score=None` means nothing abstains) ✅
+- **Langfuse scores API pitfall**: `/api/public/scores?traceId=X` does NOT filter
+  by traceId — always returns global scores. Use `/api/public/traces/{id}` and
+  read the `.scores` array from the full trace object instead.
+
+### App Insights side (verified via az rest KQL)
+
+- `eval.*` attrs survive the exporter filter: `eval.query`, `eval.query_kind`,
+  `eval.top_k`, `eval.model_key`, `eval.n_chunks`, `eval.n_episodes` all present ✅
+- `agent.*` attrs present as always ✅
+- Span chain: 4 spans per eval query (`eval-query → agent search → retrieval → embeddings`) ✅
+  - `eval-query` = Langfuse SDK root span (also flows to App Insights via unified TP — expected)
+  - `retrieval.*` attrs (`n_kept`, `n_dropped`) correctly set ✅
+- **GOTCHA — `cloud_RoleName = "unknown_service"` for local dual-export runs**:
+  When both Langfuse + App Insights are configured locally, the Langfuse SDK owns
+  the global TP (no `service.name` resource). All local spans land under
+  `cloud_RoleName = "unknown_service"` in App Insights — NOT `"podcast-search-service"`.
+  Container-only runs use `"podcast-search-service"` (rag/otel.py creates its own TP).
+  Always add `ago(7d)` and summarize by `cloud_RoleName` first if spans aren't found
+  under the expected role name.
+
+KQL to find all eval runs:
+```kql
+dependencies
+| where timestamp > ago(7d)
+    and cloud_RoleName == "unknown_service"
+    and name == "agent search"
+    and isnotempty(customDimensions["eval.query"])
+| extend
+    eval_query = tostring(customDimensions["eval.query"]),
+    qkind      = tostring(customDimensions["eval.query_kind"]),
+    n_chunks   = toint(customDimensions["eval.n_chunks"]),
+    n_ep       = toint(customDimensions["eval.n_episodes"]),
+    status     = tostring(customDimensions["agent.status"]),
+    model      = tostring(customDimensions["eval.model_key"])
+| project timestamp, eval_query, qkind, n_chunks, n_ep, status, model, duration, operation_Id
+| order by timestamp asc
+```
+
 ## Open verifications queued
 
 - **Azure.2 arc: FULLY VERIFIED** (2026-06-24, azure2d). Full telemetry parity
@@ -467,3 +515,6 @@ dependencies
   attrs in customDimensions (agent.*, retrieval.*, search.*), no Langfuse keys
   in cloud. Both 2026-06-24 findings resolved. Mentor to merge + record in
   current-status.md.
+- **Eval.2 arc: FULLY VERIFIED** (2026-06-26). Both backends pass. One nit filed
+  (cloud_RoleName inconsistency between local and container). Mentor to merge
+  `feat/eval-agent-observability` and record in current-status.md.

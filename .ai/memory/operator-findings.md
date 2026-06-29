@@ -54,3 +54,25 @@ then the entry is **deleted**. Append new findings at the bottom, dated.
 - next:     confirm whether duplicates exist in Chroma; if so, a de-dupe /
   re-ingest pass. Deferred out of 1.1k scope by design.
 - mentor:   (to triage)
+
+### 2026-06-26 — `cloud_RoleName = "unknown_service"` for local dual-export runs
+- severity: nit
+- status:   open
+- found:    op-verify-eval2, App Insights KQL (eval.2 brief verification)
+- expected: `cloud_RoleName == "podcast-search-service"` on all spans regardless of
+  whether Langfuse is co-configured (consistent with the container deploy).
+- observed: when both Langfuse + App Insights are configured locally, the Langfuse
+  SDK owns the global `TracerProvider` (no `service.name` resource attribute set on
+  it), so all spans land with `cloud_RoleName = "unknown_service"` in App Insights.
+  The container-only path (no Langfuse keys) creates its own TP with
+  `service.name = OTEL_SERVICE_NAME` → `"podcast-search-service"`. The split means
+  you need two filters to see all traffic; local eval runs are invisible if you
+  filter `cloud_RoleName == "podcast-search-service"`.
+- repro:    Run `python -m rag.eval` locally with both LANGFUSE_* and
+  APPLICATIONINSIGHTS_CONNECTION_STRING set. Query
+  `dependencies | summarize count() by cloud_RoleName` → two buckets.
+- next:     `rag/otel.py::get_tracer()` should set/merge `service.name` on the
+  Langfuse-owned global TP's resource if it isn't already set, or detect
+  "unknown_service" and upgrade it. OTEL_SERVICE_NAME already has a fallback
+  default; it just isn't applied to the reused Langfuse TP.
+- mentor:   (to triage)
