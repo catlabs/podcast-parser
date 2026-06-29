@@ -784,3 +784,30 @@ an Eval.2 item. Stays in-process, no LLM calls. Merged to `master` via
 `git merge --no-ff` (commit 6474534), branch `feat/eval-regression-gate` deleted.
 Next: Eval.2 — route eval through the SearchAgent contract + observability
 (trace `feature=eval`, Langfuse scores) + `min_score`/`top_k` baseline validation.
+
+2026-06-29 — Eval.2 SHIPPED + CLOSED: agent-routed, observable eval. `rag/eval.py`
+now invokes the **SearchAgent** via `_run_with_span(get_agent("search"), ...)` —
+the same path the HTTP service + MCP server use — instead of calling
+`semantic_search()` directly, so the regression gate measures the **production
+path**. Rank metrics are read from `result.data["chunks"]` (ordered) and
+`min_score` comes from config (`RETRIEVAL_MIN_SCORE`) the way the agent applies
+it, not as a function arg. Observability is **opt-in / additive**: each query is
+wrapped in `trace_context(feature="eval", session_id="eval-<ts>-<uuid>")` and
+per-query `hit`/`rr` (positives) + `abstained` (negatives) attach as Langfuse
+NUMERIC scores via `score_current_trace(...)`; all no-op when no backend is
+configured so the gate still runs offline in CI. `--check` now **refuses to gate**
+(before retrieval) when `top_k` OR effective `min_score` differ from the baseline,
+closing the Eval.1 apples-to-oranges gap. The degenerate all-zero `multilingual`
+baseline was removed — non-default models are now opt-in via `--model` (minilm is
+the live gate). Baseline MRR shifted 0.478 → 0.514 (the agent dedupes/orders
+chunks before the top-k cutoff) — expected, not a regression. Mentor-verified
+offline (gate exits 0 at baseline; 1 on forced regression + on top_k/min_score
+mismatch; `score_current_trace` confirmed real on Langfuse 4.6.1). **Operator
+live-verified both backends** (op-verify-eval2): `feature=eval` session with 16
+traces + correct scores in Langfuse (REST), `eval.*`/`agent.*`/`retrieval.*` span
+attrs intact in App Insights (KQL). Merged to `master` via `git merge --no-ff`
+(commit 426dd5b), branch `feat/eval-agent-observability` deleted. One **nit
+backlogged** (open in operator-findings): local dual-export runs label spans
+`cloud_RoleName="unknown_service"` because the Langfuse-owned global TP carries no
+`service.name` resource (immutable once built) — local-dev-only, container path
+unaffected. Next: **Security** milestone (then Demo) — Eval arc complete.
